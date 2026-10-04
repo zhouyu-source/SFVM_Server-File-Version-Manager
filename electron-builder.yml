@@ -1,0 +1,73 @@
+# electron-builder 配置（B16 / T16.8）。
+#
+# 范围**只有 Windows**：计划书 T16.9 的 macOS dmg 签名与公证、Linux AppImage
+# 按用户决定不做（没有 macOS 环境，产出也只保留 Windows）。
+#
+# 这里**不含任何启动开关**：`SFVM_NO_SANDBOX` / `SFVM_DISABLE_GPU` 只在
+# `is.dev`（未打包）时生效，见 src/main/index.ts 的门控与 HANDOFF §2.4。
+
+appId: com.sfvm.app
+productName: SFVM
+copyright: Copyright © 2026 SFVM
+
+directories:
+  # out/ 是 electron-vite 的产物；build/ 放图标（buildResources 默认就是它）
+  buildResources: build
+  output: dist
+
+files:
+  - out/**/*
+  - package.json
+  # 源码映射与声明文件不进包
+  - '!**/*.map'
+  - '!**/*.d.ts'
+
+# 数据库迁移脚本**必须随包发布**，放在 `resources/migrations`。
+#
+# `resolveMigrationsFolder()`（src/main/db/index.ts）的第一个候选就是
+# `process.resourcesPath/migrations`，另外两个候选都是**开发态兜底**
+# （`app.getAppPath()/src/...`、`cwd/src/...`）—— 产物里既没有 `src/`，
+# 双击运行时 `cwd` 又是 exe 所在目录，所以打包漏了这一段就三个候选全落空。
+#
+# 这一条是 B16 出包时漏掉的：产物启动后迁移不执行 → 建出空库 →
+# 设置服务第一次读表就抛 `no such table: app_settings` → 启动链中断、
+# 窗口永不出现（而主进程不会自己退出，任务管理器里留下进程树）。
+# 别删；HANDOFF §1.13 有完整的故障复盘。
+extraResources:
+  - from: src/main/db/migrations
+    to: migrations
+
+# better-sqlite3 用的是 N-API（13.x），Electron 直接可用，**不需要重编译**。
+# 保持 false 可以避免无谓地要求本机具备 VS 构建工具链。
+npmRebuild: false
+
+asar: true
+
+win:
+  # 图标由 build/icon.ico 提供（含 256/128/64/48/32/16 六个尺寸）
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+  # 不签名的本地构建：产物会带"未知发布者"提示，属预期（无代码签名证书）
+  signAndEditExecutable: true
+  verifyUpdateCodeSignature: false
+
+nsis:
+  # 非一键安装：让用户能选目录，符合"交付给运维同学自己装"的场景
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: SFVM
+  # 不允许"安装完直接启动"——用户可能想先看手册
+  runAfterFinish: false
+  artifactName: SFVM-${version}-setup.${ext}
+
+# 便携版（解压即用）由 win 的 zip target 产出，文件名用 electron-builder 的默认
+# 格式 `SFVM-<version>-win-x64.zip` —— zip 目标不支持自定义 artifactName。
+
+publish: null

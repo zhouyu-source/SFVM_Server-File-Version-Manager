@@ -1,0 +1,35 @@
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true,
+    /**
+     * `scripts/**` 里是 `.mjs`，而 `include` 默认**只收 TS**：
+     * 不开 `allowJs` 的话 tsc 会静默忽略它，ESLint 的 projectService 随即报
+     * 「was not found by the project service」（报在 0:0，看着像 lint 坏了）。
+     * 只开 allowJs、不开 checkJs：脚本不需要被类型检查，能被"认领"即可。
+     */
+    "allowJs": true,
+    "checkJs": false,
+    "types": ["node", "vitest/globals"],
+    "baseUrl": ".",
+    "paths": {
+      "@main/*": ["src/main/*"],
+      "@shared/*": ["src/shared/*"],
+      "@renderer/*": ["src/renderer/src/*"]
+    }
+  },
+  "include": [
+    "tests/**/*",
+    "vitest.config.ts",
+    "drizzle.config.ts",
+    // 集成 / E2E 的入口包装器（B16 / T16.2）。它不属于应用（node/web）任何一侧，
+    // 但必须被某个 tsconfig 覆盖 —— 否则 ESLint 的 projectService 会直接报
+    // 「was not found by the project service」，而那个报错发生在 0:0 行，
+    // 看起来像 lint 本身坏了。
+    "scripts/**/*",
+    // 测试会 import 渲染层的纯逻辑（如 utils/danger.ts），那一侧要用到
+    // `window.sfvm` 的全局声明 —— 不带上它就会有 73 处 TS2339。
+    "src/renderer/src/types/global.d.ts"
+  ]
+}

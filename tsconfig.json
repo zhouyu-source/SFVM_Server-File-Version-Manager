@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.node.json" },
+    { "path": "./tsconfig.web.json" },
+    // tests / vitest.config / drizzle.config 需要单独一份，
+    // 否则 ESLint 的 projectService 会报「was not found by the project service」
+    { "path": "./tsconfig.test.json" }
+  ]
+}

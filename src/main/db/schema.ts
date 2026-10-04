@@ -1,0 +1,249 @@
+/**
+ * SQLite 表结构（T02.2 ~ T02.5）。
+ *
+ * 严格对应《方案书》§5.2 的 DDL，共 8 张表：
+ *   connections / known_hosts / environments / targets
+ *   releases / release_items / archives / app_settings / audit_logs
+ *
+ * 约定（避免后续批次各写各的）：
+ * - 主键统一 TEXT uuid，由 `newId()` 生成（见 db/id.ts）
+ * - 时间统一存 **ISO-8601 带时区偏移的字符串**（如 2025-06-12T14:30:15+08:00）：
+ *   便于人读、便于跨时区排查，且远端 manifest 也用同一格式
+ * - 布尔用 INTEGER 0/1（Drizzle 的 `{ mode: 'boolean' }`）
+ * - JSON 字段（local_exclude / retain_policy）存 TEXT，读写处负责解析
+ */
+import { sql } from 'drizzle-orm'
+import { index, integer, sqliteTable, text, unique } from 'drizzle-orm/sqlite-core'
+
+const now = sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`
+
+/* ------------------------------------------------------------------ 连接 */
+
+export const connections = sqliteTable('connections', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  host: text('host').notNull(),
+  port: integer('port').notNull().default(22),
+  username: text('username').notNull(),
+  /** 'password' | 'privateKey' | 'agent' */
+  authType: text('auth_type').notNull(),
+  /** safeStorage 加密后的密码或私钥口令；**永远不从渲染进程写这里** */
+  secretCipher: text('secret_cipher'),
+  /** 私钥文件绝对路径（仅存路径，不存内容） */
+  privateKeyPath: text('private_key_path'),
+  /** SHA256:xxx，首次连接后写入（TOFU） */
+  hostKeyFingerprint: text('host_key_fingerprint'),
+  keepaliveMs: integer('keepalive_ms').notNull().default(15000),
+  autoConnect: integer('auto_connect', { mode: 'boolean' }).notNull().default(false),
+  lastConnectedAt: text('last_connected_at'),
+  remark: text('remark'),
+  createdAt: text('created_at').notNull().default(now),
+  updatedAt: text('updated_at').notNull().default(now)
+})
+
+/** 主机指纹历史：一台机器多算法/多指纹时保留多条 */
+export const knownHosts = sqliteTable(
+  'known_hosts',
+  {
+    id: text('id').primaryKey(),
+    host: text('host').notNull(),
+    port: integer('port').notNull(),
+    keyType: text('key_type').notNull(),
+    fingerprint: text('fingerprint').notNull(),
+    trustedAt: text('trusted_at').notNull().default(now)
+  },
+  (t) => [unique('uq_known_hosts_host_port_type').on(t.host, t.port, t.keyType)]
+)
+
+/* -------------------------------------------------------------- 工作环境 */
+
+export const environments = sqliteTable('environments', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull().unique(),
+  /** 'prod' | 'test' | 'custom' */
+  envType: text('env_type').notNull(),
+  description: text('description'),
+  connectionId: text('connection_id')
+    .notNull()
+    .references(() => connections.id, { onDelete: 'restrict' }),
+  /** UI 标识色，生产=红，测试=蓝 */
+  color: text('color'),
+  sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: text('created_at').notNull().default(now),
+  updatedAt: text('updated_at').notNull().default(now)
+})
+
+/* ---------------------------------------------------------- 受管目标资源 */
+
+export const targets = sqliteTable(
+  'targets',
+  {
+    id: text('id').primaryKey(),
+    environmentId: text('environment_id')
+      .notNull()
+      .references(() => environments.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    /** 'dir' | 'file' */
+    kind: text('kind').notNull(),
+    /** /opt/app/dist 或 /opt/svc/order.jar */
+    remotePath: text('remote_path').notNull(),
+    /** 默认 <父目录>/<basename>.versions，可覆盖 */
+    archiveDir: text('archive_dir'),
+    /** 本地构建产物路径 */
+    localPath: text('local_path'),
+    /** JSON 数组，如 [".map", "*.log"] */
+    localExclude: text('local_exclude'),
+    hashAlgo: text('hash_algo').notNull().default('sha256'),
+    verifyRemote: integer('verify_remote', { mode: 'boolean' }).notNull().default(true),
+    /** JSON: {"mode":"count","value":10} */
+    retainPolicy: text('retain_policy'),
+    /** 'rename' | 'copy' */
+    deployStrategy: text('deploy_strategy').notNull().default('rename'),
+    autoConnect: integer('auto_connect', { mode: 'boolean' }).notNull().default(false),
+    lastDeployAt: text('last_deploy_at'),
+    createdAt: text('created_at').notNull().default(now),
+    updatedAt: text('updated_at').notNull().default(now)
+  },
+  (t) => [unique('uq_targets_env_path').on(t.environmentId, t.remotePath)]
+)
+
+/* ---------------------------------------------------- 发布记录（台账主表） */
+
+export const releases = sqliteTable(
+  'releases',
+  {
+    id: text('id').primaryKey(),
+    targetId: text('target_id')
+      .notNull()
+      .references(() => targets.id, { onDelete: 'cascade' }),
+    /** 'deploy' | 'rollback' */
+    action: text('action').notNull(),
+    /** 20250612-143015_a1b2c3d */
+    versionTag: text('version_tag').notNull(),
+    /** PENDING/UPLOADING/VERIFYING/ARCHIVING/SWAPPING/SUCCESS/FAILED/ROLLED_BACK */
+    status: text('status').notNull(),
+    /** 'local' | 'archive' */
+    source: text('source'),
+    localPath: text('local_path'),
+    /** rollback 时的来源版本 */
+    archiveId: text('archive_id'),
+    /** 目录指纹 / 文件哈希 */
+    rootHash: text('root_hash'),
+    totalBytes: integer('total_bytes').notNull().default(0),
+    fileCount: integer('file_count').notNull().default(0),
+    operator: text('operator'),
+    note: text('note'),
+    currentStep: text('current_step'),
+    errorMessage: text('error_message'),
+    startedAt: text('started_at').notNull().default(now),
+    finishedAt: text('finished_at')
+  },
+  (t) => [index('idx_releases_target_time').on(t.targetId, t.startedAt)]
+)
+
+/** 发布文件清单：大目录逐文件记录，用于精确校验与差异展示 */
+export const releaseItems = sqliteTable(
+  'release_items',
+  {
+    id: text('id').primaryKey(),
+    releaseId: text('release_id')
+      .notNull()
+      .references(() => releases.id, { onDelete: 'cascade' }),
+    relPath: text('rel_path').notNull(),
+    hash: text('hash').notNull(),
+    size: integer('size').notNull(),
+    mtime: text('mtime')
+  },
+  (t) => [unique('uq_release_items_release_path').on(t.releaseId, t.relPath)]
+)
+
+/* ------------------------------------------------------ 归档版本（往期库） */
+
+export const archives = sqliteTable(
+  'archives',
+  {
+    id: text('id').primaryKey(),
+    targetId: text('target_id')
+      .notNull()
+      .references(() => targets.id, { onDelete: 'cascade' }),
+    versionTag: text('version_tag').notNull(),
+    /** 远端 <archive_dir>/<version_tag> */
+    storagePath: text('storage_path').notNull(),
+    /** <storage_path>/payload */
+    payloadPath: text('payload_path').notNull(),
+    /** 'dir' | 'file' */
+    kind: text('kind').notNull(),
+    rootHash: text('root_hash').notNull(),
+    totalBytes: integer('total_bytes').notNull(),
+    fileCount: integer('file_count').notNull(),
+    archivedAt: text('archived_at').notNull().default(now),
+    releaseId: text('release_id'),
+    note: text('note'),
+    /** 'valid' | 'missing' | 'corrupt' */
+    status: text('status').notNull().default('valid')
+  },
+  (t) => [
+    unique('uq_archives_target_tag').on(t.targetId, t.versionTag),
+    index('idx_archives_target_time').on(t.targetId, t.archivedAt)
+  ]
+)
+
+/* ------------------------------------------------------------ 应用设置 */
+
+export const appSettings = sqliteTable('app_settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: text('updated_at').notNull().default(now)
+})
+
+/* -------------------------------------------------------- 操作日志 / 审计 */
+
+export const auditLogs = sqliteTable(
+  'audit_logs',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    ts: text('ts').notNull().default(now),
+    /** 'info' | 'warn' | 'error' */
+    level: text('level').notNull(),
+    /** 'connection' | 'deploy' | 'archive' | 'app' */
+    scope: text('scope').notNull(),
+    refId: text('ref_id'),
+    message: text('message').notNull(),
+    /** JSON，**已脱敏** */
+    detail: text('detail')
+  },
+  (t) => [index('idx_audit_ts').on(t.ts)]
+)
+
+/* ------------------------------------------------------------------ 类型 */
+
+export type Connection = typeof connections.$inferSelect
+export type NewConnection = typeof connections.$inferInsert
+export type KnownHost = typeof knownHosts.$inferSelect
+export type NewKnownHost = typeof knownHosts.$inferInsert
+export type Environment = typeof environments.$inferSelect
+export type NewEnvironment = typeof environments.$inferInsert
+export type Target = typeof targets.$inferSelect
+export type NewTarget = typeof targets.$inferInsert
+export type Release = typeof releases.$inferSelect
+export type NewRelease = typeof releases.$inferInsert
+export type ReleaseItem = typeof releaseItems.$inferSelect
+export type NewReleaseItem = typeof releaseItems.$inferInsert
+export type Archive = typeof archives.$inferSelect
+export type NewArchive = typeof archives.$inferInsert
+export type AppSetting = typeof appSettings.$inferSelect
+export type AuditLog = typeof auditLogs.$inferSelect
+export type NewAuditLog = typeof auditLogs.$inferInsert
+
+/** 全部业务表，供备份/自检统计使用 */
+export const ALL_TABLES = [
+  'connections',
+  'known_hosts',
+  'environments',
+  'targets',
+  'releases',
+  'release_items',
+  'archives',
+  'app_settings',
+  'audit_logs'
+] as const

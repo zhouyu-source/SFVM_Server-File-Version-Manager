@@ -1,0 +1,11 @@
+# 统一 LF，避免 Windows 上 core.autocrlf 造成全文件 diff（方案书 B00 要求）
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.msi binary
+*.zip binary
+*.node binary
+*.dll binary

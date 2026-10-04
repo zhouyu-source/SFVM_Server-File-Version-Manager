@@ -1,0 +1,24 @@
+# 不参与格式化的内容
+node_modules/
+out/
+dist/
+coverage/
+pnpm-lock.yaml
+
+# 自动生成的类型声明（Element Plus 按需引入产物）
+src/renderer/src/types/auto-imports.d.ts
+src/renderer/src/types/components.d.ts
+
+# drizzle-kit 生成的迁移与元数据
+src/main/db/migrations/
+
+# 本机安装包与验证日志
+.tools/
+
+# 项目文档：手写排版，不要被 Prettier 重排宽表
+docs/
+*.md
+
+# 图标生成脚本与构建资源（非 JS/TS，Prettier 无解析器会直接报错）
+*.py
+build/

@@ -1,0 +1,64 @@
+# 依赖与构建产物
+node_modules/
+out/
+dist/
+dist-electron/
+coverage/
+*.tsbuildinfo
+# vitest / electron-vite 加载 TS 配置时吐出的临时文件（每次运行名字都不同）。
+# 不忽略的话：跑完 `pnpm test` 或 `pnpm build` 再跑 `pnpm lint`，会因为 eslint
+# 扫到它们而报 "was not found by the project service"，看起来像 lint 坏了。
+vitest.config.ts.timestamp-*.mjs
+electron.vite.config.*.mjs
+
+# AI 助手在本地维护的工作记忆（进度/决策笔记），不是项目源码
+.workbuddy/
+.zcode/
+
+# 数据库与日志（方案书 T00.1）
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.bak-*
+.logs/
+logs/
+*.log
+
+# 凭据相关：绝不入库
+.credentials.yaml
+*.key
+*.pem
+# 集成测试的真机凭据（.env.it.example 是模板，可入库；.env.it 是本机实际值）
+.env.it
+# 显式忽略整个 .ssh 目录：目前靠上面的 *.pem 兜着，但那是通用规则，
+# 将来一旦调整（例如为别的用途放行某些 .pem）私钥就可能被误提交。
+.ssh/
+ssh_key*
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
+# 本机开发资产目录：AI 助手的工作记忆、跨会话交接文档、环境搭建脚本与安装包、
+# 真机探测报告、验证脚本输出 —— 全部属「本机专用」，不进仓库（文件留在磁盘上）。
+#
+# 用一条整目录规则代替以前的逐条规则（.tools/*.exe、*-probe.*、verify/ 等）：
+# 原来的 `.tools/*-probe.*` 本意是忽略真机探测结果，但真实文件名是
+# `remote-probe-result.txt`（`-probe-` ≠ `-probe.`），规则没匹配上，
+# 那份含服务器侦察信息（地址/指纹/权限）的文件就被 `git add` 收进了仓库。
+.tools/
+
+# 项目文档（方案书 / 计划书 / 用户手册）：属内部开发资料，不随源码发布。
+# 文件留在磁盘上，README 与 CHANGELOG 中指向它们的链接已同步移除。
+docs/
+
+# 自动生成的类型声明（T00.7 要求提交，这里显式保留 src 下的）
+!src/renderer/src/types/*.d.ts
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

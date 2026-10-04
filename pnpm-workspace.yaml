@@ -1,0 +1,22 @@
+# electron-vite / pnpm 配置
+#
+# allowBuilds 必须是「映射」而不是列表，写错会直接解析失败。
+# 这些依赖需要执行 postinstall / install 脚本（下载二进制或编译原生模块）：
+#   - electron:        下载 Electron 运行时（v44 起无 postinstall，需显式 setup:electron）
+#   - better-sqlite3:  N-API 原生模块（v13 起为预编译产物，装包即用）
+#   - esbuild:         下载平台二进制
+#   - vue-demi:        Vue 2/3 兼容层
+#   - ssh2:            可选原生加速模块 cpu-features 的构建
+#   - cpu-features:    ssh2 的可选依赖；是 NAN 模块，编译失败不影响功能
+#                      （编译不了时 ssh2 自动回退纯 JS 实现）
+#   - electron-winstaller: electron-builder 的传递依赖，只在构建"网页安装包"
+#                      （Squirrel）时用；本项目打的是 NSIS + zip，不需要它的脚本。
+#                      B16 实测置 false 后 `npm run build:win` 照常成功。
+allowBuilds:
+  electron: true
+  better-sqlite3: true
+  esbuild: true
+  vue-demi: true
+  ssh2: true
+  cpu-features: true
+  electron-winstaller: false
