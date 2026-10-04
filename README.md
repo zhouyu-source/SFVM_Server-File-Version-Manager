@@ -21,8 +21,6 @@
 └──────────────┘   ◀─── 回滚 / 下载 ── └────────────────────────────┘
 ```
 
-> 变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
-
 ---
 
 ## 目录
@@ -83,7 +81,7 @@
 ### 作为使用者
 
 1. 拿到 `SFVM-<版本>-setup.exe`（NSIS 安装包），双击安装；
-   或解压 `SFVM-<版本>-win-x64.zip` 直接运行 `SFVM.exe`（免安装，适合放 U 盘）。
+   或解压 `SFVM-<版本>-win.zip` 直接运行 `SFVM.exe`（免安装，适合放 U 盘）。
 2. 首次启动按引导新建连接 → 新建环境与目标 → 发布。
 
 ### 从源码运行（开发者）
@@ -180,7 +178,7 @@ pnpm dev:nosandbox       # = SFVM_NO_SANDBOX=1 + SFVM_DISABLE_GPU=1
 pnpm build:win
 ```
 
-产出 `dist/SFVM-<版本>-setup.exe`（NSIS 安装包）与 `dist/SFVM-<版本>-win-x64.zip`（便携版）。
+产出 `dist/SFVM-<版本>-setup.exe`（NSIS 安装包）与 `dist/SFVM-<版本>-win.zip`（便携版）。
 
 - **版本号取自 `package.json` 的 `version`**，产物名与「关于」里的版本都跟着它走。
 - 只配置 Windows：macOS 的 dmg 签名公证与 Linux AppImage **按需再议**（当前无相应环境）。
@@ -261,7 +259,7 @@ E2E 必须串行。用 `pnpm test:e2e`（已带 `--no-file-parallelism`），不
 
 1. `lint` / `typecheck` / `test` / `build` **四绿**；
 2. 受影响的功能有真机或真窗口验证证据；
-3. 文档（`CHANGELOG.md`）回填后再提交，并打 `bNN` 标签。
+3. 受影响的文档回填后再提交，并打 `bNN` 标签。
 
 提交信息用 `[模块] 一句话说明` 的形式，正文写清**为什么**这么改。
 改动前建议先读 [项目结构](#项目结构) 里的架构约束。

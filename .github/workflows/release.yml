@@ -1,0 +1,97 @@
+# 打 tag（`v*`）后在 GitHub 的 Windows runner 上构建，并把产物挂到 Release 上。
+#
+# 为什么不把产物提交进仓库：GitHub 对**单个文件**有 100 MB 硬上限，而 SFVM 的
+# 安装包约 120 MB、便携 zip 约 160 MB，`git push` 会直接被拒。构建产物的正确落点
+# 是 **Release 的附件**（单个附件上限 2 GB）。
+#
+# 用法：
+#   git tag v1.0.0 && git push origin v1.0.0     → 自动构建并创建 Release
+# 只想空跑一遍验流水线时，推个临时 tag 再删掉即可：
+#   git tag v0.0.0-test && git push origin v0.0.0-test
+#   git push origin :refs/tags/v0.0.0-test
+#
+# tag 重推（内容变了要覆盖产物）时会走「已存在则覆盖附件」分支，不会重复建 Release。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 建 Release 需要写权限：仓库默认 GITHUB_TOKEN 权限收紧后，这里显式补回来。
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 顺序不能反：先装 pnpm，下一步 setup-node 的 `cache: pnpm` 才能命中缓存。
+      #
+      # 版本必须 >= 11：`pnpm-workspace.yaml` 里用的 `allowBuilds`（映射式白名单）
+      # 是 pnpm 11 引入的，取代了老版的 `onlyBuiltDependencies`（列表式）。
+      # 若落到 pnpm 10 及以下，该字段不生效 → electron / better-sqlite3 等依赖的
+      # install 脚本不执行 → 打出**缺原生模块的坏包**（能装、点不开）。
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # electron 44 起 npm 包不再自动下载运行时二进制，必须显式装一次
+      # （与 README「从源码运行」里的 `pnpm setup:electron` 是同一件事）。
+      - name: 下载 Electron 运行时
+        run: pnpm setup:electron
+
+      # 打包前先过四绿里的三绿，任一步失败都不出包。
+      # 真机集成（test:it）与真窗口 E2E（test:e2e）需要测试机凭据，CI 上跑不了，故不在此列。
+      - name: lint
+        run: pnpm lint
+
+      - name: typecheck
+        run: pnpm typecheck
+
+      - name: 单元测试
+        run: pnpm test
+
+      # 这里刻意**不**用 `pnpm build:win`：那个脚本把 Electron 下载源指向 npmmirror
+      # （为国内网络准备）。GitHub runner 直连 github.com 更快更稳，因此拆成两步。
+      # 若日后改了 `build:win` 的打包参数，记得同步这里，别让 CI 与本地两条路漂移。
+      - name: 构建三端产物
+        run: pnpm build
+
+      - name: 打包（NSIS 安装包 + 便携 zip）
+        run: pnpm exec electron-builder --win
+
+      - name: 创建 Release 并挂产物
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # 用通配而不是写死文件名：zip 的产物名由 electron-builder 的默认规则决定，
+          # 硬编码会在它改规则时静默少传一个附件。
+          assets=(dist/*-setup.exe dist/*.zip)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::dist/ 下没找到产物，请回看上面的打包步骤"
+            exit 1
+          fi
+          printf '将上传：%s\n' "${assets[@]}"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+              --title "SFVM ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
