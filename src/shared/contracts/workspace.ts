@@ -216,6 +216,20 @@ export const pickDirectoryInputSchema = z.object({
 })
 export type PickDirectoryInput = z.infer<typeof pickDirectoryInputSchema>
 
+/**
+ * 选择一个**可执行文件**（B20：设置「Git Bash 路径」）。
+ *
+ * 再开一个通道而不是复用 `pickDirectory`（它只让选目录）或 `pickArtifact`
+ * （它的标题写着"本地产物"，出现在"选 bash.exe"这一步上会让人以为选错了东西）。
+ * 和它们一样**只回传路径、不读内容**。
+ */
+export const pickExecutableInputSchema = z.object({
+  /** 对话框标题与用途说明（如"选择 Git Bash 的 bash.exe"） */
+  title: z.string().min(1),
+  defaultPath: z.string().min(1).nullable().optional()
+})
+export type PickExecutableInput = z.infer<typeof pickExecutableInputSchema>
+
 export interface OpenShellResult {
   ok: boolean
   /** 失败原因（如"路径不存在"）；成功时为空 */

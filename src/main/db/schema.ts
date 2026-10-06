@@ -215,6 +215,80 @@ export const auditLogs = sqliteTable(
   (t) => [index('idx_audit_ts').on(t.ts)]
 )
 
+/* ------------------------------------------------------ 脚本运行记录（B20） */
+
+/**
+ * 一次「脚本运行」。
+ *
+ * 为什么必须落库：任务框架**不保留 `run()` 的返回值**，进程一重启就完全失忆，
+ * 而"上一次那步成没成、退出码多少、输出了什么"恰恰是用户唯一想看的东西。
+ *
+ * 不变量：`status` 为 `running` 的行，其 `jobId` 一定对应一个刚刚发生过的任务；
+ * 进程被强杀时可能留下 `running`，界面上按"未正常结束"如实展示即可 ——
+ * 不去猜它成功（那是谎报）。
+ */
+export const scriptRuns = sqliteTable(
+  'script_runs',
+  {
+    id: text('id').primaryKey(),
+    targetId: text('target_id')
+      .notNull()
+      .references(() => targets.id, { onDelete: 'cascade' }),
+    /** 跑它的任务 id（任务本身不落库，这里只用于"任务台 ↔ 运行记录"对号） */
+    jobId: text('job_id').notNull(),
+    /** 'step'（目标页单条脚本，B20）| 'pipeline'（多步流水线，B21） */
+    trigger: text('trigger').notNull().default('step'),
+    /** B21 的流水线 id；B20 恒为 null。刻意不建外键：pipelines 表在 B21 才出现 */
+    pipelineId: text('pipeline_id'),
+    title: text('title').notNull(),
+    /** 'running' | 'succeeded' | 'failed' | 'cancelled' */
+    status: text('status').notNull().default('running'),
+    startedAt: text('started_at').notNull().default(now),
+    finishedAt: text('finished_at'),
+    /** 谁发起的（本机 hostname）；多人共用一台机器时才有意义 */
+    operator: text('operator'),
+    errorMessage: text('error_message')
+  },
+  (t) => [index('idx_script_runs_target_time').on(t.targetId, t.startedAt)]
+)
+
+/**
+ * 运行里的一个步骤。
+ *
+ * 输出分两处存：**完整输出**在 `output_path` 指向的文件里（单步设体积上限），
+ * 库里只留 `output_tail`（最后 200 行 / 32KB）。理由见 `contracts/script.ts` 文件头。
+ */
+export const scriptStepRuns = sqliteTable(
+  'script_step_runs',
+  {
+    id: text('id').primaryKey(),
+    runId: text('run_id')
+      .notNull()
+      .references(() => scriptRuns.id, { onDelete: 'cascade' }),
+    /** 1 起；B20 恒为 1 */
+    seq: integer('seq').notNull(),
+    name: text('name').notNull(),
+    /** 'local' | 'remote' */
+    kind: text('kind').notNull(),
+    /** 本机步骤用的解释器（'powershell' | 'gitbash'）；远端步骤为 null */
+    shell: text('shell'),
+    status: text('status').notNull().default('running'),
+    /** 进程退出码；null = 没拿到（超时被杀、连接断开等） */
+    exitCode: integer('exit_code'),
+    startedAt: text('started_at').notNull().default(now),
+    finishedAt: text('finished_at'),
+    durationMs: integer('duration_ms'),
+    /** 完整输出的落盘位置；null = 这次没落盘 */
+    outputPath: text('output_path'),
+    outputBytes: integer('output_bytes').notNull().default(0),
+    truncated: integer('truncated', { mode: 'boolean' }).notNull().default(false),
+    /** 库内保留的输出尾部 */
+    outputTail: text('output_tail'),
+    errorMessage: text('error_message')
+  },
+  (t) => [unique('uq_script_step_runs_run_seq').on(t.runId, t.seq)]
+)
+
 /* ------------------------------------------------------------------ 类型 */
 
 export type Connection = typeof connections.$inferSelect
@@ -234,6 +308,10 @@ export type NewArchive = typeof archives.$inferInsert
 export type AppSetting = typeof appSettings.$inferSelect
 export type AuditLog = typeof auditLogs.$inferSelect
 export type NewAuditLog = typeof auditLogs.$inferInsert
+export type ScriptRun = typeof scriptRuns.$inferSelect
+export type NewScriptRun = typeof scriptRuns.$inferInsert
+export type ScriptStepRun = typeof scriptStepRuns.$inferSelect
+export type NewScriptStepRun = typeof scriptStepRuns.$inferInsert
 
 /** 全部业务表，供备份/自检统计使用 */
 export const ALL_TABLES = [
@@ -245,5 +323,7 @@ export const ALL_TABLES = [
   'release_items',
   'archives',
   'app_settings',
-  'audit_logs'
+  'audit_logs',
+  'script_runs',
+  'script_step_runs'
 ] as const

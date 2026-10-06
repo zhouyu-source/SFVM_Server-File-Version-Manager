@@ -55,6 +55,7 @@ declare module 'vue' {
     RollbackDialog: typeof import('./../components/RollbackDialog.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
+    ScriptPanel: typeof import('./../components/ScriptPanel.vue')['default']
     TargetDetail: typeof import('./../components/TargetDetail.vue')['default']
     TargetWizard: typeof import('./../components/TargetWizard.vue')['default']
     TaskConsole: typeof import('./../components/TaskConsole.vue')['default']

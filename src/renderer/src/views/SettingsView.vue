@@ -50,6 +50,7 @@ import {
 } from '@element-plus/icons-vue'
 import { api, IpcBusinessError } from '../api'
 import { useMenuStore } from '../stores/menu'
+import { confirmDanger } from '../utils/danger'
 import { formatBytes } from '../utils/format'
 import type { AppInfoOutput, DataLocationOutput } from '../../../shared/contracts/app'
 import {
@@ -130,6 +131,10 @@ interface SettingsForm {
   hashCompatMode: boolean
   retainMode: 'none' | 'count' | 'days'
   retainValue: number
+  /** B20：自定义脚本总闸（默认关） */
+  allowUserScripts: boolean
+  /** B20：Git Bash 的 bash.exe 路径；null = 自动探测 */
+  gitBashPath: string | null
 }
 
 const saved = ref<AppSettings>({ ...DEFAULT_APP_SETTINGS })
@@ -139,7 +144,9 @@ const form = reactive<SettingsForm>({
   logLevel: DEFAULT_APP_SETTINGS.logLevel,
   hashCompatMode: DEFAULT_APP_SETTINGS.hashCompatMode,
   retainMode: DEFAULT_APP_SETTINGS.defaultRetainPolicy ? 'count' : 'none',
-  retainValue: DEFAULT_APP_SETTINGS.defaultRetainPolicy?.value ?? DEFAULT_RETAIN_COUNT
+  retainValue: DEFAULT_APP_SETTINGS.defaultRetainPolicy?.value ?? DEFAULT_RETAIN_COUNT,
+  allowUserScripts: DEFAULT_APP_SETTINGS.allowUserScripts,
+  gitBashPath: DEFAULT_APP_SETTINGS.gitBashPath
 })
 
 /** 表单 → 契约（提交时用）。 */
@@ -152,7 +159,10 @@ function toSettings(): AppSettings {
     defaultRetainPolicy:
       form.retainMode === 'none'
         ? null
-        : { mode: form.retainMode, value: Math.max(1, Math.floor(form.retainValue)) }
+        : { mode: form.retainMode, value: Math.max(1, Math.floor(form.retainValue)) },
+    allowUserScripts: form.allowUserScripts,
+    // 空串在契约里没有意义（契约是 `string | null`）→ 归一成 null
+    gitBashPath: form.gitBashPath?.trim() ? form.gitBashPath.trim() : null
   }
 }
 
@@ -164,6 +174,8 @@ function fromSettings(s: AppSettings): void {
   form.hashCompatMode = s.hashCompatMode
   form.retainMode = s.defaultRetainPolicy?.mode ?? 'none'
   form.retainValue = s.defaultRetainPolicy?.value ?? DEFAULT_RETAIN_COUNT
+  form.allowUserScripts = s.allowUserScripts
+  form.gitBashPath = s.gitBashPath
 }
 
 const issues = ref<SettingsSnapshot['issues']>([])
@@ -286,6 +298,44 @@ async function pickDownloadDir(): Promise<void> {
   try {
     const r = await api.app.pickDirectory({ defaultPath: form.downloadDir })
     if (r) form.downloadDir = r.path
+  } catch (e) {
+    ElMessage.error((e as IpcBusinessError).toUserText())
+  }
+}
+
+/* --------------------------------------------------------------- 脚本执行 */
+
+/**
+ * 「允许执行自定义脚本」开关前的危险确认（B20）。
+ *
+ * 用 `el-switch` 的 `before-change` 而不是"先切过去、再弹框问"：
+ * 后者在用户点"取消"时得把开关**拨回来**，中间那一帧既是错误的线上状态
+ * （`dirty` 已经变了、按钮已经亮了），也会让人以为"已经开了"。
+ * `before-change` 返回 false 时开关**根本没动过**。
+ *
+ * 关掉方向不拦：关闭永远是安全的，加一道确认只会让用户以为"关不掉"。
+ */
+async function beforeToggleUserScripts(): Promise<boolean> {
+  if (form.allowUserScripts) return true
+  return confirmDanger({
+    title: '打开「允许执行自定义脚本」？',
+    consequence:
+      '打开后，在目标页添加入的脚本会被真正执行 —— 本地脚本在本机跑，服务端脚本用你已连接的服务器账号跑。' +
+      '本工具不检查脚本内容，也不会替你挡住写错的命令。',
+    remoteEffect: 'exec',
+    remoteDetail: '执行什么完全由脚本内容决定，可能是关服务、删文件或改配置。',
+    confirmText: '我明白，打开'
+  })
+}
+
+/** 选 Git Bash 的 bash.exe（B20）。选完不立即保存，跟着「保存」一起生效。 */
+async function pickGitBash(): Promise<void> {
+  try {
+    const r = await api.app.pickExecutable({
+      title: '选择 Git Bash 的 bash.exe',
+      defaultPath: form.gitBashPath
+    })
+    if (r) form.gitBashPath = r.path
   } catch (e) {
     ElMessage.error((e as IpcBusinessError).toUserText())
   }
@@ -584,6 +634,45 @@ const exportSizeText = computed(() => {
         </el-form-item>
         <div class="hint indent">
           只影响<strong>之后新建</strong>的目标；已有目标各自的策略在目标配置里改。
+        </div>
+      </el-form>
+
+      <!-- ------------------------------------------------ 脚本执行（B20） -->
+      <el-divider content-position="left">脚本执行</el-divider>
+
+      <el-form label-width="120px" class="settings-form" @submit.prevent>
+        <el-form-item :label="SETTING_LABELS.allowUserScripts">
+          <!--
+            开关由 `before-change` 拦一道危险确认 —— 打开它是全应用里权限最大的一步
+            （从此可以在这台电脑上、以及已连接的服务器上跑任意命令）。
+          -->
+          <el-switch
+            v-model="form.allowUserScripts"
+            :before-change="beforeToggleUserScripts"
+            data-test="settings-allow-user-scripts"
+          />
+          <span class="hint inline">
+            默认<strong>关闭</strong>。关闭时目标页的脚本面板只显示开关位置，不接受执行。
+            打开后，脚本会以你的权限在本机或服务器上运行 —— 请只填自己看得懂的脚本。
+          </span>
+        </el-form-item>
+
+        <el-form-item :label="SETTING_LABELS.gitBashPath">
+          <div class="field-row">
+            <el-input
+              v-model="form.gitBashPath"
+              class="grow"
+              placeholder="留空则自动探测（通常在 Git 安装目录的 bin/bash.exe）"
+              clearable
+              data-test="settings-git-bash-path"
+            />
+            <el-button :icon="FolderOpened" @click="pickGitBash">选择…</el-button>
+          </div>
+        </el-form-item>
+        <div class="hint indent">
+          只在本机 Windows 上执行 <span class="mono">Git Bash</span> 脚本时用到。
+          自动探测会依次找常见安装位置与 <span class="mono">PATH</span>；填了路径却不存在时
+          <strong>不会静默回退</strong>，而是直接报错 —— 免得你以为在跑 Git Bash、实际跑的是别的壳。
         </div>
       </el-form>
 

@@ -27,7 +27,8 @@ describe('B15 / T15.4 错误文案表', () => {
   const entries = Object.entries(ERROR_TEXT)
 
   it('覆盖全部错误码（Record 类型已保证，这里再确认一次不是空的）', () => {
-    // 目前 49 条；数量本身不是目标，但"突然少了一半"往往意味着有人误删了整段
+    // 目前 54 条（B20 加了 4 个 script 相关码）；数量本身不是目标，
+    // 但"突然少了一半"往往意味着有人误删了整段
     expect(entries.length).toBe(Object.keys(ErrorCode).length)
     expect(entries.length).toBeGreaterThan(40)
   })

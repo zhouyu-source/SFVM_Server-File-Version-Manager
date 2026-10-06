@@ -23,6 +23,8 @@ import {
   knownHosts,
   releaseItems,
   releases,
+  scriptRuns,
+  scriptStepRuns,
   targets,
   type NewArchive,
   type NewAuditLog,
@@ -30,8 +32,11 @@ import {
   type NewEnvironment,
   type NewRelease,
   type NewReleaseItem,
+  type NewScriptRun,
+  type NewScriptStepRun,
   type NewTarget
 } from './schema'
+import { DEFAULT_SCRIPT_RUN_LIST_LIMIT } from '../../shared/contracts/script'
 
 /** 统一的更新时间戳（ISO-8601 UTC）。 */
 function ts(): string {
@@ -511,6 +516,96 @@ export function createRepositories(db: Db) {
     }
   }
 
+  /* ----------------------------------------------------- 脚本运行记录（B20） */
+
+  /**
+   * 一次脚本运行。
+   *
+   * `startedAt` 可以显式指定（与 `archives.create` 同理）：将来若有"补录"或
+   * 测试夹具需要固定时间，不至于又要改仓储。
+   */
+  const scriptRunsRepo = {
+    get: (id: string) => db.select().from(scriptRuns).where(eq(scriptRuns.id, id)).get(),
+
+    /** 某个目标的运行记录：按开始时间倒序（新的在前） */
+    listByTarget: (targetId: string, limit = DEFAULT_SCRIPT_RUN_LIST_LIMIT) =>
+      db
+        .select()
+        .from(scriptRuns)
+        .where(eq(scriptRuns.targetId, targetId))
+        .orderBy(desc(scriptRuns.startedAt))
+        .limit(limit)
+        .all(),
+
+    /** 按任务查（任务台里点一个脚本任务，想知道它写了哪条运行记录） */
+    listByJob: (jobId: string) =>
+      db.select().from(scriptRuns).where(eq(scriptRuns.jobId, jobId)).all(),
+
+    create: (input: Omit<NewScriptRun, 'id' | 'startedAt'> & { startedAt?: string }) => {
+      const row: NewScriptRun = { ...input, id: newId(), startedAt: input.startedAt ?? ts() }
+      db.insert(scriptRuns).values(row).run()
+      return scriptRunsRepo.get(row.id)!
+    },
+
+    /** 落终态。`errorMessage` 传 null 表示清掉（重跑一条同 id 记录时不会发生，但保持对称） */
+    finish: (id: string, status: string, errorMessage: string | null = null) => {
+      db.update(scriptRuns)
+        .set({ status, errorMessage, finishedAt: ts() })
+        .where(eq(scriptRuns.id, id))
+        .run()
+      return scriptRunsRepo.get(id)
+    },
+
+    remove: (id: string) => {
+      db.delete(scriptRuns).where(eq(scriptRuns.id, id)).run()
+    }
+  }
+
+  const scriptStepRunsRepo = {
+    get: (id: string) => db.select().from(scriptStepRuns).where(eq(scriptStepRuns.id, id)).get(),
+
+    listByRun: (runId: string) =>
+      db
+        .select()
+        .from(scriptStepRuns)
+        .where(eq(scriptStepRuns.runId, runId))
+        .orderBy(scriptStepRuns.seq)
+        .all(),
+
+    create: (input: Omit<NewScriptStepRun, 'id' | 'startedAt'> & { startedAt?: string }) => {
+      const row: NewScriptStepRun = { ...input, id: newId(), startedAt: input.startedAt ?? ts() }
+      db.insert(scriptStepRuns).values(row).run()
+      return scriptStepRunsRepo.get(row.id)!
+    },
+
+    /**
+     * 落一步的终态。
+     *
+     * 做成"一次给全"的 patch 而不是几个小方法：这些字段**必须一起确定**
+     * （退出码、耗时、输出尾部、截断标志在同一时刻才知道），分成多次写会出现
+     * "状态已是 failed 但还没有错误说明"的中间态被 UI 读到。
+     */
+    finish: (
+      id: string,
+      patch: {
+        status: string
+        exitCode: number | null
+        durationMs: number | null
+        outputPath: string | null
+        outputBytes: number
+        truncated: boolean
+        outputTail: string | null
+        errorMessage: string | null
+      }
+    ) => {
+      db.update(scriptStepRuns)
+        .set({ ...patch, finishedAt: ts() })
+        .where(eq(scriptStepRuns.id, id))
+        .run()
+      return scriptStepRunsRepo.get(id)
+    }
+  }
+
   return {
     connections: connectionsRepo,
     knownHosts: knownHostsRepo,
@@ -520,7 +615,9 @@ export function createRepositories(db: Db) {
     releaseItems: releaseItemsRepo,
     archives: archivesRepo,
     settings: settingsRepo,
-    audit: auditRepo
+    audit: auditRepo,
+    scriptRuns: scriptRunsRepo,
+    scriptStepRuns: scriptStepRunsRepo
   }
 }
 

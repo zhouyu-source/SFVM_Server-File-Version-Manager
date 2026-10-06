@@ -11,7 +11,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { Warning } from '@element-plus/icons-vue'
-import { remoteEffectLine, type RemoteEffect } from '../utils/danger'
+import { remoteEffectAlertType, remoteEffectLine, type RemoteEffect } from '../utils/danger'
 
 const props = defineProps<{
   modelValue: boolean
@@ -21,14 +21,14 @@ const props = defineProps<{
   /** 危险等级的提示文案（如"此操作不可恢复"） */
   warning?: string
   /**
-   * 对服务器的影响（B15 / T15.6）。
+   * 对服务器的影响（B15 / T15.6，B20 加 `exec` 档）。
    *
    * **必填**，且由 `remoteEffectLine()` 统一渲染 —— 见 `utils/danger.ts` 里
    * "为什么要把这句话统一起来"。做成必填是因为：默认值无论取哪个都会有人漏填，
    * 而漏填的后果是"危险操作没告诉你它删不删服务器文件"。
    */
   remoteEffect: RemoteEffect
-  /** remoteEffect === 'files' 时说明删什么 */
+  /** remoteEffect 为 'files' / 'exec' 时说明具体动什么 */
   remoteDetail?: string
   confirmText?: string
   cancelText?: string
@@ -89,11 +89,12 @@ function close(): void {
 
     <!--
       服务器影响单独一块：它是这类弹窗里最要紧的一句话，不该混在正文里被读漏。
-      会删服务器文件时用 danger 色，不删时用 info 色 —— 颜色本身也在传达"严重程度"。
+      颜色由 `remoteEffectAlertType()` 统一决定（不删文件 info / 执行命令 warning /
+      删文件 error）—— 颜色本身也在传达"严重程度"，别再写回三元表达式。
     -->
     <el-alert
       class="effect"
-      :type="remoteEffect === 'files' ? 'error' : 'info'"
+      :type="remoteEffectAlertType(remoteEffect)"
       show-icon
       :closable="false"
       :title="effectText"

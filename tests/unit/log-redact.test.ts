@@ -133,4 +133,44 @@ describe('scrubText（第二道防线）', () => {
     const s = 'published /opt/app/dist to 10.0.0.1 in 12s'
     expect(scrubText(s)).toBe(s)
   })
+
+  it('只有用户名、没有密码时不误伤', () => {
+    const s = 'http://onlyuser@host/p'
+    expect(scrubText(s)).toBe(s)
+  })
+
+  it('同一条文本里多个 URL 都处理，且用户名保留', () => {
+    const s = scrubText('a https://u1:p1@h1/x b sftp://u2:p2@h2/y')
+    expect(s).not.toContain('p1')
+    expect(s).not.toContain('p2')
+    expect(s).toContain('u1:***@h1')
+    expect(s).toContain('u2:***@h2')
+  })
+
+  /**
+   * 性能回归（B20 加）。
+   *
+   * 这个函数在**每一次脚本输出**上跑，而单步输出上限是 8MB —— 一次 `mvn package`
+   * 的日志足够把主进程冻住。原来的 URL 正则用贪婪 `\w+`，在没有匹配的长 token
+   * （编译日志 / base64 / 压缩过的 JS 都是没有空格的连续串）上会逐个回退，
+   * 复杂度 O(n²)：实测 10K 字符 65ms、100K 字符 **6.4 秒**。
+   *
+   * 阈值给得很松（200K 字符 < 2 秒）。修好之后这里是 ~30ms，
+   * 而"退化回二次"会直接变成 ~25 秒，所以它拦得住回归，又不会在慢机器上误报。
+   */
+  it('长文本上是线性的（贪婪量词退化成 O(n²) 会让这里超时）', () => {
+    const n = 200_000
+    const plain = 'x'.repeat(n)
+    const t0 = Date.now()
+    scrubText(plain)
+    const plainMs = Date.now() - t0
+
+    const urls = 'sftp://u:p@h/'.repeat(Math.ceil(n / 14)).slice(0, n)
+    const t1 = Date.now()
+    scrubText(urls)
+    const urlMs = Date.now() - t1
+
+    expect(plainMs, `20 万字符的纯 token 用了 ${plainMs}ms`).toBeLessThan(2000)
+    expect(urlMs, `20 万字符的重复凭据 URL 用了 ${urlMs}ms`).toBeLessThan(2000)
+  })
 })

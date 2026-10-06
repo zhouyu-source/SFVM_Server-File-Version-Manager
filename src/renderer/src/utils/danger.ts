@@ -17,7 +17,14 @@
  */
 import { ElMessageBox } from 'element-plus'
 
-export type RemoteEffect = 'none' | 'files'
+/**
+ * 三档，按"后果的可预测性"递增：
+ * - `none`：只动本地，服务器一个字节都不碰（删连接 / 删目标配置）。
+ * - `files`：会删服务器上的文件，**且删什么是确定的**（保留策略 / 回滚 / 删归档）。
+ * - `exec`：会在服务器上跑用户填写的命令 —— **后果由命令本身决定**，
+ *  本工具无法保证它删了什么（B20 打开"允许执行自定义脚本"就属这一档）。
+ */
+export type RemoteEffect = 'none' | 'files' | 'exec'
 
 /**
  * "对服务器的影响"这句话的唯一来源。
@@ -29,9 +36,28 @@ export function remoteEffectLine(effect: RemoteEffect, detail?: string): string 
   if (effect === 'none') {
     return '【对服务器的影响】不会删除或修改服务器上的任何文件。'
   }
+  if (effect === 'exec') {
+    // 这一档不能承诺任何事 —— 说"可能重启服务或删除数据"是描述**最常见**的两种脚本，
+    // 而不是它的上限。真正的护栏是"脚本由你自己填写"。
+    return detail
+      ? `【对服务器的影响】会在服务器上执行你填写的命令 —— ${detail}`
+      : '【对服务器的影响】会在服务器上执行你填写的命令，可能重启服务、删除文件或修改配置，后果由脚本内容决定。'
+  }
   return detail
     ? `【对服务器的影响】会删除服务器上的文件 —— ${detail}`
     : '【对服务器的影响】会删除服务器上的文件，且本工具无法恢复它们。'
+}
+
+/**
+ * `el-alert` 的 type（颜色也在传达严重程度）。
+ *
+ * 与 `remoteEffectLine()` 放在一起，是为了让"文案"和"颜色"永远同档升级 ——
+ * 上一次加档时就差点只改了文案、漏了颜色。
+ */
+export function remoteEffectAlertType(effect: RemoteEffect): 'info' | 'warning' | 'error' {
+  if (effect === 'none') return 'info'
+  if (effect === 'exec') return 'warning'
+  return 'error'
 }
 
 export interface DangerConfirmInput {
@@ -39,7 +65,7 @@ export interface DangerConfirmInput {
   /** 会发生什么（本机的后果） */
   consequence: string
   remoteEffect: RemoteEffect
-  /** `remoteEffect === 'files'` 时说明删什么 */
+  /** `remoteEffect` 为 `'files'` / `'exec'` 时说明具体动什么 */
   remoteDetail?: string
   confirmText?: string
   cancelText?: string

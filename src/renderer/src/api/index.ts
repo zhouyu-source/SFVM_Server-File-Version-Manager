@@ -34,7 +34,8 @@ import type {
   LocalArtifactInfo,
   OpenShellResult,
   PickArtifactInput,
-  PickDirectoryInput
+  PickDirectoryInput,
+  PickExecutableInput
 } from '../../../shared/contracts/workspace'
 import type {
   JobCancelResult,
@@ -88,6 +89,13 @@ import type {
   DeployResidueCleanResult,
   DeployStartInput
 } from '../../../shared/contracts/deploy'
+import type {
+  ScriptCapabilities,
+  ScriptRunDetailInput,
+  ScriptRunListInput,
+  ScriptRunStepInput,
+  ScriptRunView
+} from '../../../shared/contracts/script'
 
 /** 跨进程业务异常。组件可捕获后按 code 分支，或用 message 直接展示。 */
 export class IpcBusinessError extends Error {
@@ -161,6 +169,10 @@ export const api = {
     /** 选择一个本地目录（下载保存位置）；取消返回 null（B12 / T12.3） */
     pickDirectory: (input: PickDirectoryInput): Promise<{ path: string } | null> =>
       call('app:pickDirectory', () => window.sfvm.app.pickDirectory(input)),
+
+    /** 选择一个可执行文件；取消返回 null（B20） */
+    pickExecutable: (input: PickExecutableInput): Promise<{ path: string } | null> =>
+      call('app:pickExecutable', () => window.sfvm.app.pickExecutable(input)),
 
     /** 读数据目录状态（B18） */
     dataLocationGet: (): Promise<DataLocationOutput> =>
@@ -391,6 +403,22 @@ export const api = {
     /** 从文本导入（粘贴） */
     import: (input: ConfigImportInput): Promise<ConfigImportResult> =>
       call('settings.import', () => window.sfvm.settings.import(input))
+  },
+
+  /* ------------------------------------------------ 自定义脚本（B20） */
+  scripts: {
+    capabilities: (): Promise<ScriptCapabilities> =>
+      call('scripts.capabilities', () => window.sfvm.scripts.capabilities()),
+
+    /** 跑一条脚本：立刻返回任务视图，进度与日志走 jobs.onProgress / onLog */
+    runStep: (input: ScriptRunStepInput): Promise<JobView> =>
+      call('scripts.runStep', () => window.sfvm.scripts.runStep(input)),
+
+    runs: (input: ScriptRunListInput): Promise<ScriptRunView[]> =>
+      call('scripts.runs', () => window.sfvm.scripts.runs(input)),
+
+    runDetail: (input: ScriptRunDetailInput): Promise<ScriptRunView> =>
+      call('scripts.runDetail', () => window.sfvm.scripts.runDetail(input))
   },
 
   /* ------------------------------------------------ 菜单命令（B15 / T15.7） */

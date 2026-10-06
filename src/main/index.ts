@@ -24,6 +24,7 @@ import { registerArchiveHandlers } from './ipc/archive'
 import { registerDeployHandlers } from './ipc/deploy'
 import { registerRollbackHandlers } from './ipc/rollback'
 import { registerReconcileHandlers } from './ipc/reconcile'
+import { registerScriptHandlers } from './ipc/script'
 import { closeAppDatabase, getRepositories, openAppDatabase, openedDataDir, backupDatabaseTo } from './db'
 import { DB_FILENAME } from './db/client'
 import { SshConnectionPool } from './services/ssh-client'
@@ -35,6 +36,7 @@ import { createArchiveDownloadService } from './services/archive-download'
 import { createDeployService } from './services/deploy'
 import { createRollbackService } from './services/rollback'
 import { createReconcileService } from './services/reconcile'
+import { createScriptService } from './services/script'
 import {
   attachJobEventPush,
   createJobGuard,
@@ -348,8 +350,18 @@ if (!gotLock) {
     // B01：统一 IPC 注册框架（入参 Zod 校验 + IpcResult 信封）
     registerAppHandlers({ dataLocation: dataLocationService })
 
+    /**
+     * 「允许执行自定义脚本」总闸的取值函数（B20）。
+     *
+     * 连接池比设置服务先构造，所以这里先放一个**默认拒绝**的实现，
+     * 等设置服务建好之后再换成真正的读法（见下面的赋值处）。
+     * 默认值取"拒绝"是刻意的：万一哪次改动漏了这一句，后果是"用户脚本用不了"，
+     * 而不是"悄悄给本机开了个可执行任意命令的入口"。
+     */
+    let allowUserScripts = (): boolean => false
+
     // B03：SSH 连接池 + 连接管理服务
-    const pool = new SshConnectionPool()
+    const pool = new SshConnectionPool({ allowRawExec: () => allowUserScripts() })
     const repo = getRepositories()
 
     /**
@@ -371,6 +383,8 @@ if (!gotLock) {
     })
     // 应用用户选过的日志级别（没选过时给 null，等于"跟随默认"）
     setLogLevel(settingsService.current().logLevel)
+    // B20：把总闸接到真正的设置项上（默认拒绝的占位实现到此为止）
+    allowUserScripts = () => settingsService.current().allowUserScripts
 
     registerSettingsHandlers({
       settings: settingsService,
@@ -491,6 +505,25 @@ if (!gotLock) {
     const rollbackService = createRollbackService({ repo, archive: archiveService })
     registerRollbackHandlers({
       rollback: rollbackService,
+      jobs: jobService,
+      connections: connectionService,
+      pool,
+      repo
+    })
+
+    // B20：自定义脚本（本机 / 服务器各能跑一条，留档在 script_runs）
+    // 依赖 JobService（脚本以任务形式跑，与同目标的发布/回滚**共用车道**即天然互斥）
+    const scriptService = createScriptService({
+      repo,
+      // 总闸现取：用户随时可能关掉，而"关掉之后正在排队的任务也不该再跑"要靠它
+      allowUserScripts: () => allowUserScripts(),
+      gitBashPath: () => settingsService.current().gitBashPath,
+      // 完整输出落在数据目录的日志区（B18 起日志跟着数据目录走）
+      runsDir: () =>
+        join(logDirOf(openedDataDir() ?? app.getPath('userData')), 'script-runs')
+    })
+    registerScriptHandlers({
+      scripts: scriptService,
       jobs: jobService,
       connections: connectionService,
       pool,

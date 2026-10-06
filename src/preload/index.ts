@@ -21,7 +21,8 @@ import type {
   LocalArtifactInfo,
   OpenShellResult,
   PickArtifactInput,
-  PickDirectoryInput
+  PickDirectoryInput,
+  PickExecutableInput
 } from '../shared/contracts/workspace'
 import type {
   JobCancelResult,
@@ -66,6 +67,13 @@ import type {
 } from '../shared/contracts/settings'
 import type { MenuCommandPayload } from '../shared/contracts/menu'
 import type {
+  ScriptCapabilities,
+  ScriptRunDetailInput,
+  ScriptRunListInput,
+  ScriptRunStepInput,
+  ScriptRunView
+} from '../shared/contracts/script'
+import type {
   DiagnoseInput,
   ReconcileInput,
   ReconcileReport,
@@ -109,6 +117,10 @@ const api = {
     /** 选择一个本地目录（下载保存位置）；返回 null 表示用户取消（B12 / T12.3） */
     pickDirectory: (input: PickDirectoryInput): Promise<IpcResult<{ path: string } | null>> =>
       ipcRenderer.invoke(IPC_CHANNELS.APP_PICK_DIRECTORY, input),
+
+    /** 选择一个可执行文件；返回 null 表示用户取消（B20） */
+    pickExecutable: (input: PickExecutableInput): Promise<IpcResult<{ path: string } | null>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.APP_PICK_EXECUTABLE, input),
 
     /** 读数据目录状态：生效目录 / 配置目录 / 日志目录（B18） */
     dataLocationGet: (): Promise<IpcResult<DataLocationOutput>> =>
@@ -353,6 +365,25 @@ const api = {
     /** 从文本导入（粘贴用） */
     import: (input: ConfigImportInput): Promise<IpcResult<ConfigImportResult>> =>
       ipcRenderer.invoke(IPC_CHANNELS.SETTINGS_IMPORT, input)
+  },
+
+  /* ------------------------------------------------ 自定义脚本（B20） */
+  scripts: {
+    /** 总闸状态 + 本机可用的解释器（决定界面把哪些选项灰掉） */
+    capabilities: (): Promise<IpcResult<ScriptCapabilities>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SCRIPTS_CAPABILITIES),
+
+    /** 跑一条脚本；立刻返回任务视图，进度/日志走 jobs.onProgress / onLog */
+    runStep: (input: ScriptRunStepInput): Promise<IpcResult<JobView>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SCRIPTS_RUN_STEP, input),
+
+    /** 某个目标的运行记录（纯读台账） */
+    runs: (input: ScriptRunListInput): Promise<IpcResult<ScriptRunView[]>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SCRIPTS_RUNS, input),
+
+    /** 一次运行的详情 */
+    runDetail: (input: ScriptRunDetailInput): Promise<IpcResult<ScriptRunView>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SCRIPTS_RUN_DETAIL, input)
   },
 
   /* ------------------------------------------------ 菜单命令（B15 / T15.7） */

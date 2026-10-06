@@ -72,7 +72,16 @@ export const JOB_TYPES = [
   'download',
   'archive',
   'reconcile',
-  'health'
+  'health',
+  /**
+   * 自定义脚本（B20）。
+   *
+   * 一个「脚本」任务执行**一到多个**步骤（B20 只会有一个：从目标页跑单条脚本；
+   * B21 的流水线才有多步）。让它也走任务框架而不是"阻塞式 IPC"，是为了白拿三件事：
+   * 可取消、进度与日志进底部任务台、与同目标的发布/回滚**天然互斥**
+   * （任务按 `t:<targetId>` 分车道，同车道串行）。
+   */
+  'script'
 ] as const
 export const jobTypeSchema = z.enum(JOB_TYPES)
 export type JobType = z.infer<typeof jobTypeSchema>
@@ -84,7 +93,8 @@ export const JOB_TYPE_TEXT: Record<JobType, string> = {
   download: '下载',
   archive: '归档',
   reconcile: '对账',
-  health: '体检'
+  health: '体检',
+  script: '脚本'
 }
 
 export function describeJobType(type: JobType): string {

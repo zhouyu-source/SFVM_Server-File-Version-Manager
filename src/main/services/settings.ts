@@ -284,10 +284,27 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
     if (input.applySettings !== false && bundle.settings) {
       const parsed = appSettingsPatchSchema.safeParse(bundle.settings)
       if (parsed.success) {
-        persist(parsed.data)
+        /**
+         * **安全开关不随配置文件走**（B20）。
+         *
+         * 导入这件事的性质是"把别人机器上的配置搬过来"。如果导出文件里
+         * `allowUserScripts` 是开的（它默认就是关的，开着说明对方主动开过，
+         * 也可能被手工改过），照单应用就等于"导入同事的配置"顺手给本机装了个 shell。
+         * 所以这一项一律忽略，并**明确告警**告诉用户去哪儿开 —— 静默忽略会让人
+         * 以为"导入成功了、功能却没生效"，那更糟。
+         */
+        const { allowUserScripts, ...rest } = parsed.data
+        persist(rest)
+        if (allowUserScripts !== undefined) {
+          warnings.push(
+            allowUserScripts
+              ? '导出文件里「允许执行自定义脚本」是开启的，出于安全考虑已忽略；需要的话请在「设置」页手动打开。'
+              : '导出文件里的「允许执行自定义脚本」设置已忽略 —— 该开关只在本机手动修改。'
+          )
+        }
         // 设置不走 update()：那份实现会校验 + 记日志，这里的值已经过 schema，
         // 而且导入不该因为"某一项恰好坏了"就整批失败（其余三类已经写进去了）
-        applyLogLevel(parsed.data.logLevel ?? null)
+        applyLogLevel(rest.logLevel ?? null)
         result.settingsApplied = true
       } else {
         warnings.push('导出文件里的设置项不合法，已跳过（其余内容已导入）。')

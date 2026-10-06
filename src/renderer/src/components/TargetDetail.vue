@@ -20,6 +20,7 @@ import { useConnectionStore } from '../stores/connection'
 import PublishPanel from './PublishPanel.vue'
 import LocalArtifactCard from './LocalArtifactCard.vue'
 import ArchiveSection from './ArchiveSection.vue'
+import ScriptPanel from './ScriptPanel.vue'
 import type { TargetView, HealthReport, HealthCheck } from '../../../shared/contracts/workspace'
 import type { DeployCurrentVersion } from '../../../shared/contracts/deploy'
 
@@ -233,6 +234,14 @@ function icon(level: HealthCheck['level']): string {
       @deployed="onDeployed"
       @saved="ws.refreshTargets(target.environmentId)"
     />
+
+    <!--
+      脚本（B20）。
+      挂在「发布」之后、与发布同级：用户提的场景就是"构筑 → 关服务 → 发布 → 启服务"，
+      脚本与发布本来就该挨着看。B21 的流水线也落在这里。
+    -->
+    <el-divider content-position="left">脚本</el-divider>
+    <ScriptPanel :target="target" />
 
     <!-- 往期版本（B12 / T12.1~T12.7；回滚在 B13） -->
     <el-divider content-position="left">往期版本</el-divider>

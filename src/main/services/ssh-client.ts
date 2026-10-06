@@ -11,7 +11,8 @@
  * 依据 known_hosts 判定后传入；这样本层可独立测试，也避免循环依赖。
  */
 import { createHash } from 'node:crypto'
-import { Client, type ConnectConfig, type SFTPWrapper } from 'ssh2'
+import { StringDecoder } from 'node:string_decoder'
+import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from 'ssh2'
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
 import { guardSftp } from '../infra/sftp-guard'
@@ -60,6 +61,19 @@ export interface ConnectResult {
 
 export type StateListener = (state: ConnectionState) => void
 
+export interface SshConnectionPoolOptions {
+  /**
+   * 「允许执行自定义脚本」总闸（**现取**，所以注入的是函数不是值）。
+   *
+   * 连接池比设置服务先构造（池在 `main/index.ts` 里更早），所以接线层传进来的
+   * 是一个可后置赋值的读函数；默认不传 = 恒为 `false` = 拒绝。
+   * 这个默认值的取向很重要：**万一接线漏了，行为是"功能不可用"，而不是"悄悄放开"**。
+   *
+   * 关于它守的是什么，见 `execRaw()` 的注释。
+   */
+  allowRawExec?: () => boolean
+}
+
 interface Pooled {
   client: Client
   options: SshConnectOptions
@@ -83,6 +97,11 @@ interface Pooled {
 export class SshConnectionPool {
   private pool = new Map<string, Pooled>()
   private listeners = new Set<StateListener>()
+  private options: SshConnectionPoolOptions
+
+  constructor(options: SshConnectionPoolOptions = {}) {
+    this.options = options
+  }
 
   /** 订阅状态变化（T03.3 的状态广播）。返回取消订阅函数。 */
   onState(fn: StateListener): () => void {
@@ -415,6 +434,173 @@ export class SshConnectionPool {
         stream.on('close', () => {
           clearTimeout(timer)
           resolve({ stdout, stderr, code })
+        })
+      })
+    })
+  }
+
+  /**
+   * 执行**用户填写的**脚本（B20）。
+   *
+   * ## 它和 `exec()` 是两条截然不同的路
+   *
+   * `exec()` 走的是"命令由模板生成、调用方永远不能提供命令字符串"那套
+   * （`infra/remote-exec.ts` 的 `assertCommandAllowed()` 是出口自检）。
+   * 用户脚本**本质就是一段任意命令**，不可能塞进那个白名单 —— 所以这里是
+   * 一条**并列**的通道，不做白名单自检，代之以三道别的闸：
+   *
+   * 1. `allowRawExec()` 总闸（设置项 `allowUserScripts`，**默认关**）；
+   * 2. 调用前由服务层做危险确认（首次执行 / 生产环境输目标名）；
+   * 3. 输出全量过 `scrubText` 脱敏后才进日志与留档。
+   *
+   * 关键是**不动 `exec()` 一个字符**：内部命令"不可能注入"的性质完整保住，
+   * 而这里放开的是"用户明确要求的能力"，责任边界清楚。
+   *
+   * ## 与 `exec()` 的三处行为差异（都是有意为之）
+   *
+   * - **流式**：`onStdout`/`onStderr` 每收到一块就回调 —— 一次 `mvn package`
+   *   要跑几分钟，攒到最后再返回等于没有进度。
+   * - **可取消**：`opts.signal` 触发时先给远端进程发 `TERM` **再**关通道。
+   *   只 `close()` 的话通道断了、远端进程还在跑（"取消了，但服务器上还在编译"）。
+   * - **超时**：默认 5 分钟。超时同样先 `TERM`，并把 `timedOut` 交回调用方 ——
+   *   超时与"进程自己以非零码退出"是两件不同的事，不能混成一个报错。
+   */
+  async execRaw(
+    connectionId: string,
+    command: string,
+    opts: {
+      timeoutMs?: number
+      signal?: AbortSignal
+      onStdout?: (chunk: Buffer) => void
+      onStderr?: (chunk: Buffer) => void
+    } = {}
+  ): Promise<{ stdout: string; stderr: string; code: number | null; timedOut: boolean }> {
+    if (this.options.allowRawExec?.() !== true) {
+      // 二道闸：即便将来有人绕过服务层直接调它，也会在这里被拦下。
+      throw new AppError(ErrorCode.E_SCRIPT_DISABLED, { connectionId })
+    }
+    const p = this.pool.get(connectionId)
+    if (!p) throw new AppError(ErrorCode.E_CONN_LOST, { connectionId })
+    if (typeof command !== 'string' || !command.trim()) {
+      throw new AppError(ErrorCode.E_PARAM, { reason: 'empty-command' })
+    }
+
+    const timeoutMs = Math.max(1000, opts.timeoutMs ?? 300_000)
+
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timedOut = false
+      let stdout = ''
+      let stderr = ''
+      let code: number | null = null
+      let stream: ClientChannel | null = null
+      let timer: NodeJS.Timeout | null = null
+      let forceTimer: NodeJS.Timeout | null = null
+
+      /**
+       * stdout / stderr **各一个**增量解码器。
+       *
+       * 不能直接 `d.toString('utf8')`：SSH 通道的分块边界与字符边界无关，
+       * 一个中文字被切在两块之间就会"偶尔乱一下"（同 `infra/local-exec.ts`
+       * 的 `createChunkDecoder`）。这里两个流各自独立分块，所以不能共用一个。
+       *
+       * 注意调用方（`services/script-runner.ts`）走的是 `opts.onStdout/onStderr`
+       * 那条流式路，传的是**原始 Buffer**，由它自己解码 —— 此处这两个字符串
+       * 只是"顺带攒一份"，但也得攒对，否则将来有人用它就会踩到同一个坑。
+       */
+      const outDecoder = new StringDecoder('utf8')
+      const errDecoder = new StringDecoder('utf8')
+
+      /** 先 SIGTERM 再关通道：见方法注释里"可取消"那一段。 */
+      function killRemote(): void {
+        if (!stream) return
+        try {
+          stream.signal('TERM')
+        } catch (err) {
+          logger.debug(`execRaw: signal TERM failed: ${(err as Error).message}`)
+        }
+        try {
+          stream.close()
+        } catch (err) {
+          logger.debug(`execRaw: close failed: ${(err as Error).message}`)
+        }
+      }
+
+      function cleanup(): void {
+        if (timer) clearTimeout(timer)
+        if (forceTimer) clearTimeout(forceTimer)
+        opts.signal?.removeEventListener('abort', onAbort)
+      }
+
+      function settle(err: Error | null): void {
+        if (settled) return
+        settled = true
+        cleanup()
+        if (err) reject(err)
+        else resolve({ stdout, stderr, code, timedOut })
+      }
+
+      function onAbort(): void {
+        killRemote()
+        settle(new AppError(ErrorCode.E_JOB_CANCELLED, { connectionId }))
+      }
+
+      timer = setTimeout(() => {
+        timedOut = true
+        killRemote()
+        // 不立刻 settle：给 `close` 一点时间把已经收到的输出交回来 ——
+        // 超时那一刻的输出往往正是"卡在哪一步"的唯一线索。
+        // 但也不能无限等（远端可能不理会 TERM），3 秒兜底强制结束。
+        forceTimer = setTimeout(() => {
+          killRemote()
+          settle(new AppError(ErrorCode.E_SCRIPT_TIMEOUT, { connectionId, command }))
+        }, 3000)
+      }, timeoutMs)
+
+      if (opts.signal?.aborted) {
+        onAbort()
+        return
+      }
+      opts.signal?.addEventListener('abort', onAbort, { once: true })
+
+      p.client.exec(command, (err, ch) => {
+        if (err) {
+          settle(new AppError(ErrorCode.E_CONN_LOST, { original: err.message }))
+          return
+        }
+        if (settled) {
+          // 兜底：超时/取消已经把 Promise 结了，但通道刚建出来 —— 关掉它
+          try {
+            ch.close()
+          } catch {
+            /* 已经断了就算了 */
+          }
+          return
+        }
+        stream = ch
+        ch.on('data', (d: Buffer) => {
+          stdout += outDecoder.write(d)
+          opts.onStdout?.(d)
+        })
+        ch.stderr.on('data', (d: Buffer) => {
+          stderr += errDecoder.write(d)
+          opts.onStderr?.(d)
+        })
+        ch.on('exit', (c: number | null) => {
+          code = c
+        })
+        ch.on('close', () => {
+          // 通道结束：把解码器里压着的尾巴交出来（也可能是最后半个字符）
+          stdout += outDecoder.end()
+          stderr += errDecoder.end()
+          if (timedOut) {
+            settle(new AppError(ErrorCode.E_SCRIPT_TIMEOUT, { connectionId, exitCode: code }))
+            return
+          }
+          settle(null)
+        })
+        ch.on('error', (e: Error) => {
+          settle(new AppError(ErrorCode.E_CONN_LOST, { original: e.message }))
         })
       })
     })

@@ -18,6 +18,7 @@ import {
   openTerminalInputSchema,
   pickArtifactInputSchema,
   pickDirectoryInputSchema,
+  pickExecutableInputSchema,
   revealPathInputSchema,
   type OpenShellResult
 } from '../../shared/contracts/workspace'
@@ -174,6 +175,40 @@ export function registerAppHandlers(deps: AppHandlerDeps = {}): void {
       return { path: result.filePaths[0] }
     } catch (err) {
       logger.error(`pickDirectory failed: ${(err as Error).message}`)
+      throw new AppError(ErrorCode.E_UNKNOWN, { original: (err as Error).message })
+    }
+  })
+
+  /**
+   * 选择一个可执行文件（B20：设置「Git Bash 路径」）。
+   *
+   * 与上面几个同属"用途限定"的选路通道：**只回传路径、不读内容**。
+   * 这里额外挂一个可执行文件过滤（Windows 上 Git 的安装目录里同时有
+   * `bash.exe`、`git-bash.exe`、`sh.exe`，不过滤的话很容易选错一个能起、
+   * 但行为不同的壳）。过滤器只是"默认顺序"，用户仍可切到"所有文件"
+   * —— 所以服务层那边还要再做一次存在性校验，不能只信对话框。
+   */
+  registerHandler(IPC_CHANNELS.APP_PICK_EXECUTABLE, pickExecutableInputSchema, async (input) => {
+    const win = parentWindow()
+    const options: OpenDialogOptions = {
+      title: input.title,
+      buttonLabel: '选择',
+      ...(input.defaultPath ? { defaultPath: input.defaultPath } : {}),
+      properties: ['openFile'],
+      filters: [
+        { name: '可执行文件', extensions: ['exe', 'cmd', 'bat', 'com'] },
+        { name: '所有文件', extensions: ['*'] }
+      ]
+    }
+
+    try {
+      const result = win
+        ? await dialog.showOpenDialog(win, options)
+        : await dialog.showOpenDialog(options)
+      if (result.canceled || result.filePaths.length === 0) return null
+      return { path: result.filePaths[0] }
+    } catch (err) {
+      logger.error(`pickExecutable failed: ${(err as Error).message}`)
       throw new AppError(ErrorCode.E_UNKNOWN, { original: (err as Error).message })
     }
   })

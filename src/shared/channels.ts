@@ -18,6 +18,8 @@ export const IPC_CHANNELS = {
   APP_OPEN_TERMINAL: 'app:openTerminal',
   /** 选择一个本地目录（默认值可给，用于下载保存位置）；取消返回 null（B12 / T12.3） */
   APP_PICK_DIRECTORY: 'app:pickDirectory',
+  /** 选择一个可执行文件（B20：「Git Bash 路径」）；取消返回 null */
+  APP_PICK_EXECUTABLE: 'app:pickExecutable',
   /** 读数据目录状态：生效目录 / 配置目录 / 日志目录（B18） */
   APP_DATA_LOCATION_GET: 'app:dataLocation.get',
   /** 改数据目录：复制台账 + 写指针文件，重启后生效（B18） */
@@ -152,6 +154,21 @@ export const IPC_CHANNELS = {
   SETTINGS_IMPORT: 'settings.import',
   /** 从文件导入（弹打开对话框） */
   SETTINGS_IMPORT_FROM_FILE: 'settings.importFromFile',
+
+  /* ------------------------------------------------ 自定义脚本（B20 / T20.7） */
+  /**
+   * 能力探测：总闸开没开、本机有哪些解释器。
+   *
+   * 设置页与目标页都要它 —— 放在这里而不是各自去猜，是为了让"为什么选项是灰的"
+   * 只有一个答案来源。
+   */
+  SCRIPTS_CAPABILITIES: 'scripts.capabilities',
+  /** 跑一条脚本（本机或服务器）：内部走 JobService（可取消、进度与日志进任务台） */
+  SCRIPTS_RUN_STEP: 'scripts.runStep',
+  /** 某个目标的运行记录（**纯读台账**，不连服务器） */
+  SCRIPTS_RUNS: 'scripts.runs',
+  /** 一次运行的详情：每步的状态 / 退出码 / 耗时 / 输出尾部 */
+  SCRIPTS_RUN_DETAIL: 'scripts.runDetail',
 
   /* ------------------------------------------ 工作环境与目标（B05 / T05.8） */
   ENV_LIST: 'env.list',

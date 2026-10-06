@@ -96,7 +96,22 @@ export function redact(value: unknown, depth = 0, seen = new WeakSet<object>()):
  * 纯自由文本里的**裸串**（如 `auth failed for hunter2`）无法可靠识别：
  * 任何正则都会漏，而放宽规则又会误伤正常日志。
  * 因此约定是：凭据必须以结构化字段形式传给 logger，不要拼进自由文本。
+ *
+ * ## 性能：这里的两个正则必须是**线性**的（B20 修）
+ *
+ * 这个函数在每一条日志与每一次脚本输出上都跑，而脚本输出一次可以有 8MB。
+ * 原来的 URL 那条写的是 `(\w+:\/\/[^:/\s]+:)([^@\s]+)(@)`：`\w+` 是贪婪的，
+ * 在一个**没有匹配**的长字符串上（编译日志、base64 串、压缩过的 JS —— 全是没有
+ * 空格的连续 token），每个起始位置都会把整段扫一遍再逐个回退，于是总代价是
+ * O(n²)。实测：10K 字符 65ms、100K 字符 **6.4 秒** —— 8MB 的输出会把主进程
+ * 冻住到天荒地老。
+ *
+ * 修法是**把所有量词都变成有界量词**：协议名 ≤32、用户名密码 ≤256。
+ * 真实凭据远短于这个上限，而有界量词让"匹配失败"的代价也变成常数。
+ * （顺带要求协议名以字母开头，比原来的 `\w+` 更贴合实际形态。）
  */
+const SCHEME_WITH_AUTHORITY = /([a-z][a-z0-9+.-]{1,31}:\/\/)([^@\s/]{1,256})@/gi
+
 export function scrubText(text: string): string {
   return (
     text
@@ -105,7 +120,13 @@ export function scrubText(text: string): string {
         /("?(?:password|passwd|passphrase|secret|token|api_?key)"?\s*[:=]\s*)("?)([^"',\s}]+)/gi,
         (_m, prefix: string, quote: string) => `${prefix}${quote}${REDACTED}`
       )
-      // URL 形态：https://user:pass@host
-      .replace(/(\w+:\/\/[^:/\s]+:)([^@\s]+)(@)/g, `$1${REDACTED}$3`)
+      // URL 形态：https://user:pass@host —— 只替换"密码"那一段，用户名保留
+      // （排障时要看的是"用哪个账号连的"，不是密码）
+      .replace(SCHEME_WITH_AUTHORITY, (m, scheme: string, userinfo: string) => {
+        const colon = userinfo.lastIndexOf(':')
+        // 没有 `user:pass` 的形态（只有用户名）就不动它
+        if (colon < 0) return m
+        return `${scheme}${userinfo.slice(0, colon)}:${REDACTED}@`
+      })
   )
 }

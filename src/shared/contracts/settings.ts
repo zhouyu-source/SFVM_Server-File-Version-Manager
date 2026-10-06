@@ -66,7 +66,26 @@ export const appSettingsSchema = z.object({
    */
   hashCompatMode: z.boolean(),
   /** 新建目标的默认保留策略；`null` = 新建目标默认不清理 */
-  defaultRetainPolicy: retainPolicySchema.nullable()
+  defaultRetainPolicy: retainPolicySchema.nullable(),
+  /**
+   * **允许执行自定义脚本**（B20）—— 默认关闭。
+   *
+   * 打开它等于给这个应用装了一个 shell：脚本内容由用户自由填写，可以在本机跑、
+   * 也可以在服务器上跑（包括 `kill` / `systemctl` 这类内部白名单里根本没有的命令）。
+   * 这是本应用唯一一处"用户提供的命令字符串会被执行"的地方，所以它：
+   * 1. 默认 `false`；
+   * 2. 打开时走危险确认（说明"允许在服务器上执行任意命令"）；
+   * 3. **配置导入时不会被自动打开**（见 `services/settings.ts` 的导入分支）——
+   *    否则"导入同事的配置文件"会顺手把这个开关打开。
+   */
+  allowUserScripts: z.boolean(),
+  /**
+   * Git Bash 的 `bash.exe` 完整路径（B20）。
+   *
+   * `null` = 自动探测常见安装位置。留这个手工口子是因为：Git for Windows 可以装到
+   * 任意目录，而"探测不到就把选项灰掉"必须有一条自救路径 —— 否则用户只能改代码。
+   */
+  gitBashPath: z.string().min(1).nullable()
 })
 export type AppSettings = z.infer<typeof appSettingsSchema>
 
@@ -79,7 +98,11 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   transferConcurrency: DEFAULT_TRANSFER_CONCURRENCY,
   logLevel: null,
   hashCompatMode: true,
-  defaultRetainPolicy: { mode: 'count', value: DEFAULT_RETAIN_COUNT }
+  defaultRetainPolicy: { mode: 'count', value: DEFAULT_RETAIN_COUNT },
+  // 安全开关一律"默认关"：漏配的后果是功能不可用（用户会看到提示），
+  // 而默认开的后果是"不知不觉装了个人人可用的 shell"。
+  allowUserScripts: false,
+  gitBashPath: null
 }
 
 /** `app_settings` 表里的 key —— 与设置项同名，避免多一层映射。 */
@@ -88,7 +111,9 @@ export const SETTING_KEYS = {
   transferConcurrency: 'transfer.concurrency',
   logLevel: 'log.level',
   hashCompatMode: 'hash.compatMode',
-  defaultRetainPolicy: 'archive.defaultRetainPolicy'
+  defaultRetainPolicy: 'archive.defaultRetainPolicy',
+  allowUserScripts: 'script.allowUserScripts',
+  gitBashPath: 'script.gitBashPath'
 } as const satisfies Record<keyof AppSettings, string>
 
 export type SettingsKey = (typeof SETTING_KEYS)[keyof typeof SETTING_KEYS]
@@ -120,7 +145,9 @@ export const SETTING_LABELS: Record<keyof AppSettings, string> = {
   transferConcurrency: '传输并发数',
   logLevel: '日志级别',
   hashCompatMode: '算法兼容模式',
-  defaultRetainPolicy: '默认保留策略'
+  defaultRetainPolicy: '默认保留策略',
+  allowUserScripts: '允许执行自定义脚本',
+  gitBashPath: 'Git Bash 路径'
 }
 
 /**
@@ -229,6 +256,31 @@ export function buildSettings(read: (key: string) => string | null): {
     const r = retainPolicySchema.safeParse(v)
     return r.success ? { ok: true, value: r.data } : bad()
   }, '不自动清理')
+
+  /**
+   * 两个 B20 的设置项。
+   *
+   * `allowUserScripts` 的解析**刻意不接受"看起来像真"的杂值**（`1` / `yes` / `on`）：
+   * 它是个安全开关，"把一个看不懂的值当成开启"是最坏的一种宽容。
+   */
+  take('allowUserScripts', (t) => {
+    const v = scalar(t)
+    if (typeof v === 'boolean') return { ok: true, value: v }
+    if (v === 'true') return { ok: true, value: true }
+    if (v === 'false') return { ok: true, value: false }
+    return bad()
+  }, '关闭')
+
+  take(
+    'gitBashPath',
+    (t) => {
+      const v = scalar(t)
+      if (v === null || v === '') return { ok: true, value: null }
+      if (typeof v !== 'string' || !v.trim()) return bad()
+      return { ok: true, value: v.trim() }
+    },
+    '自动探测'
+  )
 
   return { settings: out, issues }
 }

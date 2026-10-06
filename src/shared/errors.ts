@@ -74,7 +74,13 @@ export const ErrorCode = {
   E_DUPLICATE_NAME: 'E_DUPLICATE_NAME',
   E_IN_USE: 'E_IN_USE',
   E_REMOTE_RESIDUE: 'E_REMOTE_RESIDUE',
-  E_TARGET_NAME_MISSING: 'E_TARGET_NAME_MISSING'
+  E_TARGET_NAME_MISSING: 'E_TARGET_NAME_MISSING',
+
+  // ---- 自定义脚本（B20）----
+  E_SCRIPT_DISABLED: 'E_SCRIPT_DISABLED',
+  E_SCRIPT_SHELL_MISSING: 'E_SCRIPT_SHELL_MISSING',
+  E_SCRIPT_TIMEOUT: 'E_SCRIPT_TIMEOUT',
+  E_SCRIPT_EXIT: 'E_SCRIPT_EXIT'
 } as const
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode]
@@ -274,6 +280,23 @@ export const ERROR_TEXT: Record<ErrorCodeValue, ErrorDescriptor> = {
   E_TARGET_NAME_MISSING: {
     message: '文件型目标的服务器端路径没有文件名',
     hint: '文件型目标的路径必须以文件名结尾（例如 /opt/svc/order.jar），请修改目标配置。'
+  },
+
+  E_SCRIPT_DISABLED: {
+    message: '自定义脚本功能未开启',
+    hint: '在「设置」页打开「允许执行自定义脚本」后再试。该开关默认关闭 —— 开启后脚本会在本机或服务器上执行你填写的任意命令。'
+  },
+  E_SCRIPT_SHELL_MISSING: {
+    message: '本机没有找到可用的脚本解释器',
+    hint: 'Windows 上需要 PowerShell（系统自带）或 Git Bash（装 Git for Windows 后可用）；也可在「设置」页手工填写 Git Bash 的完整路径。'
+  },
+  E_SCRIPT_TIMEOUT: {
+    message: '脚本执行超时',
+    hint: '已按这一步配置的超时时间终止它。可以调大超时，或先手工确认这条命令的实际耗时。'
+  },
+  E_SCRIPT_EXIT: {
+    message: '脚本以非零退出码结束',
+    hint: '展开「运行记录」看输出，定位失败原因后修改脚本再试。'
   }
 }
 
