@@ -377,7 +377,7 @@ describeE2E('B20 DoD：脚本执行底座', () => {
     await openSettings(cdp)
     expect(
       await switchOn(cdp, 'settings-allow-user-scripts'),
-      '「允许执行自定义脚本」默认必须是关闭的'
+      '「开启自定义脚本」默认必须是关闭的'
     ).toBe(false)
     // Git Bash 路径默认留空（走自动探测）
     const gitPath = await cdp.evaluate<string>(`(() => {
@@ -403,7 +403,7 @@ describeE2E('B20 DoD：脚本执行底座', () => {
     ).toBe(false)
 
     const gate = await textOf(cdp, 'script-gate-off')
-    expect(gate).toContain('允许执行自定义脚本')
+    expect(gate).toContain('开启自定义脚本')
     // 关着的时候也要说清"开启后会发生什么"，而不是一句"未开启"了事
     expect(gate).toContain('任意命令')
     console.info('[B20 DoD] 总闸默认关闭：面板只显示开启指引，未渲染表单')

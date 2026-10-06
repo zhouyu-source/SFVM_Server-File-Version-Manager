@@ -298,8 +298,8 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
         if (allowUserScripts !== undefined) {
           warnings.push(
             allowUserScripts
-              ? '导出文件里「允许执行自定义脚本」是开启的，出于安全考虑已忽略；需要的话请在「设置」页手动打开。'
-              : '导出文件里的「允许执行自定义脚本」设置已忽略 —— 该开关只在本机手动修改。'
+              ? '导出文件里「开启自定义脚本」是开启的，出于安全考虑已忽略；需要的话请在「设置」页手动打开。'
+              : '导出文件里的「开启自定义脚本」设置已忽略 —— 该开关只在本机手动修改。'
           )
         }
         // 设置不走 update()：那份实现会校验 + 记日志，这里的值已经过 schema，

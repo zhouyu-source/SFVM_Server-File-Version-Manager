@@ -304,7 +304,7 @@ export const ERROR_TEXT: Record<ErrorCodeValue, ErrorDescriptor> = {
 
   E_SCRIPT_DISABLED: {
     message: '自定义脚本功能未开启',
-    hint: '在「设置」页打开「允许执行自定义脚本」后再试。该开关默认关闭 —— 开启后脚本会在本机或服务器上执行你填写的任意命令。'
+    hint: '在「设置」页打开「开启自定义脚本」后再试。该开关默认关闭 —— 开启后脚本会在本机或服务器上执行你填写的任意命令。'
   },
   E_SCRIPT_SHELL_MISSING: {
     message: '本机没有找到可用的脚本解释器',

@@ -318,7 +318,7 @@ async function pickDownloadDir(): Promise<void> {
 async function beforeToggleUserScripts(): Promise<boolean> {
   if (form.allowUserScripts) return true
   return confirmDanger({
-    title: '打开「允许执行自定义脚本」？',
+    title: '打开「开启自定义脚本」？',
     consequence:
       '打开后，在目标页添加入的脚本会被真正执行 —— 本地脚本在本机跑，服务端脚本用你已连接的服务器账号跑。' +
       '本工具不检查脚本内容，也不会替你挡住写错的命令。',

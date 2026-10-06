@@ -365,7 +365,7 @@ watch(
           这个功能默认关闭 —— 开启后可以在本机或服务器上执行你填写的任意命令。
         </p>
         <p class="gate-text">
-          需要的到「设置 → 脚本执行」里打开<strong>允许执行自定义脚本</strong>。
+          需要的到「设置 → 脚本执行」里打开<strong>开启自定义脚本</strong>。
         </p>
         <el-button size="small" :icon="CaretRight" @click="goSettings">去设置里打开</el-button>
       </el-alert>
