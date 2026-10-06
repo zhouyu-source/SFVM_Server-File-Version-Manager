@@ -652,8 +652,7 @@ const exportSizeText = computed(() => {
             data-test="settings-allow-user-scripts"
           />
           <span class="hint inline">
-            默认<strong>关闭</strong>。关闭时目标页的脚本面板只显示开关位置，不接受执行。
-            打开后，脚本会以你的权限在本机或服务器上运行 —— 请只填自己看得懂的脚本。
+            <strong style="color: red">注意：本工具不会检查你的脚本，请确认脚本无误。</strong>
           </span>
         </el-form-item>
 
@@ -669,11 +668,6 @@ const exportSizeText = computed(() => {
             <el-button :icon="FolderOpened" @click="pickGitBash">选择…</el-button>
           </div>
         </el-form-item>
-        <div class="hint indent">
-          只在本机 Windows 上执行 <span class="mono">Git Bash</span> 脚本时用到。
-          自动探测会依次找常见安装位置与 <span class="mono">PATH</span>；填了路径却不存在时
-          <strong>不会静默回退</strong>，而是直接报错 —— 免得你以为在跑 Git Bash、实际跑的是别的壳。
-        </div>
       </el-form>
 
       <!-- ------------------------------------------------ 诊断 -->

@@ -51,9 +51,41 @@ function toJobView(row: unknown): JobView {
   return row as JobView
 }
 
-/** 表格当前行变化 → 切换查看的任务（模板里不能写类型标注）。 */
+/**
+ * 表格当前行变化 → 切换查看的任务（模板里不能写类型标注）。
+ *
+ * ## 为什么要防一个 `null`
+ *
+ * 用户报上来的现象：**点开一个"执行中"的任务，详情显示一下就自己关掉了**。
+ * 根因不在 store，而在 `el-table` 的当前行机制 ——
+ * `node_modules/element-plus/.../table/src/store/current.mjs` 的 `updateCurrentRowData()`：
+ *
+ * ```js
+ * if (oldCurrentRow && !data.includes(oldCurrentRow)) {
+ *   if (rowKey) { setCurrentRowByKey(...) }   // 有 row-key：按 key 找回新对象
+ *   else { currentRow = null; emit('current-change', null) }   // 没有：清空当前行
+ * }
+ * ```
+ *
+ * 而 store 更新任务时是**替换行对象**（`jobs[i] = { ...jobs[i], percent }`，见
+ * `stores/job.ts` 的 `applyProgress` / `upsert`）。于是路径是：
+ * 进度事件 → 行对象被换掉 → `data.includes(旧对象)` 为假 → 没有 `row-key`
+ * → 清空当前行 → `current-change(null)` → `select(null)` → 详情回到"选择一个任务查看日志"。
+ *
+ * 执行中的任务**每秒**都有进度事件（脚本的启发式进度就是 1s 一次），所以是"点开一秒后就关"。
+ *
+ * 两道保险：
+ * 1. 表格加 `row-key="jobId"` —— 让 el-table 自己去新数据里找回同一行（正常路径）；
+ * 2. 收到 `null` 时，若 store 里选中的任务**还在**，就当没发生 ——
+ *    选中项是 store 的状态，不该被表格内部的实现细节改掉。
+ *
+ * 顺带一个取舍：`clearFinished` 把"当前选中的那个任务"清掉时，表格会抛一次 `null`，
+ * 而此刻 store 可能已经被 `fetchList` 换成了列表第一条 —— 于是详情显示的是第一条、
+ * 高亮却没了。宁可这样，也不要"用户点开的东西自己消失"。
+ */
 function onCurrentChange(row: unknown): void {
   const id = (row as { jobId?: string } | null)?.jobId ?? null
+  if (id === null && store.selectedJob) return
   selectJob(id)
 }
 
@@ -177,6 +209,7 @@ const runningCount = computed(() => store.jobs.filter((j) => !isTerminalStatus(j
         <div class="tc-list">
           <el-table
             :data="store.jobs"
+            row-key="jobId"
             size="small"
             height="196"
             highlight-current-row

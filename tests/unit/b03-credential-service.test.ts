@@ -5,6 +5,7 @@
  * - 连接视图（唯一允许跨 IPC 的形态）**不含密文、也不含明文**
  * - secret 三态语义：不传=不变、''=清除、非空=设置
  * - 被环境引用的连接不能删除（E_IN_USE）、入参校验、TOFU 落库
+ * - 私钥文件读不出来时报的是**私钥**（E_CONN_KEY_MISSING），不是"本地产物"
  *
  * Electron 由 tests/stubs/electron.ts 统一替身（见 vitest.config.ts 的 alias）；
  * "密钥链不可用"通过 credential 的测试注入点模拟。
@@ -218,17 +219,69 @@ describe('ConnectionService（T03.8）', () => {
     }
   })
 
-  it('私钥文件不存在时在建连前就报本地路径错误', async () => {
+  /**
+   * 回归：**连接不能借用"发布"的错误文案**。
+   *
+   * 起因是用户实测报上来的：在「连接」页连测试服务器，弹的是
+   * 「本地构建产物不存在 / 请确认本地产物路径，或先执行构建」——
+   * 于是他跑去翻目标的发布配置，而真正要改的是这个连接配置里的**私钥路径**
+   * （当时这里复用了 `E_LOCAL_PATH_MISSING`：那是"本地产物"专用的码与文案）。
+   *
+   * 所以这里除了"能报错"，还要钉住**报的是哪一件事**：文案里要有具体文件路径、
+   * 要说"私钥"，且一个字都不能提"构建产物"。
+   */
+  it('私钥文件不存在时在建连前就报错，且文案说的是私钥（不是本地产物）', async () => {
     const { t, svc } = setup()
     try {
+      const keyPath = 'D:/definitely/not/here/id_ed25519'
       const view = svc.create({
         name: 'k',
         host: 'h',
         username: 'u',
         authType: 'privateKey',
-        privateKeyPath: 'D:/definitely/not/here/id_ed25519'
+        privateKeyPath: keyPath
       })
-      await expect(svc.connect(view.id)).rejects.toThrowError(AppError)
+
+      let caught: unknown
+      try {
+        await svc.connect(view.id)
+      } catch (e) {
+        caught = e
+      }
+      expect(caught).toBeInstanceOf(AppError)
+      const err = caught as AppError
+      expect(err.code).toBe(ErrorCode.E_CONN_KEY_MISSING)
+      // 弹窗里只有这两行，所以"哪个文件"必须出现在 message 里
+      expect(err.message).toContain(keyPath)
+      expect(err.message).toContain('私钥')
+      expect(`${err.message}\n${err.hint ?? ''}`).not.toContain('构建产物')
+      // 具体原因留给"复制诊断信息"
+      expect(err.detail).toMatchObject({ path: keyPath, code: 'ENOENT' })
+    } finally {
+      t.cleanup()
+    }
+  })
+
+  it('表单里还没保存的草稿走同一条路：test({input}) 也报 E_CONN_KEY_MISSING，不是"未知错误"', async () => {
+    const { t, svc } = setup()
+    try {
+      let caught: unknown
+      try {
+        await svc.test({
+          input: {
+            name: '草稿',
+            host: 'h',
+            username: 'u',
+            authType: 'privateKey',
+            privateKeyPath: 'D:/definitely/not/here/id_ed25519'
+          }
+        })
+      } catch (e) {
+        caught = e
+      }
+      // 以前这条是裸 readFileSync，抛出去会被 IPC 归一成 E_UNKNOWN（"发生未知错误"）
+      expect(caught).toBeInstanceOf(AppError)
+      expect((caught as AppError).code).toBe(ErrorCode.E_CONN_KEY_MISSING)
     } finally {
       t.cleanup()
     }

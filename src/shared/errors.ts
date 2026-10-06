@@ -21,6 +21,15 @@ export const ErrorCode = {
   E_CONN_AUTH: 'E_CONN_AUTH',
   E_CONN_REFUSED: 'E_CONN_REFUSED',
   E_CONN_LOST: 'E_CONN_LOST',
+  /**
+   * 私钥文件读不出来（不存在 / 无权限）。
+   *
+   * 单独立一个码、而不是复用 `E_LOCAL_PATH_MISSING`，是因为后者讲的是
+   * **本地产物**（构建出来要发布的东西）。以前共用时，用户在「连接」页连服务器，
+   * 报的却是"本地构建产物不存在" —— 于是他跑去翻发布配置，越查越远。
+   * 连接与发布是两件事，文案也不能共用。
+   */
+  E_CONN_KEY_MISSING: 'E_CONN_KEY_MISSING',
   E_HOST_KEY_CHANGED: 'E_HOST_KEY_CHANGED',
   E_HOST_KEY_UNKNOWN: 'E_HOST_KEY_UNKNOWN',
   E_SFTP_CHANNEL: 'E_SFTP_CHANNEL',
@@ -113,6 +122,17 @@ export const ERROR_TEXT: Record<ErrorCodeValue, ErrorDescriptor> = {
   E_CONN_LOST: {
     message: 'SSH 连接已断开',
     hint: '应用会尝试自动重连；发布任务执行期间不会重连，任务将判定失败。'
+  },
+  E_CONN_KEY_MISSING: {
+    message: '私钥文件不存在或无法读取',
+    /**
+     * 这条以前复用的是「本地构建产物不存在」，用户明明在连服务器却被提示"本地产物"，
+     * 于是跑去翻发布配置（用户实测报上来的就是"连接测试服务器提示本地构建产物不存在"）。
+     * 所以在建议里**明说与本地产物无关** —— 这正是被误导过一次的地方。
+     */
+    hint:
+      '请到「连接」页编辑该连接，把私钥路径改成实际存在且本机可读的文件。' +
+      '这与目标的「本地产物」配置无关，不影响连接以外的其他功能。'
   },
   E_HOST_KEY_CHANGED: {
     message: '服务器主机密钥已变化',

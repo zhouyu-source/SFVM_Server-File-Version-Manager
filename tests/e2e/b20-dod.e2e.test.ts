@@ -342,7 +342,8 @@ describeE2E('B20 DoD：脚本执行底座', () => {
   }
 
   /** 打开第一行的「详情」，读出输出尾部，然后关掉弹窗。 */
-  async function readFirstRunOutput(cdp: Cdp): Promise<string> {    await cdp.evaluate<boolean>(
+  async function readFirstRunOutput(cdp: Cdp): Promise<string> {
+    await cdp.evaluate<boolean>(
       "([...document.querySelectorAll('[data-test=script-run-detail]')][0].click(), true)"
     )
     await waitFor(
@@ -599,6 +600,147 @@ describeE2E('B20 DoD：脚本执行底座', () => {
     const probe = await readUiProbe(cdp)
     console.info(`[B20 DoD] 界面提示：${probe.msgs.join(' | ')}`)
   }, 240000)
+
+  /* ---------------- ④b 控制台：点开"进行中"的任务，详情不该被悄悄关掉 */
+
+  /**
+   * 用户报的现象：**在任务控制台点开一个执行中的本机脚本，详情显示一下就自己关了**。
+   *
+   * 根因不在 store，也不在"详情"本身，而在 `el-table` 的当前行机制：
+   * store 更新任务时**替换行对象**（`jobs[i] = { …jobs[i], percent }`），而表格没有
+   * `row-key` 时会把"当前行不在数据里了"当成"用户换了行"，于是抛一次
+   * `current-change(null)`，把选中项清空、详情回到"选择一个任务查看日志"。
+   * 执行中的任务**每秒**都有进度事件（脚本的启发式进度就是 1s 一次），所以是"点开一秒后就关"。
+   * 完整推导见 `TaskConsole.vue` 里 `onCurrentChange` 的注释。
+   *
+   * 这条用例的关键是让任务**跑得够久**：只有持续有进度事件，行对象才会被反复替换。
+   * 所以故意用一条 10 秒的脚本，点开详情后**再等到确认来过一次进度事件**才断言
+   * （只看固定几秒会撞运气 —— 同一份代码实测跑两次，一次红一次绿）。
+   *
+   * 断言全包在 `try/finally` 里：这条脚本是**同目标互斥**的，用例万一红了也要把它等完，
+   * 否则后面的用例会撞 `E_TARGET_BUSY`（第一次写这条用例就是这么把 ⑤ 带红的，
+   * 诊断信息里那句"该目标上已有脚本在执行中"就是它）。
+   */
+  it('任务控制台：点开"进行中"的任务后，详情不会被每秒的进度事件关掉', async () => {
+    const cdp = app!.cdp
+    await selectTarget(cdp)
+    await waitFor(cdp, isVisible('script-text'), 30000, '脚本表单就绪')
+
+    // 10 秒的本机脚本。按当前选中的解释器挑写法（Windows 默认 PowerShell）
+    const shellText = await textOf(cdp, 'script-shell')
+    const longScript = /PowerShell/.test(shellText)
+      ? '1..10 | ForEach-Object { Write-Output "tick $_"; Start-Sleep -Seconds 1 }'
+      : 'for i in 1 2 3 4 5 6 7 8 9 10; do echo tick $i; sleep 1; done'
+    expect(await setTextarea(cdp, 'script-text', longScript), '没找到脚本输入框').toBe(true)
+
+    await clickTest(cdp, 'script-run', '执行按钮')
+
+    // 展开底部控制台（幂等：已展开时不点，避免点成收起 —— 与 B08 同一套做法）
+    const already = await cdp.evaluate<boolean>("!!document.querySelector('.tc-panel-head')")
+    if (!already) {
+      await cdp.evaluate<boolean>("(document.querySelector('.tc-toggle').click(), true)")
+    }
+    await waitFor(cdp, "!!document.querySelector('.tc-panel-head')", 10000, '任务控制台面板展开')
+
+    /**
+     * 点"进行中"的那一行。
+     *
+     * 判据用**行文本**（标题是 `脚本「本机脚本」`）而不是行号：这 10 秒里可能还有
+     * 别的任务行插进来，行号会漂。
+     */
+    const rowExpr = `(() => {
+      const rows = [...document.querySelectorAll('.tc-panel .el-table__body tbody tr')]
+      return rows.filter((tr) => tr.textContent.includes('本机脚本'))
+    })()`
+
+    const titleExpr = "(document.querySelector('.tc-detail-title') || {}).textContent || ''"
+    const logCount = (): Promise<number> =>
+      cdp.evaluate<number>("document.querySelectorAll('.tc-log-line').length")
+
+    try {
+      await waitFor(
+        cdp,
+        `(${rowExpr}).some((tr) => tr.textContent.includes('进行中'))`,
+        30000,
+        '脚本任务出现在控制台且状态为「进行中」'
+      )
+
+      const clicked = await cdp.evaluate<boolean>(`(() => {
+        const rows = ${rowExpr}
+        const row = rows.find((tr) => tr.textContent.includes('进行中'))
+        if (!row) return false
+        row.click()
+        return true
+      })()`)
+      expect(clicked, `控制台里没找到"进行中"的脚本任务行。当前界面：\n${await dumpUi(cdp)}`).toBe(
+        true
+      )
+
+      // 用"等"而不是一次性读：点下去到界面反应过来之间有延迟（实测见过 3 秒以上），
+      // 一次读会把"还没渲染出来"误判成"没选中"
+      await waitFor(cdp, `(${titleExpr}).includes('本机脚本')`, 20000, '详情已打开（标题是脚本任务）')
+      const logsBefore = await logCount()
+
+      /*
+       * 关键窗口：等到**确认又来过一次进度事件**再断言。
+       *
+       * 执行中的任务每秒都会推一次进度（收起条的百分比随之变化），
+       * 所以"百分比变了"就是一个**确定发生了数据更新**的门 ——
+       * 修复前那一次更新必然把详情关掉，修复后照旧留着。
+       */
+      const barPercentExpr =
+        "(document.querySelector('.tc-bar .tc-percent') || {}).textContent || ''"
+      const percentBefore = await cdp.evaluate<string>(barPercentExpr)
+      expect(percentBefore, '收起条上没有百分比（长脚本应当还在跑）').toMatch(/%/)
+      await waitFor(
+        cdp,
+        `(${barPercentExpr}) !== ${JSON.stringify(percentBefore)}`,
+        20000,
+        `进度又走了一格（起点 ${percentBefore}）`
+      )
+
+      const afterTitle = await cdp.evaluate<string>(titleExpr)
+      expect(
+        afterTitle,
+        '又来过一次进度事件之后，详情被关掉了（回到"选择一个任务查看日志"）—— ' +
+          '这正是用户报的现象：表格没有 row-key 时，行对象被替换会被当成"当前行不在了"，' +
+          '于是抛一次 current-change(null) 把选中项清掉。'
+      ).toContain('本机脚本')
+
+      /**
+       * 日志还得**继续长**。
+       *
+       * 这一条是"详情还跟着这个任务走"的证据，所以用等而不是一次性读：
+       * PowerShell 往管道写是带缓冲的，某 1 秒里一行都没到是正常的。
+       */
+      try {
+        await waitFor(
+          cdp,
+          `document.querySelectorAll('.tc-log-line').length > ${logsBefore}`,
+          25000,
+          '右侧日志继续增长'
+        )
+      } catch (e) {
+        throw new Error(
+          `详情框还在，但右侧日志不再增长（起点 ${logsBefore} 行，现在 ${await logCount()} 行）—— ` +
+            '说明详情虽然没被关，却不再跟着这个运行中的任务走了。',
+          { cause: e }
+        )
+      }
+
+      console.info(
+        `[B20 DoD] 详情在进度事件下保持打开；日志 ${logsBefore} → ${await logCount()} 行`
+      )
+    } finally {
+      // 无论断言过不过，都要把这条 10 秒的脚本等完：同目标的脚本执行是互斥的
+      await waitFor(
+        cdp,
+        `!(${rowExpr}).some((tr) => tr.textContent.includes('进行中'))`,
+        60000,
+        '10 秒的长脚本结束'
+      ).catch(() => undefined)
+    }
+  }, 180000)
 
   /* ------------------------------------------ ⑤ 真跑一条服务器脚本（需凭据） */
 

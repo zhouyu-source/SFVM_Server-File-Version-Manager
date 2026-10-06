@@ -93,14 +93,7 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
       if (!row.privateKeyPath) {
         throw new AppError(ErrorCode.E_CONN_AUTH, { reason: 'privateKeyPath-missing' })
       }
-      try {
-        privateKey = readFileSync(row.privateKeyPath)
-      } catch (err) {
-        throw new AppError(ErrorCode.E_LOCAL_PATH_MISSING, {
-          path: row.privateKeyPath,
-          original: (err as Error).message
-        })
-      }
+      privateKey = readPrivateKey(row.privateKeyPath)
     }
 
     return {
@@ -244,7 +237,7 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
           secret: i.secret,
           privateKey:
             i.authType === 'privateKey' && i.privateKeyPath
-              ? readFileSync(i.privateKeyPath)
+              ? readPrivateKey(i.privateKeyPath)
               : undefined,
           keepaliveMs: 15000,
           hostKeyPolicy: 'accept-any'
@@ -369,6 +362,43 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
 }
 
 export type ConnectionService = ReturnType<typeof createConnectionService>
+
+/* ------------------------------------------------------------------ 私钥读取 */
+
+/**
+ * 读取连接配置里指定的私钥文件。
+ *
+ * 两件事必须在这里一次性说清：
+ *
+ * 1. **两条入口共用一个函数**。已保存的连接（`connect` / `test({id})`）与表单里
+ *    还没保存的草稿（`test({input})`）都要读私钥。以前前者自己 `try/catch`、
+ *    后者是**裸 `readFileSync`** —— 同一个问题两种说法：列表里报业务错误，
+ *    表单里抛出去被 IPC 归一成 `E_UNKNOWN`（"发生未知错误"）。
+ * 2. **错误码必须是连接类的**。这条以前复用 `E_LOCAL_PATH_MISSING`，它的文案是
+ *    「本地构建产物不存在 / 请确认本地产物路径」—— 讲的是**发布**。
+ *    于是用户在「连接」页点连接，看到的是"本地产物没配"，跑去翻发布配置；
+ *    而真正要改的是这个连接的私钥路径。用户实测报上来的就是这个：
+ *    「连接测试服务器提示本地构建产物不存在」。
+ *
+ * 另外：**只报错、不在保存时拦截**。私钥可能放在移动硬盘或网络盘上，
+ * 保存配置时它不在，不代表这份配置就是错的 —— 拦截会拦住合法用法。
+ */
+function readPrivateKey(path: string): Buffer {
+  try {
+    return readFileSync(path)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    const missing = code === 'ENOENT'
+    throw new AppError(
+      ErrorCode.E_CONN_KEY_MISSING,
+      { path, code, original: (err as Error).message },
+      {
+        // 具体原因（哪个文件、为什么）进 message：用户在弹窗里只看得见这一行
+        message: missing ? `私钥文件不存在：${path}` : `无法读取私钥文件：${path}`
+      }
+    )
+  }
+}
 
 /* -------------------------------------------------------------------- 校验 */
 

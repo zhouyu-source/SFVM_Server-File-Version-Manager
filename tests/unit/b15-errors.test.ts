@@ -27,7 +27,7 @@ describe('B15 / T15.4 错误文案表', () => {
   const entries = Object.entries(ERROR_TEXT)
 
   it('覆盖全部错误码（Record 类型已保证，这里再确认一次不是空的）', () => {
-    // 目前 54 条（B20 加了 4 个 script 相关码）；数量本身不是目标，
+    // 目前 55 条（B20 加了 4 个 script 相关码 + 1 个连接私钥码）；数量本身不是目标，
     // 但"突然少了一半"往往意味着有人误删了整段
     expect(entries.length).toBe(Object.keys(ErrorCode).length)
     expect(entries.length).toBeGreaterThan(40)
@@ -77,5 +77,21 @@ describe('B15 / T15.4 错误文案表', () => {
     const noTool = ERROR_TEXT[ErrorCode.E_NO_REMOTE_HASH_TOOL]
     expect(noTool.hint).toContain('算法兼容模式')
     expect(noTool.message).not.toContain('速度较慢')
+  })
+
+  it('错误码不跨域复用：私钥读不出来 ≠ 本地产物不存在', () => {
+    /**
+     * 这两件事曾经共用一个码，后果是用户在「连接」页连服务器，
+     * 却被告知"本地构建产物不存在"，于是跑去翻发布配置（用户实测报上来的）。
+     * 只要这两条码还各自存在、文案还各自说自己的事，就不会再混。
+     */
+    const key = ERROR_TEXT[ErrorCode.E_CONN_KEY_MISSING]
+    const artifact = ERROR_TEXT[ErrorCode.E_LOCAL_PATH_MISSING]
+    expect(key.message).toContain('私钥')
+    expect(key.message).not.toContain('构建产物')
+    expect(artifact.message).toContain('构建产物')
+    expect(key.message).not.toBe(artifact.message)
+    // 提示里要明说"与本地产物无关" —— 用户正是被这一点误导过
+    expect(key.hint).toContain('本地产物')
   })
 })

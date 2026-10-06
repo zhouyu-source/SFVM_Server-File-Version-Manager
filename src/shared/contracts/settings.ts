@@ -146,7 +146,7 @@ export const SETTING_LABELS: Record<keyof AppSettings, string> = {
   logLevel: '日志级别',
   hashCompatMode: '算法兼容模式',
   defaultRetainPolicy: '默认保留策略',
-  allowUserScripts: '允许执行自定义脚本',
+  allowUserScripts: '开启自定义脚本',
   gitBashPath: 'Git Bash 路径'
 }
 
