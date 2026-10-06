@@ -393,6 +393,26 @@ describeIf('B16 / T16.4：发布两次 → 回滚 → 当前版本与往期版�
     const tagsAfter = await archiveTags(cdp)
     expect(tagsAfter).toContain(tagArchived)
 
+    /**
+     * ②-b（B19）回滚过的目标必须**自己说清楚**。
+     *
+     * 没有这两处标记时，用户回滚完只看到版本号变了：不知道当前版本是回滚来的，
+     * 也不知道往期列表里那条「多出来的」是什么。标记是**纯派生**的
+     * （只读 `releases` 里已有的 action / status / archiveId，不落库），
+     * 所以这两条断言同时钉住了主进程的派生逻辑与渲染层的展示位。
+     */
+    try {
+      await waitFor(cdp, isVisible('current-version-rollback'), 20000, '当前版本旁出现「回滚」标记')
+      await waitFor(
+        cdp,
+        isVisible(`arch-rollback-source-${tagArchived}`),
+        20000,
+        '回滚到的那一版在往期列表里标成「回滚而来」'
+      )
+    } catch (e) {
+      throw new Error(`${(e as Error).message}\n${await dumpUi(cdp, app!.logs)}`, { cause: e })
+    }
+
     // ③ 硬证据：服务器上的内容逐字回到 v1
     expect(await readRemoteText(remote, `${REMOTE_TARGET}/index.html`)).toBe('v1-index')
     expect(await readRemoteText(remote, `${REMOTE_TARGET}/assets/app.js`)).toBe('v1-js')

@@ -21,6 +21,7 @@ import PublishPanel from './PublishPanel.vue'
 import LocalArtifactCard from './LocalArtifactCard.vue'
 import ArchiveSection from './ArchiveSection.vue'
 import type { TargetView, HealthReport, HealthCheck } from '../../../shared/contracts/workspace'
+import type { DeployCurrentVersion } from '../../../shared/contracts/deploy'
 
 const props = defineProps<{ target: TargetView }>()
 const emit = defineEmits<{ edit: [TargetView] }>()
@@ -33,8 +34,22 @@ const report = ref<HealthReport | null>(null)
 
 /** 往期版本区块（B12）：发布成功后由它自己重载列表与汇总 */
 const archiveRef = ref<InstanceType<typeof ArchiveSection> | null>(null)
-/** 当前线上版本号（= 最近一次成功发布的版本号）；拿不到为 null */
-const currentVersionTag = ref<string | null>(null)
+/** 当前线上版本（= 最近一次成功操作，发布或回滚都算）；拿不到为 null */
+const currentVersion = ref<DeployCurrentVersion | null>(null)
+const currentVersionTag = computed(() => currentVersion.value?.versionTag ?? null)
+/**
+ * 「当前版本是不是回滚来的」。
+ *
+ * `action` 本来就是 `deploy.currentVersion` 的返回值之一（`'deploy' | 'rollback'`），
+ * 只是这里原先只取了 `versionTag` 把它丢了。之后只要有一次新的**发布**成功，
+ * `action` 就变回 `'deploy'`，标记自动消失 —— 不需要任何额外的清理逻辑。
+ */
+const isCurrentRollback = computed(() => currentVersion.value?.action === 'rollback')
+const rollbackTip = computed(() => {
+  const at = currentVersion.value?.at
+  const when = at ? `（${formatDateTime(at)}）` : ''
+  return `当前线上版本由回滚恢复${when} —— 它的内容来自版本库中的往期版本，不是本地发布`
+})
 
 const env = computed(() => ws.environments.find((e) => e.id === props.target.environmentId))
 const offline = computed(() =>
@@ -78,12 +93,11 @@ async function runCheck(): Promise<void> {
  */
 async function loadCurrentVersion(): Promise<void> {
   try {
-    const v = await api.deploy.currentVersion(props.target.id)
-    currentVersionTag.value = v.versionTag
+    currentVersion.value = await api.deploy.currentVersion(props.target.id)
   } catch {
     // 读不出来时说明"未知"，但不要清掉上一次的值制造闪烁 ——
     // 这里的失败绝大多数是"目标被删了"，那时整个组件都要卸载
-    currentVersionTag.value = null
+    currentVersion.value = null
   }
 }
 
@@ -112,7 +126,7 @@ watch(
   () => props.target.id,
   () => {
     report.value = null
-    currentVersionTag.value = null
+    currentVersion.value = null
     void loadCurrentVersion()
   },
   { immediate: true }
@@ -151,9 +165,22 @@ function icon(level: HealthCheck['level']): string {
         >
       </el-descriptions-item>
       <el-descriptions-item label="当前版本">
-        <span v-if="currentVersionTag" class="mono" data-test="current-version">
-          {{ currentVersionTag }}
-        </span>
+        <template v-if="currentVersionTag">
+          <span class="mono" data-test="current-version">{{ currentVersionTag }}</span>
+          <!--
+            回滚提示（B19）：`data-test` 是 E2E 的契约，两个元素分开挂，
+            这样"当前版本是什么"与"它是不是回滚来的"可以分别断言。
+          -->
+          <el-tooltip v-if="isCurrentRollback" :content="rollbackTip" placement="top">
+            <el-tag
+              size="small"
+              type="warning"
+              class="ml"
+              data-test="current-version-rollback"
+              >回滚</el-tag
+            >
+          </el-tooltip>
+        </template>
         <span v-else class="muted">未知（还没发布过，或本地产物未配置）</span>
       </el-descriptions-item>
       <el-descriptions-item label="最近发布">

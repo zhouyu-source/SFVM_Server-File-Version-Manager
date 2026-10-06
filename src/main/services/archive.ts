@@ -69,6 +69,7 @@ import type {
   ArchiveDetail,
   ArchiveManifestFile,
   ArchiveRemoveResult,
+  ArchiveRollbackMark,
   ArchiveStatus,
   ArchiveSummary,
   ArchiveVerifyResult,
@@ -80,6 +81,16 @@ import type { JobLogLevel } from '../../shared/contracts/job'
 
 /** 保留策略执行时必须看到**全部**归档行（分页上限不能让它漏删）。 */
 const RETENTION_SCAN_LIMIT = 100000
+
+/**
+ * 给归档行打"回滚"标记时扫多少条台账记录。
+ *
+ * 与列表自身的上限（`DEFAULT_ARCHIVE_LIST_LIMIT`）无关，两个方向都要放开：
+ * 列表可能只显示最近 N 条归档，而**很久以前**那次回滚留下的痕迹（尤其是
+ * 被标成 `ROLLED_BACK` 的来源行）必须仍然可见。200 条足以覆盖任何一个目标的
+ * 完整历史（每次发布或回滚各占一条）。
+ */
+const ROLLBACK_SCAN_LIMIT = 200
 
 export type ArchiveLogFn = (text: string, level?: JobLogLevel) => void
 
@@ -401,6 +412,84 @@ function previewList(names: readonly string[], max = 5): string {
   return names.length > max ? `${head} 等 ${names.length} 个` : head
 }
 
+/* ------------------------------------------------- 回滚标记（纯派生） */
+
+/** `buildRollbackMarks` 的归档行输入：只取判定需要的字段，便于单测直接构造。 */
+export interface RollbackMarkArchiveRow {
+  id: string
+  versionTag: string
+  releaseId: string | null
+}
+
+export interface RollbackMarkReleaseRow {
+  id: string
+  action: string
+  versionTag: string
+  status: string
+  archiveId: string | null
+  startedAt: string
+  finishedAt: string | null
+}
+
+export interface RollbackMarkResult {
+  rollback: ArchiveRollbackMark | null
+  supersededByRollbackAt: string | null
+}
+
+/**
+ * 把 `releases` 里的回滚痕迹归到具体的归档行上。
+ *
+ * 三条判据都不需要新字段：
+ *
+ * | 归档行的身份 | 判据 |
+ * | --- | --- |
+ * | 某次回滚的**来源**（被回滚到的版本） | `action='rollback' && status='SUCCESS' && archiveId === 行.id` |
+ * | 某次回滚**归档出来**的产物 | `releaseId === 行.id`（那行 `action='rollback'`） |
+ * | 内容已被后来的回滚取代 | `status='ROLLED_BACK' && versionTag === 行.versionTag` |
+ *
+ * 两处刻意的取舍：
+ *
+ * 1. **来源只认成功的回滚**：失败的回滚会被补偿把内容搬回去，那一刻"线上版本"
+ *    并没有换成它 —— 让它顶着"当前线上版本"的标记是谎话。
+ * 2. **`archived` 不筛状态**：归档行只要还在台账里，就说明那次回滚确实归档过它
+ *    （失败且补偿成功的归档行会被摘掉，自然不会出现在输入里）。
+ */
+export function buildRollbackMarks(input: {
+  archives: readonly RollbackMarkArchiveRow[]
+  releases: readonly RollbackMarkReleaseRow[]
+}): Map<string, RollbackMarkResult> {
+  /** 归档行 id → 它作为某次回滚来源的标记 */
+  const asSource = new Map<string, ArchiveRollbackMark>()
+  /** 台账行 id → 它那次回滚归档出来的产物标记 */
+  const asArchived = new Map<string, ArchiveRollbackMark>()
+  /** 版本号 → 被回滚取代的时间（`finishedAt` 读不到就给 null） */
+  const supersededAt = new Map<string, string | null>()
+
+  for (const r of input.releases) {
+    if (r.status === 'ROLLED_BACK' && !supersededAt.has(r.versionTag)) {
+      supersededAt.set(r.versionTag, r.finishedAt)
+    }
+    if (r.action !== 'rollback') continue
+    const at = r.finishedAt ?? r.startedAt
+    if (r.status === 'SUCCESS' && r.archiveId) {
+      asSource.set(r.archiveId, { role: 'source', toVersionTag: r.versionTag, at })
+    }
+    asArchived.set(r.id, { role: 'archived', toVersionTag: r.versionTag, at })
+  }
+
+  const out = new Map<string, RollbackMarkResult>()
+  for (const a of input.archives) {
+    // 来源优先于"回滚归档"：同一行不可能两者都是，但来源那条更贴近"它在哪"这个问题
+    const fromSource = asSource.get(a.id)
+    const fromArchived = a.releaseId ? asArchived.get(a.releaseId) : undefined
+    out.set(a.id, {
+      rollback: fromSource ?? fromArchived ?? null,
+      supersededByRollbackAt: supersededAt.get(a.versionTag) ?? null
+    })
+  }
+  return out
+}
+
 export function createArchiveService(deps: ArchiveServiceDeps) {
   const { repo } = deps
   const now = deps.now ?? ((): Date => new Date())
@@ -434,14 +523,38 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
       releaseId: row.releaseId ?? null,
       note: row.note ?? null,
       status: toArchiveStatus(row.status),
-      shortHash: row.rootHash.slice(0, 8)
+      shortHash: row.rootHash.slice(0, 8),
+      // 回滚标记要一次看全某个目标的 `releases` 才能算，所以由 `list()` 拿到整批
+      // 归档行之后统一补上。单独调用 `toView` 的地方（如刚归档完的返回值）给空值。
+      rollback: null,
+      supersededByRollbackAt: null
     }
   }
 
   /* ------------------------------------------------------------ 列举 */
 
   function list(targetId: string, limit = DEFAULT_ARCHIVE_LIST_LIMIT): ArchiveView[] {
-    return repo.archives.listByTarget(targetId, limit).map(toView)
+    const rows = repo.archives.listByTarget(targetId, limit)
+    /**
+     * 回滚标记是**派生**的：现读一次 `releases`，不缓存、不落库。
+     *
+     * 成本只有一次本地 SQL（命中 `idx_releases_target_time`），换来的是"列表里
+     * 一眼能看出回滚到过哪一版、哪一版被回滚取代了" —— 而这正是回滚之后用户
+     * 最想确认的事。把它做成第二个 IPC 会让 UI 多一次往返与一处可能不同步的
+     * 加载态，不值得。
+     */
+    const marks = buildRollbackMarks({
+      archives: rows.map((r) => ({ id: r.id, versionTag: r.versionTag, releaseId: r.releaseId })),
+      releases: repo.releases.listByTarget(targetId, ROLLBACK_SCAN_LIMIT)
+    })
+    return rows.map((row) => {
+      const mark = marks.get(row.id)
+      return {
+        ...toView(row),
+        rollback: mark?.rollback ?? null,
+        supersededByRollbackAt: mark?.supersededByRollbackAt ?? null
+      }
+    })
   }
 
   function count(targetId: string): number {

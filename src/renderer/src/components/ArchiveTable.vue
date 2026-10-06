@@ -127,6 +127,78 @@ function actionCell(row: ArchiveView): VNode {
   ])
 }
 
+/* ------------------------------------------------------- 回滚标记（B19） */
+
+/**
+ * 「版本」列里跟在版本号后面的回滚标记。
+ *
+ * 从 `releases` 派生（主进程 `archive.list` 里算好），三种身份：
+ *
+ * - **回滚而来**：这一版就是当前线上版本 —— 某次回滚把它恢复了上去；
+ * - **回滚归档**：这一版是某次回滚把**当时的线上版本**归档出来的产物；
+ * - **已被回滚取代**：这一版曾经在线上，后来被下一次回滚换掉了。
+ *
+ * 前两种与第三种可以叠加：一版先被回滚到线上、之后又被换掉。这时两个标记都显示 ——
+ * "它从哪来"和"它现在还在不在线上"是两个不同的问题，答案不同就要都说出来。
+ *
+ * 标记一律挂 `data-test`：这是 E2E 的契约，以后改文案/换图标不该让用例失效。
+ */
+function rollbackMarks(row: ArchiveView): VNode | null {
+  const nodes: VNode[] = []
+  const mark = row.rollback
+  const when = (at: string | null): string => (at ? `（${formatDateTime(at)}）` : '')
+
+  if (mark) {
+    const isSource = mark.role === 'source'
+    const tip = isSource
+      ? `这一版就是当前的线上版本 —— 由回滚恢复${when(mark.at)}`
+      : `这是回滚时把当时的线上版本归档出来的产物 —— 那次回滚恢复的是 ${mark.toVersionTag}${when(mark.at)}`
+    nodes.push(
+      h(
+        ElTooltip,
+        { content: tip, placement: 'top', showAfter: 300 },
+        {
+          default: () =>
+            h(
+              ElTag,
+              {
+                size: 'small',
+                type: isSource ? 'success' : 'warning',
+                'data-test': isSource
+                  ? `arch-rollback-source-${row.versionTag}`
+                  : `arch-rollback-archived-${row.versionTag}`
+              },
+              () => (isSource ? '回滚版本' : '回滚归档')
+            )
+        }
+      )
+    )
+  }
+
+  if (row.supersededByRollbackAt) {
+    nodes.push(
+      h(
+        ElTooltip,
+        {
+          content: `这一版的内容已经被后来的回滚取代，不在线上了${when(row.supersededByRollbackAt)}`,
+          placement: 'top',
+          showAfter: 300
+        },
+        {
+          default: () =>
+            h(
+              ElTag,
+              { size: 'small', type: 'info', 'data-test': `arch-superseded-${row.versionTag}` },
+              () => '已被回滚取代'
+            )
+        }
+      )
+    )
+  }
+
+  return nodes.length > 0 ? h('div', { class: 'arch-marks' }, nodes) : null
+}
+
 const columns = computed<Column<ArchiveView>[]>(() => [
   {
     key: 'select',
@@ -152,9 +224,15 @@ const columns = computed<Column<ArchiveView>[]>(() => [
     key: 'versionTag',
     title: '版本',
     dataKey: 'versionTag',
-    width: 210,
-    cellRenderer: ({ rowData }: { rowData: ArchiveView }) =>
-      h('span', { class: 'mono', 'data-test': 'arch-version' }, rowData.versionTag)
+    // 320：版本号本身 22 字符等宽约 154px，后面还要容下最多两个标记 tag
+    width: 320,
+    cellRenderer: ({ rowData }: { rowData: ArchiveView }) => {
+      const marks = rollbackMarks(rowData)
+      return h('div', { class: 'arch-version-cell' }, [
+        h('span', { class: 'mono', 'data-test': 'arch-version' }, rowData.versionTag),
+        ...(marks ? [marks] : [])
+      ])
+    }
   },
   {
     key: 'archivedAt',
@@ -243,5 +321,24 @@ const columns = computed<Column<ArchiveView>[]>(() => [
   justify-content: flex-end;
   gap: 2px;
   white-space: nowrap;
+}
+/* 版本号 + 回滚标记同排。
+   两个选择器都写：`h()` 创建的节点会带上本组件的 scopeId（普通选择器命中），
+   而 `:deep()` 形式与上面 `.arch-actions` 一致、万一层级不同也能兜住。
+   这里不图好看，只图**绝不折行** —— 折行会顶破写死的 `row-height: 42`。 */
+:deep(.arch-version-cell),
+.arch-version-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+:deep(.arch-marks),
+.arch-marks {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
 }
 </style>

@@ -142,6 +142,28 @@ export const KNOWN_MANIFEST_KEYS = [
 
 /* ---------------------------------------------------------- 台账视图 */
 
+/**
+ * 这一版与「回滚」的关系（**纯派生**：由 `releases` 现算，不落库、不进 manifest）。
+ *
+ * 一次回滚会在台账里留下两类可观察的痕迹，它们分别落在**两行不同的归档**上：
+ *
+ * - `source`   —— 这一版是那次回滚的**来源**，也就是"被回滚到的版本"。回滚成功后
+ *   它就重新成为线上版本；若之后又被下一次回滚取代，它还会同时带上"已被取代"。
+ * - `archived` —— 这一版是那次回滚把**当时的线上版本**归档出来的产物。
+ *   `archives.note` 里写的就是「回滚前置归档（<来源版本> → 本版）」。
+ *
+ * **为什么不落库**：这三条判据全部由 `releases` 里已有的行就能推出（`action` /
+ * `status` / `archiveId` / `versionTag`）。多存一份就等于多一处会与事实不一致的
+ * 副本 —— 而回滚的补偿路径（阶段 3 失败要把来源搬回去）本来就是"改台账"的重灾区。
+ */
+export interface ArchiveRollbackMark {
+  role: 'source' | 'archived'
+  /** 那次回滚"回滚到的"版本号（= 该次回滚台账行的 `versionTag`） */
+  toVersionTag: string
+  /** 那次回滚的完成时间；台账里没写完成时间时回退到开始时间 */
+  at: string | null
+}
+
 export interface ArchiveView {
   id: string
   targetId: string
@@ -160,6 +182,17 @@ export interface ArchiveView {
   status: ArchiveStatus
   /** 相邻展示用：根哈希前 8 位，UI 上比 64 位更好认 */
   shortHash: string
+  /** 与某次回滚的关系（来源 / 回滚时归档出来的）；与回滚无关为 null */
+  rollback: ArchiveRollbackMark | null
+  /**
+   * 这一版的内容已经被后来的某次回滚取代（对应 `releases.status = 'ROLLED_BACK'`），
+   * 值为那次回滚的完成时间。
+   *
+   * 它只可能出现在"曾是某次回滚来源"的行上：`archives.versionTag` 是归档时**新生成**的
+   * （`yyyyMMdd-HHmmss_<hash7>`），要与某条发布/回滚台账行的 `versionTag` 相等，
+   * 只有"这一行本身就是那次操作的来源"一种可能。发布产生的版本号与归档行不会撞。
+   */
+  supersededByRollbackAt: string | null
 }
 
 /**
