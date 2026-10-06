@@ -12,10 +12,10 @@
  * 与发布的行为一致（失败也要留痕）。
  */
 import { registerHandler } from '../infra/ipc'
+import { assertTargetIdle } from './target-busy'
 import { logger } from '../infra/logger'
 import { AppError, ErrorCode } from '../infra/errors'
 import { IPC_CHANNELS } from '../../shared/channels'
-import { isTerminalStatus } from '../../shared/contracts/job'
 import {
   DEFAULT_SCRIPT_RUN_LIST_LIMIT,
   scriptRunDetailInputSchema,
@@ -73,26 +73,14 @@ export function registerScriptHandlers(deps: ScriptIpcDeps): void {
 
   registerHandler(IPC_CHANNELS.SCRIPTS_RUN_STEP, scriptRunStepInputSchema, (input) => {
     /**
-     * 同一目标已有脚本任务在跑（或排队）时**直接拒绝**，不排进队列。
+     * 同一目标上已有任务（脚本、流水线、发布、回滚……）时**直接拒绝**，不排进队列。
      *
-     * 与 `deploy.start` 同一取向：队列会把"手滑点了两次"变成"真的跑了两遍"，
+     * 与 `deploy.start` 共用一处守卫：队列会把"手滑点了两次"变成"真的跑了两遍"，
      * 而这类脚本里通常有"关服务 / 启服务"这种**跑两遍就会坏**的操作。
-     * 注意发布与脚本**不需要**在这里互斥 —— 它们共用 `t:<targetId>` 车道，
-     * 任务框架保证同目标串行。
+     * 发布与脚本之间同样要拦 —— 它们确实共用 `t:<targetId>` 车道不会并发，
+     * 但"点了一下没反应、过一会儿突然开始跑"是更差的结果。
      */
-    const active = jobs
-      .activeForTarget(input.targetId)
-      .filter((j) => j.type === 'script' && !isTerminalStatus(j.status))
-    if (active.length > 0) {
-      throw new AppError(
-        ErrorCode.E_TARGET_BUSY,
-        { targetId: input.targetId, jobId: active[0]?.jobId },
-        {
-          message: `该目标上已有脚本在执行中（${active[0]?.title ?? ''}）`,
-          hint: '请等待它结束，或先在底部任务控制台取消它。'
-        }
-      )
-    }
+    assertTargetIdle(jobs, input.targetId, { action: '执行脚本' })
 
     const io: ScriptJobIo =
       input.kind === 'remote' ? { openRemote: () => openRemote(input.targetId) } : {}

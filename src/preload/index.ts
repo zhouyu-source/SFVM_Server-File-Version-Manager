@@ -74,6 +74,17 @@ import type {
   ScriptRunView
 } from '../shared/contracts/script'
 import type {
+  PipelineDetailInput,
+  PipelineListInput,
+  PipelinePreview,
+  PipelinePreviewInput,
+  PipelineRemoveInput,
+  PipelineRunInput,
+  PipelineRunStepInput,
+  PipelineSaveInput,
+  PipelineView
+} from '../shared/contracts/pipeline'
+import type {
   DiagnoseInput,
   ReconcileInput,
   ReconcileReport,
@@ -384,6 +395,35 @@ const api = {
     /** 一次运行的详情 */
     runDetail: (input: ScriptRunDetailInput): Promise<IpcResult<ScriptRunView>> =>
       ipcRenderer.invoke(IPC_CHANNELS.SCRIPTS_RUN_DETAIL, input)
+  },
+
+  /* ---------------------------------------- 自动化流水线（B21 / T21.5） */
+  pipelines: {
+    /** 某个目标下的流水线（含步骤，按 seq 排好） */
+    list: (input: PipelineListInput): Promise<IpcResult<PipelineView[]>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.PIPELINES_LIST, input),
+
+    detail: (input: PipelineDetailInput): Promise<IpcResult<PipelineView>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.PIPELINES_GET, input),
+
+    /** 新建（不传 pipelineId）或整体覆盖保存 */
+    save: (input: PipelineSaveInput): Promise<IpcResult<PipelineView>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.PIPELINES_SAVE, input),
+
+    remove: (input: PipelineRemoveInput): Promise<IpcResult<{ removed: boolean }>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.PIPELINES_REMOVE, input),
+
+    /** 「会执行什么」：纯本地展开，确认对话框据此渲染 */
+    preview: (input: PipelinePreviewInput): Promise<IpcResult<PipelinePreview>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.PIPELINES_PREVIEW, input),
+
+    /** 一键跑整条；立刻返回任务视图，进度/日志走 jobs.onProgress / onLog */
+    run: (input: PipelineRunInput): Promise<IpcResult<JobView>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.PIPELINES_RUN, input),
+
+    /** 只跑其中一步（其余步骤不会被触发） */
+    runStep: (input: PipelineRunStepInput): Promise<IpcResult<JobView>> =>
+      ipcRenderer.invoke(IPC_CHANNELS.PIPELINES_RUN_STEP, input)
   },
 
   /* ------------------------------------------------ 菜单命令（B15 / T15.7） */

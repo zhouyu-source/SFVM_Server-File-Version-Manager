@@ -15,6 +15,13 @@
       "when": 1791269674206,
       "tag": "0001_broad_the_fallen",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791279845025,
+      "tag": "0002_past_pestilence",
+      "breakpoints": true
     }
   ]
 }

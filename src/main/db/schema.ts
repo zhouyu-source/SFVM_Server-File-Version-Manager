@@ -205,7 +205,13 @@ export const auditLogs = sqliteTable(
     ts: text('ts').notNull().default(now),
     /** 'info' | 'warn' | 'error' */
     level: text('level').notNull(),
-    /** 'connection' | 'deploy' | 'archive' | 'app' */
+    /**
+     * 'connection' | 'deploy' | 'archive' | 'app' | 'script'
+     *
+     * `script`（B20/B21）：脚本与流水线的执行。这是全应用唯一"用户填什么就
+     * 执行什么"的功能，`script_runs` 回答"成没成"，审计回答"谁在什么时候
+     * 对着哪台机器做了什么"—— 多人共用一个发布账号时，能查的只有后者。
+     */
     scope: text('scope').notNull(),
     refId: text('ref_id'),
     message: text('message').notNull(),
@@ -289,6 +295,66 @@ export const scriptStepRuns = sqliteTable(
   (t) => [unique('uq_script_step_runs_run_seq').on(t.runId, t.seq)]
 )
 
+/* ---------------------------------------------------------- 自动化流水线（B21） */
+
+/**
+ * 一条自动化流水线。**绑定到目标**：步骤里既有"在本机构筑"也有"在服务器重启服务"，
+ * 而这两件事都只能是"针对某个目标"的（发布更不用说，它本来就要目标）。
+ */
+export const pipelines = sqliteTable(
+  'pipelines',
+  {
+    id: text('id').primaryKey(),
+    targetId: text('target_id')
+      .notNull()
+      .references(() => targets.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    description: text('description'),
+    createdAt: text('created_at').notNull().default(now),
+    updatedAt: text('updated_at').notNull().default(now)
+  },
+  (t) => [
+    index('idx_pipelines_target').on(t.targetId),
+    // 同名流水线在同一目标下没有意义，而且会让"一键执行"的按钮分不清谁是谁
+    unique('uq_pipelines_target_name').on(t.targetId, t.name)
+  ]
+)
+
+/**
+ * 流水线里的一步。
+ *
+ * `seq` 是**顺序**而不是数组下标：步骤要能整体上移/下移，用连续整数最省心
+ * （保存时整组重写，所以不会出现空洞）。`UNIQUE(pipeline_id, seq)` 保证
+ * "读出来的顺序"是确定的 —— 只按 `seq` 排序而没有唯一约束时，
+ * 两条同序号的步骤在不同查询里可能换位置，而这在一个"顺序执行"的功能里是致命的。
+ *
+ * `script` 对 `deploy` 步骤恒为空串（见 `contracts/pipeline.ts` 的说明）；
+ * 这里不给它建约束是因为"空"是业务规则，而建 CHECK 会让迁移更难写 ——
+ * 规则由契约层在**存下来的那一刻**拦住。
+ */
+export const pipelineSteps = sqliteTable(
+  'pipeline_steps',
+  {
+    id: text('id').primaryKey(),
+    pipelineId: text('pipeline_id')
+      .notNull()
+      .references(() => pipelines.id, { onDelete: 'cascade' }),
+    /** 1 起 */
+    seq: integer('seq').notNull(),
+    name: text('name').notNull(),
+    /** 'local' | 'remote' | 'deploy' */
+    kind: text('kind').notNull(),
+    script: text('script').notNull().default(''),
+    /** 本机步骤的解释器（'powershell' | 'gitbash'）；远端/发布步骤为 null */
+    shell: text('shell'),
+    cwd: text('cwd'),
+    timeoutMs: integer('timeout_ms').notNull(),
+    /** 'stop' | 'continue' */
+    onFailure: text('on_failure').notNull().default('stop')
+  },
+  (t) => [unique('uq_pipeline_steps_pipeline_seq').on(t.pipelineId, t.seq)]
+)
+
 /* ------------------------------------------------------------------ 类型 */
 
 export type Connection = typeof connections.$inferSelect
@@ -312,6 +378,10 @@ export type ScriptRun = typeof scriptRuns.$inferSelect
 export type NewScriptRun = typeof scriptRuns.$inferInsert
 export type ScriptStepRun = typeof scriptStepRuns.$inferSelect
 export type NewScriptStepRun = typeof scriptStepRuns.$inferInsert
+export type Pipeline = typeof pipelines.$inferSelect
+export type NewPipeline = typeof pipelines.$inferInsert
+export type PipelineStep = typeof pipelineSteps.$inferSelect
+export type NewPipelineStep = typeof pipelineSteps.$inferInsert
 
 /** 全部业务表，供备份/自检统计使用 */
 export const ALL_TABLES = [
@@ -325,5 +395,7 @@ export const ALL_TABLES = [
   'app_settings',
   'audit_logs',
   'script_runs',
-  'script_step_runs'
+  'script_step_runs',
+  'pipelines',
+  'pipeline_steps'
 ] as const

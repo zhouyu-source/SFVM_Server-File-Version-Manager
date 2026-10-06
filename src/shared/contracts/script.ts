@@ -35,6 +35,24 @@ export const SCRIPT_KIND_LABELS: Record<ScriptKind, string> = {
   remote: '服务器执行'
 }
 
+/**
+ * **运行记录里**一个步骤的类型。
+ *
+ * 比 `SCRIPT_KINDS` 多一个 `deploy`：B21 的流水线里，步骤可以是"一次发布"。
+ * 发布不是"一段脚本交给 shell"，所以它不在 `SCRIPT_KINDS` 里（那个联合是给
+ * "跑一条脚本"的入参用的）；但它在运行记录里**必须**能被表示出来 ——
+ * 否则流水线跑到第三步（发布）时，记录里会缺一格，用户会以为漏跑了。
+ */
+export const SCRIPT_STEP_RUN_KINDS = ['local', 'remote', 'deploy'] as const
+export const scriptStepRunKindSchema = z.enum(SCRIPT_STEP_RUN_KINDS)
+export type ScriptStepRunKind = z.infer<typeof scriptStepRunKindSchema>
+
+export const SCRIPT_STEP_RUN_KIND_LABELS: Record<ScriptStepRunKind, string> = {
+  local: '本机执行',
+  remote: '服务器执行',
+  deploy: '发布'
+}
+
 /* -------------------------------------------------------- 本地解释器 */
 
 /**
@@ -186,8 +204,8 @@ export const scriptStepRunViewSchema = z.object({
   /** 1 起，与流水线里的步骤顺序一致（B20 恒为 1） */
   seq: z.number().int().min(1),
   name: z.string(),
-  kind: scriptKindSchema,
-  /** 本机步骤用的解释器；远端步骤为 null */
+  kind: scriptStepRunKindSchema,
+  /** 本机步骤用的解释器；远端/发布步骤为 null */
   shell: localShellSchema.nullable(),
   status: scriptRunStatusSchema,
   /** 进程退出码；`null` = 没拿到（超时被杀、连接断开等） */

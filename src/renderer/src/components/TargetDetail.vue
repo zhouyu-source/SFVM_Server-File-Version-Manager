@@ -21,6 +21,7 @@ import PublishPanel from './PublishPanel.vue'
 import LocalArtifactCard from './LocalArtifactCard.vue'
 import ArchiveSection from './ArchiveSection.vue'
 import ScriptPanel from './ScriptPanel.vue'
+import PipelinePanel from './PipelinePanel.vue'
 import type { TargetView, HealthReport, HealthCheck } from '../../../shared/contracts/workspace'
 import type { DeployCurrentVersion } from '../../../shared/contracts/deploy'
 
@@ -242,6 +243,10 @@ function icon(level: HealthCheck['level']): string {
     -->
     <el-divider content-position="left">脚本</el-divider>
     <ScriptPanel :target="target" />
+
+    <!-- 自动化流水线（B21）—— 多步骤编排，发布可作为其中一环 -->
+    <el-divider content-position="left">自动化流水线</el-divider>
+    <PipelinePanel :target="target" />
 
     <!-- 往期版本（B12 / T12.1~T12.7；回滚在 B13） -->
     <el-divider content-position="left">往期版本</el-divider>

@@ -170,6 +170,25 @@ export const IPC_CHANNELS = {
   /** 一次运行的详情：每步的状态 / 退出码 / 耗时 / 输出尾部 */
   SCRIPTS_RUN_DETAIL: 'scripts.runDetail',
 
+  /* ---------------------------------------- 自动化流水线（B21 / T21.5） */
+  /** 某个目标下的流水线列表（含步骤） */
+  PIPELINES_LIST: 'pipelines.list',
+  PIPELINES_GET: 'pipelines.get',
+  /** 新建或整组覆盖保存（步骤整组替换，不做逐条 diff） */
+  PIPELINES_SAVE: 'pipelines.save',
+  PIPELINES_REMOVE: 'pipelines.remove',
+  /**
+   * 「会执行什么」的展开：**纯本地**（只读台账 + 目标配置）。
+   *
+   * 与运行本身分开，是为了让确认对话框在**没连服务器**时也能把该说的说完，
+   * 而且"要执行什么"只有一处来源，不会出现"对话框说的"和"实际跑的"不一致。
+   */
+  PIPELINES_PREVIEW: 'pipelines.preview',
+  /** 一键跑整条 */
+  PIPELINES_RUN: 'pipelines.run',
+  /** 只跑其中一步（其余步骤不会被触发） */
+  PIPELINES_RUN_STEP: 'pipelines.runStep',
+
   /* ------------------------------------------ 工作环境与目标（B05 / T05.8） */
   ENV_LIST: 'env.list',
   ENV_GET: 'env.get',

@@ -105,3 +105,31 @@ export async function confirmDanger(input: DangerConfirmInput): Promise<boolean>
     return false
   }
 }
+
+/**
+ * 与 `confirmDanger` 同一个弹窗，但**把用户输入的那个名字带回来**（B21）。
+ *
+ * 为什么不能用 `confirmDanger` 然后"反正是生产环境，就把目标名传过去"：
+ * 服务端那道校验（`services/pipeline.ts` 的 `assertProdConfirmed`）存在的意义
+ * 就是"不轻信调用方"。渲染进程如果只是**推断**用户输对了、再把推断当事实送过去，
+ * 那道校验就成了一句自我应验的话 —— 换句话说，它拦住的恰好只有"真的会去拦它的人"。
+ *
+ * 所以这里把输入值原样带出来，让"用户确实逐字打了目标名"这件事**可验证**。
+ */
+export async function confirmDangerWithName(
+  input: DangerConfirmInput & { requireTypedName: string }
+): Promise<{ ok: true; typed: string } | { ok: false; typed: null }> {
+  try {
+    // 带 `inputValidator` 时 `ElMessageBox.confirm` 的 resolve 值就是输入框内容
+    const typed = await ElMessageBox.confirm(dangerBody(input), input.title, {
+      type: 'warning',
+      confirmButtonText: input.confirmText ?? '确认执行',
+      cancelButtonText: input.cancelText ?? '取消',
+      inputPlaceholder: `请输入 ${input.requireTypedName} 以确认`,
+      inputValidator: (v: string) => (v === input.requireTypedName ? true : '名称不一致')
+    })
+    return { ok: true, typed: String(typed ?? '') }
+  } catch {
+    return { ok: false, typed: null }
+  }
+}

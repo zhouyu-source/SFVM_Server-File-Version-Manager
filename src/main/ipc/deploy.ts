@@ -47,7 +47,7 @@ import {
   type DeploySftpLike
 } from '../services/deploy'
 import type { JobService, JobSpec } from '../services/job'
-import { isTerminalStatus } from '../../shared/contracts/job'
+import { assertTargetIdle } from './target-busy'
 import type { ConnectionService } from '../services/connection'
 import type { SshConnectionPool } from '../services/ssh-client'
 import type { Repositories } from '../db/repositories'
@@ -80,28 +80,44 @@ export interface OpenedPorts {
   connectionId: string
 }
 
+/** "目标 → 端口"的可注入形式（发布与流水线里的发布步骤共用）。 */
+export type DeployPortsOpener = (targetId: string) => Promise<OpenedPorts>
+
 /**
  * 发布用的一条 SFTP 通道包出的全部端口。
  *
  * `pool.sftp()` **每次都新建一条通道**，所以这个函数被再调用一次就等于
  * "换一条新通道重试" —— `cleanup` 正是靠这一点在断链后还能清理。
+ *
+ * B21 把"从目标解析出一条可用连接并包成端口"抽成了独立工厂：流水线里的
+ * 「发布」步骤要**直接调用** `deploy.run`（不能新建任务，会自锁死锁），
+ * 于是它也需要同一份端口装配。不抽出来的话，两处必然各自演一遍
+ * （而其中一处的 `tmpDir` 拼错，只有真机上才会发现）。
  */
-export function registerDeployHandlers(deps: DeployIpcDeps): void {
-  const { deploy, jobs, connections, pool, repo } = deps
+export interface DeployPortsOpenerDeps {
+  repo: Repositories
+  connections: ConnectionService
+  pool: SshConnectionPool
+  /** 写进远端锁文件，便于用户判断"是谁在发布"。默认取本机 hostname */
+  hostname?: () => string
+}
+
+export function createDeployPortsOpener(
+  deps: DeployPortsOpenerDeps
+): (targetId: string) => Promise<OpenedPorts> {
   const hostname = deps.hostname ?? ((): string => osHostname())
 
-  async function openPorts(targetId: string): Promise<OpenedPorts> {
-    if (deps.openPorts) return deps.openPorts(targetId)
-    const target = repo.targets.get(targetId)
+  return async function openPorts(targetId: string): Promise<OpenedPorts> {
+    const target = deps.repo.targets.get(targetId)
     if (!target) throw new AppError(ErrorCode.E_NOT_FOUND, { targetId })
 
-    const env = repo.environments.get(target.environmentId)
+    const env = deps.repo.environments.get(target.environmentId)
     if (!env) throw new AppError(ErrorCode.E_NOT_FOUND, { environmentId: target.environmentId })
 
     const connectionId = env.connectionId
-    if (!pool.isOnline(connectionId)) await connections.connect(connectionId)
+    if (!deps.pool.isOnline(connectionId)) await deps.connections.connect(connectionId)
 
-    const capability = pool.capabilityOf(connectionId)
+    const capability = deps.pool.capabilityOf(connectionId)
     if (!capability) {
       throw new AppError(ErrorCode.E_CONN_LOST, {
         connectionId,
@@ -109,7 +125,7 @@ export function registerDeployHandlers(deps: DeployIpcDeps): void {
       })
     }
 
-    const sftp = (await pool.sftp(connectionId)) as unknown as DeploySftpLike
+    const sftp = (await deps.pool.sftp(connectionId)) as unknown as DeploySftpLike
     const tmpDir = joinRemote(
       normalizeRemotePath(capability.homeDir?.trim() || '/tmp'),
       '.sfvm-tmp'
@@ -121,11 +137,24 @@ export function registerDeployHandlers(deps: DeployIpcDeps): void {
         sftp,
         capability,
         tmpDir,
-        exec: (cmd) => pool.exec(connectionId, cmd),
+        exec: (cmd) => deps.pool.exec(connectionId, cmd),
         hostname: hostname()
       })
     }
   }
+}
+
+export function registerDeployHandlers(deps: DeployIpcDeps): void {
+  const { deploy, jobs, connections, pool, repo } = deps
+
+  const openPorts =
+    deps.openPorts ??
+    createDeployPortsOpener({
+      repo,
+      connections,
+      pool,
+      ...(deps.hostname ? { hostname: deps.hostname } : {})
+    })
 
   /* --------------------------------------------------------------- 任务化 */
 
@@ -285,22 +314,13 @@ export function registerDeployHandlers(deps: DeployIpcDeps): void {
   )
 
   registerHandler(IPC_CHANNELS.DEPLOY_START, deployStartInputSchema, (input) => {
-    // 同一目标已有发布在跑（或排队）时直接拒绝，而不是排进队列。
+    // 同一目标上已有任务（发布、回滚、脚本、流水线……）就直接拒绝，而不是排进队列。
     // 队列会让"手滑点了两次"变成"真的发布了两版"，而第二版与前版内容相同，
     // 除了在往期版本里多一条一模一样的记录之外没有任何意义。
-    const active = jobs
-      .activeForTarget(input.targetId)
-      .filter((j) => j.type === 'deploy' && !isTerminalStatus(j.status))
-    if (active.length > 0) {
-      throw new AppError(
-        ErrorCode.E_TARGET_BUSY,
-        { targetId: input.targetId, jobId: active[0]?.jobId },
-        {
-          message: `该目标上已有发布在进行中（${active[0]?.title ?? ''}）`,
-          hint: '请等待它结束，或先在底部任务控制台取消它。'
-        }
-      )
-    }
+    //
+    // B21 起这里从"只看 type==='deploy'"放宽成"看这个目标上的**任意**任务"：
+    // 脚本/流水线同样在动这个目标，静默排队对用户来说就是"点了没反应"。
+    assertTargetIdle(jobs, input.targetId, { action: '发布' })
     const view = jobs.start(createDeployJobSpec(input))
     logger.info(`deploy.start: target=${input.targetId} job=${view.jobId}`)
     return view

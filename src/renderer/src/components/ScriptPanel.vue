@@ -239,9 +239,12 @@ onScopeDispose(() => {
   if (clockTimer !== null) clearInterval(clockTimer)
 })
 
-function stepOf(run: ScriptRunView): ScriptStepRunView | null {
-  return run.steps[0] ?? null
-}
+/*
+ * 注意：这里**没有** `stepOf()` 这类"取第一步"的助手了。
+ * B20 时列表的耗时与退出码都取 `steps[0]`（那时恒为一步），B21 起一条记录
+ * 可能有多步 —— 那些取法会把"一条跑了 5 分钟的流水线"显示成"第一步的 3 秒"。
+ * 现在分别用 `runDuration()` / `runExitCode()`，语义写在各自的注释里。
+ */
 
 /**
  * 把表格 slot 的 `row` 收窄回 `ScriptRunView`。
@@ -256,17 +259,38 @@ function toRunView(row: unknown): ScriptRunView {
   return row as ScriptRunView
 }
 
-function stepDuration(run: ScriptRunView): string {
-  const s = stepOf(run)
-  if (!s) return '—'
-  if (s.finishedAt) return formatDuration(s.startedAt, s.finishedAt)
+/**
+ * 列表里的"耗时"取**整条运行**的起止，而不是某一步的。
+ *
+ * B21 起一条记录可能有多个步骤，取第一步的会让"一条跑了 5 分钟的流水线"
+ * 显示成"第一步的 3 秒"。用运行自己的起止时间对单步（B20）也几乎无差。
+ */
+function runDuration(run: ScriptRunView): string {
+  if (run.finishedAt) return formatDuration(run.startedAt, run.finishedAt)
   // 执行中：拿当前时刻算，与任务台的计时口径一致
-  return formatDuration(s.startedAt, new Date(now.value).toISOString())
+  return formatDuration(run.startedAt, new Date(now.value).toISOString())
 }
 
-/** "本机 · PowerShell" / "服务器" —— 列表与详情共用一套说法。 */
+/**
+ * 列表里的"退出码"。
+ *
+ * 单步运行：就是那一步的。多步（流水线）：优先显示**失败那一步**的退出码 ——
+ * 那才是用户想知道的；全部成功时显示最后一步的（流水线里最后一步成不成，
+ * 通常就等于"整件事成不成"）。
+ */
+function runExitCode(run: ScriptRunView): number | null {
+  if (run.steps.length === 1) return run.steps[0]!.exitCode
+  const failed = run.steps.find((s) => s.status === 'failed')
+  if (failed) return failed.exitCode
+  return run.steps.length > 0 ? run.steps[run.steps.length - 1]!.exitCode : null
+}
+
+/** "本机 · PowerShell" / "服务器" / "发布" —— 列表与详情共用一套说法。 */
 function kindTextOf(step: ScriptStepRunView | null): string {
   if (!step) return '—'
+  // B21 起步骤也可能是"发布"：它既不是本机也不是服务器命令，
+  // 归到任何一边都会让人以为"这一步跑了条 shell"
+  if (step.kind === 'deploy') return '发布'
   if (step.kind === 'local') {
     return step.shell ? `本机 · ${LOCAL_SHELL_LABELS[step.shell]}` : '本机'
   }
@@ -274,7 +298,9 @@ function kindTextOf(step: ScriptStepRunView | null): string {
 }
 
 function kindText(run: ScriptRunView): string {
-  return kindTextOf(stepOf(run))
+  // 多步（流水线）：说"几步"比说"第一步在哪跑"有用得多
+  if (run.steps.length > 1) return `${run.steps.length} 个步骤`
+  return kindTextOf(run.steps[0] ?? null)
 }
 
 /* ---------------------------------------------------------------- 详情 */
@@ -571,7 +597,7 @@ watch(
 
         <el-table-column label="耗时" width="92">
           <template #default="{ row }">
-            <span class="mono">{{ stepDuration(toRunView(row)) }}</span>
+            <span class="mono">{{ runDuration(toRunView(row)) }}</span>
           </template>
         </el-table-column>
 
@@ -581,8 +607,8 @@ watch(
               `null` 是"没拿到"（超时被杀、连接断开），与"退出码 0"是两件事 ——
               显示成 0 会让人以为成功了。
             -->
-            <span v-if="stepOf(toRunView(row))?.exitCode === null" class="muted">—</span>
-            <span v-else class="mono">{{ stepOf(toRunView(row))?.exitCode }}</span>
+            <span v-if="runExitCode(toRunView(row)) === null" class="muted">—</span>
+            <span v-else class="mono">{{ runExitCode(toRunView(row)) }}</span>
           </template>
         </el-table-column>
 

@@ -21,10 +21,11 @@ import { registerAppHandlers } from './ipc/app'
 import { registerConnectionHandlers } from './ipc/connections'
 import { registerWorkspaceHandlers } from './ipc/workspace'
 import { registerArchiveHandlers } from './ipc/archive'
-import { registerDeployHandlers } from './ipc/deploy'
+import { registerDeployHandlers, createDeployPortsOpener } from './ipc/deploy'
 import { registerRollbackHandlers } from './ipc/rollback'
 import { registerReconcileHandlers } from './ipc/reconcile'
 import { registerScriptHandlers } from './ipc/script'
+import { registerPipelineHandlers, createPipelineDeployPort } from './ipc/pipeline'
 import { closeAppDatabase, getRepositories, openAppDatabase, openedDataDir, backupDatabaseTo } from './db'
 import { DB_FILENAME } from './db/client'
 import { SshConnectionPool } from './services/ssh-client'
@@ -37,6 +38,7 @@ import { createDeployService } from './services/deploy'
 import { createRollbackService } from './services/rollback'
 import { createReconcileService } from './services/reconcile'
 import { createScriptService } from './services/script'
+import { createPipelineService } from './services/pipeline'
 import {
   attachJobEventPush,
   createJobGuard,
@@ -491,12 +493,20 @@ if (!gotLock) {
       transferConcurrency: () => settingsService.current().transferConcurrency,
       hashCompat: () => settingsService.current().hashCompatMode
     })
+    // 端口装配只做一次：**流水线里的「发布」步骤要用同一份**
+    // （它必须直接调 deploy.run，见 services/pipeline.ts 文件头）
+    const deployPortsOpener = createDeployPortsOpener({
+      repo,
+      connections: connectionService,
+      pool
+    })
     registerDeployHandlers({
       deploy: deployService,
       jobs: jobService,
       connections: connectionService,
       pool,
-      repo
+      repo,
+      openPorts: deployPortsOpener
     })
 
     // B13：回滚（把一个往期版本恢复为当前版本，当前版本先归档、不丢）。
@@ -528,6 +538,30 @@ if (!gotLock) {
       connections: connectionService,
       pool,
       repo
+    })
+
+    // B21：自动化流水线（多步骤编排，发布可作为其中一环）
+    //
+    // 依赖 scriptService（每一步的留档与单步执行复用 B20 的实现，不重抄
+    // sink/tail/脱敏那一套）与 deployService（发布步骤**直接调用**它 —— 新建任务
+    // 会排在本流水线任务自己的后面，自锁死锁）。
+    const pipelineService = createPipelineService({
+      repo,
+      scripts: scriptService,
+      deploy: createPipelineDeployPort({
+        openPorts: deployPortsOpener,
+        deploy: deployService,
+        pool
+      }),
+      allowUserScripts: () => allowUserScripts()
+    })
+    registerPipelineHandlers({
+      pipelines: pipelineService,
+      jobs: jobService,
+      connections: connectionService,
+      pool,
+      repo,
+      openPorts: deployPortsOpener
     })
 
     // 连接状态变化转发给渲染进程（T03.3 的状态广播）

@@ -210,7 +210,22 @@ describe('B20 总闸', () => {
       const r = await runSpec(spec, makeCtx())
       expect(r.ok).toBe(false)
       expect((r as { error: AppError }).error.code).toBe(ErrorCode.E_SCRIPT_SHELL_MISSING)
-      expect(svc.list(target.id)).toEqual([])
+
+      /*
+       * B21 起这里**留一条失败记录**。
+       *
+       * 以前断言的是"一条记录都没有"—— 而那个行为本身就是毛病：用户点了执行、
+       * 任务台里一条红、再回"运行记录"想复查时什么都没有。现在解释器找不到
+       * 也照样建记录，并把原因写进这一步的错误与日志里，记录自解释。
+       */
+      const runs = svc.list(target.id)
+      expect(runs).toHaveLength(1)
+      expect(runs[0]!.status).toBe('failed')
+      const step = runs[0]!.steps[0]!
+      expect(step.status).toBe('failed')
+      expect(step.errorMessage ?? '').toContain('解释器')
+      // 整条运行的原因也要写清楚 —— 列表页只显示这一行
+      expect(runs[0]!.errorMessage ?? '').toContain('解释器')
     } finally {
       t.cleanup()
     }

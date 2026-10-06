@@ -96,6 +96,17 @@ import type {
   ScriptRunStepInput,
   ScriptRunView
 } from '../../../shared/contracts/script'
+import type {
+  PipelineDetailInput,
+  PipelineListInput,
+  PipelinePreview,
+  PipelinePreviewInput,
+  PipelineRemoveInput,
+  PipelineRunInput,
+  PipelineRunStepInput,
+  PipelineSaveInput,
+  PipelineView
+} from '../../../shared/contracts/pipeline'
 
 /** 跨进程业务异常。组件可捕获后按 code 分支，或用 message 直接展示。 */
 export class IpcBusinessError extends Error {
@@ -419,6 +430,33 @@ export const api = {
 
     runDetail: (input: ScriptRunDetailInput): Promise<ScriptRunView> =>
       call('scripts.runDetail', () => window.sfvm.scripts.runDetail(input))
+  },
+
+  /* ---------------------------------------- 自动化流水线（B21 / T21.5） */
+  pipelines: {
+    list: (input: PipelineListInput): Promise<PipelineView[]> =>
+      call('pipelines.list', () => window.sfvm.pipelines.list(input)),
+
+    detail: (input: PipelineDetailInput): Promise<PipelineView> =>
+      call('pipelines.get', () => window.sfvm.pipelines.detail(input)),
+
+    save: (input: PipelineSaveInput): Promise<PipelineView> =>
+      call('pipelines.save', () => window.sfvm.pipelines.save(input)),
+
+    remove: (input: PipelineRemoveInput): Promise<{ removed: boolean }> =>
+      call('pipelines.remove', () => window.sfvm.pipelines.remove(input)),
+
+    /** 「会执行什么」：纯本地，不连服务器 */
+    preview: (input: PipelinePreviewInput): Promise<PipelinePreview> =>
+      call('pipelines.preview', () => window.sfvm.pipelines.preview(input)),
+
+    /** 一键跑整条 */
+    run: (input: PipelineRunInput): Promise<JobView> =>
+      call('pipelines.run', () => window.sfvm.pipelines.run(input)),
+
+    /** 只跑其中一步 */
+    runStep: (input: PipelineRunStepInput): Promise<JobView> =>
+      call('pipelines.runStep', () => window.sfvm.pipelines.runStep(input))
   },
 
   /* ------------------------------------------------ 菜单命令（B15 / T15.7） */

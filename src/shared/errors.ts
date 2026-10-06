@@ -89,7 +89,11 @@ export const ErrorCode = {
   E_SCRIPT_DISABLED: 'E_SCRIPT_DISABLED',
   E_SCRIPT_SHELL_MISSING: 'E_SCRIPT_SHELL_MISSING',
   E_SCRIPT_TIMEOUT: 'E_SCRIPT_TIMEOUT',
-  E_SCRIPT_EXIT: 'E_SCRIPT_EXIT'
+  E_SCRIPT_EXIT: 'E_SCRIPT_EXIT',
+
+  // ---- 自动化流水线（B21）----
+  E_PIPELINE_PRECHECK: 'E_PIPELINE_PRECHECK',
+  E_CONFIRM_REQUIRED: 'E_CONFIRM_REQUIRED'
 } as const
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode]
@@ -317,6 +321,15 @@ export const ERROR_TEXT: Record<ErrorCodeValue, ErrorDescriptor> = {
   E_SCRIPT_EXIT: {
     message: '脚本以非零退出码结束',
     hint: '展开「运行记录」看输出，定位失败原因后修改脚本再试。'
+  },
+
+  E_PIPELINE_PRECHECK: {
+    message: '发布步骤的前置校验没通过',
+    hint: '流水线在这一步停下，没有改动服务器上的文件。请按报告里的问题处理后再跑（例如清理残留、改本地产物路径），或先把「发布」这一行改成「继续往下跑」由你自行取舍。'
+  },
+  E_CONFIRM_REQUIRED: {
+    message: '生产环境需要先确认目标名称',
+    hint: '这是生产环境的目标，跑流水线之前必须逐字输入目标名称 —— 它会执行构筑、重启服务乃至换版，误触的代价与测试环境完全不同。'
   }
 }
 

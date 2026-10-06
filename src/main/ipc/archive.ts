@@ -32,6 +32,7 @@
 import { promises as fsp } from 'node:fs'
 import { join as joinLocal } from 'node:path'
 import { registerHandler } from '../infra/ipc'
+import { assertTargetIdle } from './target-busy'
 import { logger } from '../infra/logger'
 import { AppError, ErrorCode } from '../infra/errors'
 import { IPC_CHANNELS } from '../../shared/channels'
@@ -349,17 +350,10 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
 
     // 该目标上有任务在跑时不让删：发布/回滚正在用归档目录，
     // 而"这一版刚好是正在发布的那一版"是真实存在的场景
-    const active = jobs.activeForTarget(first.targetId)
-    if (active.length > 0) {
-      throw new AppError(
-        ErrorCode.E_TARGET_BUSY,
-        { targetId: first.targetId, jobId: active[0]?.jobId },
-        {
-          message: `该目标上已有任务在进行中（${active[0]?.title ?? ''}）`,
-          hint: '请等它结束后再删除往期版本。'
-        }
-      )
-    }
+    assertTargetIdle(jobs, first.targetId, {
+      action: '删除往期版本',
+      hint: '请等它结束后再删除往期版本。'
+    })
 
     const { ports } = await openPorts(first.targetId)
     const result = await archive.removeVersions({ archiveIds, fs: ports.fs })

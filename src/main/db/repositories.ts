@@ -21,6 +21,8 @@ import {
   connections,
   environments,
   knownHosts,
+  pipelineSteps,
+  pipelines,
   releaseItems,
   releases,
   scriptRuns,
@@ -30,6 +32,8 @@ import {
   type NewAuditLog,
   type NewConnection,
   type NewEnvironment,
+  type NewPipeline,
+  type NewPipelineStep,
   type NewRelease,
   type NewReleaseItem,
   type NewScriptRun,
@@ -606,6 +610,81 @@ export function createRepositories(db: Db) {
     }
   }
 
+  /* ------------------------------------------------------------ pipelines */
+
+  const pipelinesRepo = {
+    get: (id: string) => db.select().from(pipelines).where(eq(pipelines.id, id)).get(),
+
+    /** 某个目标的全部流水线：按创建时间正序（同一批建的自然成组） */
+    listByTarget: (targetId: string) =>
+      db
+        .select()
+        .from(pipelines)
+        .where(eq(pipelines.targetId, targetId))
+        .orderBy(pipelines.createdAt, pipelines.name)
+        .all(),
+
+    /** 查重（同一目标下不允许同名）—— 保存前先问一句，好给出比"唯一约束冲突"好的提示 */
+    findByName: (targetId: string, name: string) =>
+      db
+        .select()
+        .from(pipelines)
+        .where(and(eq(pipelines.targetId, targetId), eq(pipelines.name, name)))
+        .get(),
+
+    create: (input: Omit<NewPipeline, 'id' | 'createdAt' | 'updatedAt'>) => {
+      const stamp = ts()
+      const row: NewPipeline = { ...input, id: newId(), createdAt: stamp, updatedAt: stamp }
+      db.insert(pipelines).values(row).run()
+      return pipelinesRepo.get(row.id)!
+    },
+
+    update: (id: string, patch: { name: string; description: string | null }) => {
+      db.update(pipelines)
+        .set({ ...patch, updatedAt: ts() })
+        .where(eq(pipelines.id, id))
+        .run()
+      return pipelinesRepo.get(id)
+    },
+
+    remove: (id: string) => {
+      db.delete(pipelines).where(eq(pipelines.id, id)).run()
+    }
+  }
+
+  const pipelineStepsRepo = {
+    listByPipeline: (pipelineId: string) =>
+      db
+        .select()
+        .from(pipelineSteps)
+        .where(eq(pipelineSteps.pipelineId, pipelineId))
+        .orderBy(pipelineSteps.seq)
+        .all(),
+
+    /**
+     * 整组替换一条流水线的步骤。
+     *
+     * **不做逐条 diff**：步骤要能上移/下移，而"移动"在逐条比对下会变成一串
+     * update + 序号冲突（`UNIQUE(pipeline_id, seq)` 会在中途报错）。整组换掉
+     * 就没有这个问题，代价只是步骤 id 会变 —— 而步骤 id 除了 `remove` 之外
+     * 没有外部引用（运行记录用的是 `seq` 与快照，不是步骤 id）。
+     *
+     * 必须在一个事务里：先删后插之间的空档如果被别的读操作撞上，
+     * 界面会看到「一条没有步骤的流水线」。
+     */
+    replaceAll: (
+      pipelineId: string,
+      steps: Array<Omit<NewPipelineStep, 'id' | 'pipelineId'>>
+    ): void => {
+      db.transaction((tx) => {
+        tx.delete(pipelineSteps).where(eq(pipelineSteps.pipelineId, pipelineId)).run()
+        for (const s of steps) {
+          tx.insert(pipelineSteps).values({ ...s, id: newId(), pipelineId }).run()
+        }
+      })
+    }
+  }
+
   return {
     connections: connectionsRepo,
     knownHosts: knownHostsRepo,
@@ -617,7 +696,9 @@ export function createRepositories(db: Db) {
     settings: settingsRepo,
     audit: auditRepo,
     scriptRuns: scriptRunsRepo,
-    scriptStepRuns: scriptStepRunsRepo
+    scriptStepRuns: scriptStepRunsRepo,
+    pipelines: pipelinesRepo,
+    pipelineSteps: pipelineStepsRepo
   }
 }
 

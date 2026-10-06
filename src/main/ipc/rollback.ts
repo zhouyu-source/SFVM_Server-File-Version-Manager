@@ -24,7 +24,7 @@ import { IPC_CHANNELS } from '../../shared/channels'
 import { joinRemote } from '../infra/hash-core'
 import { normalizeRemotePath } from '../infra/remote-path'
 import { lockPathOf, parseLockPayload } from '../infra/deploy-plan'
-import { isTerminalStatus } from '../../shared/contracts/job'
+import { assertTargetIdle } from './target-busy'
 import {
   rollbackPreviewInputSchema,
   rollbackStartInputSchema,
@@ -222,22 +222,9 @@ export function registerRollbackHandlers(deps: RollbackIpcDeps): void {
   )
 
   registerHandler(IPC_CHANNELS.ROLLBACK_START, rollbackStartInputSchema, (input) => {
-    const active = jobs
-      .activeForTarget(input.targetId)
-      .filter(
-        (j) =>
-          !isTerminalStatus(j.status) && (j.type === 'deploy' || j.type === 'rollback')
-      )
-    if (active.length > 0) {
-      throw new AppError(
-        ErrorCode.E_TARGET_BUSY,
-        { targetId: input.targetId, jobId: active[0]?.jobId, type: active[0]?.type },
-        {
-          message: `该目标上已有${active[0]?.type === 'rollback' ? '回滚' : '发布'}在进行中（${active[0]?.title ?? ''}）`,
-          hint: '请等待它结束，或先在底部任务控制台取消它。'
-        }
-      )
-    }
+    // B21 起放宽成"这个目标上的**任意**任务"：脚本/流水线同样在动这个目标，
+    // 静默排队对用户来说就是"点了没反应"（与 deploy.start 同一处守卫）
+    assertTargetIdle(jobs, input.targetId, { action: '回滚' })
     const view = jobs.start(createRollbackJobSpec(input))
     logger.info(
       `rollback.start: target=${input.targetId} archive=${input.archiveId} job=${view.jobId}`
