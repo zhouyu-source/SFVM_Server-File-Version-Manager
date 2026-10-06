@@ -546,10 +546,17 @@ const runningCount = computed(() => store.jobs.filter((j) => !isTerminalStatus(j
   white-space: nowrap;
 }
 
+/*
+  右侧详情。
+  `min-height: 0` 是**必须**的：它是 grid 项，自动最小尺寸默认等于内容高度，
+  于是里面的日志框（`flex:1` + `overflow:auto`）永远拿不到一个受限的高度 ——
+  超长内容不会在自己框里滚，而是把整个面板顶破。加上它日志才真的滚起来。
+*/
 .tc-detail {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .tc-detail-head {
@@ -568,11 +575,20 @@ const runningCount = computed(() => store.jobs.filter((j) => !isTerminalStatus(j
   white-space: nowrap;
 }
 
+/*
+  失败详情可能很长（错误说明 + 建议，或一整段服务端回执）。原来"有多高就多高"，
+  于是它能把下面的日志区挤没、再把面板顶破。给它一个上限、超出的自己滚 ——
+  详情优先，但不许吃掉整个详情区。
+  另外 `overflow-wrap` 是给"一长串没有空格的路径 / 命令"留的，否则横向也会溢出。
+*/
 .tc-error {
   padding: 6px 10px;
   background: #fef0f0;
   border-bottom: 1px solid #fde2e2;
   font-size: 12px;
+  max-height: 120px;
+  overflow: auto;
+  overflow-wrap: break-word;
 }
 
 .tc-error-code {

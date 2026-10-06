@@ -18,15 +18,28 @@
  *    与一堆边界情况（拖出容器、拖到自身），而上移/下移对 10 步以内的清单完全够用。
  * 3. **跑整条一律先确认**，确认框里列全步骤。流水线是"一次点击触发一串不可撤销
  *    的操作"，这一步的确认成本远低于误触的代价。生产环境还要逐字输入目标名。
+ *
+ * ## 它是脚本功能在目标页的唯一入口
+ *
+ * B20 曾有一个独立的「脚本」区块（跑单条脚本的表单 + 常驻权限提示），
+ * 那个入口已被流水线的"一步"取代，已删除。于是两件事搬到了这里：
+ *
+ * - **常驻的服务器权限提示** → 编辑器里「服务器执行」步骤的「步骤名」下面
+ *   （它本来就只对服务器步骤有意义，放在那一步里比放在页面上更贴题）；
+ * - **总闸关着时的"去哪儿打开"** → 这块自己说明（见下方模板），
+ *   因为已经没有别的地方会讲这件事了。
+ *
+ * 运行记录（`script_runs`）跟在它后面，见 `RunHistoryPanel.vue`。
  */
 import { computed, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   ArrowDown,
   ArrowUp,
+  CaretRight,
   Delete,
   EditPen,
-  InfoFilled,
   Plus,
   Refresh,
   VideoPlay
@@ -58,17 +71,31 @@ import type { TargetView } from '../../../shared/contracts/workspace'
 
 const props = defineProps<{ target: TargetView }>()
 
+const router = useRouter()
+
+/** 总闸关着时唯一的出路：开关在「设置 → 脚本执行」 */
+function goSettings(): void {
+  void router.push('/settings')
+}
+
 /* ------------------------------------------------------------------ 能力 */
 
 const caps = ref<ScriptCapabilities | null>(null)
+const capsError = ref('')
 
+/**
+ * 读能力（总闸开关 + 本机可用的解释器）。
+ *
+ * 读不出来时**要说出来**：这块现在是脚本与流水线在目标页的**唯一入口**，
+ * 静默什么都不渲染会让人以为功能被删了。
+ */
 async function loadCaps(): Promise<void> {
   try {
     caps.value = await api.scripts.capabilities()
-  } catch {
-    // 读不到能力时整块不渲染（ScriptPanel 会把"为什么不可用"讲清楚），
-    // 这里再报一次错只是噪音
+    capsError.value = ''
+  } catch (e) {
     caps.value = null
+    capsError.value = (e as IpcBusinessError).toUserText()
   }
 }
 
@@ -423,10 +450,37 @@ watch(
 
 <template>
   <!--
-    总闸关着时**整块不渲染**：`ScriptPanel` 已经把"这个功能默认关闭、去哪儿打开"
-    讲清楚了，这里再来一条同样的提示只是噪音。
+    这块现在是「脚本 / 流水线」在目标页的**唯一入口** —— B20 那个独立的「脚本」
+    区块已经删掉，所以三种状态都要说清楚，不能静默不渲染：
+    能力读不出来 → 报错；总闸关着 → 说明去哪儿打开；否则 → 正常面板。
+    （`caps` 还没读回来时三种都不渲染，避免闪一下"功能未开启"。）
   -->
-  <section v-if="caps && caps.allowUserScripts" class="pipeline-panel" data-test="pipeline-panel">
+  <el-alert
+    v-if="capsError"
+    type="error"
+    show-icon
+    :closable="false"
+    :title="`读取脚本能力失败：${capsError}`"
+    data-test="script-caps-error"
+  />
+
+  <el-alert
+    v-else-if="caps && !caps.allowUserScripts"
+    type="info"
+    show-icon
+    :closable="false"
+    title="自定义脚本功能未开启"
+    data-test="script-gate-off"
+  >
+    <p class="gate-text">
+      这个功能默认关闭 —— 开启后可以在本机或服务器上执行你填写的任意命令，
+      并把这些步骤存成自动化流水线。
+    </p>
+    <p class="gate-text">需要的到「设置 → 脚本执行」里打开<strong>开启自定义脚本</strong>。</p>
+    <el-button size="small" :icon="CaretRight" @click="goSettings">去设置里打开</el-button>
+  </el-alert>
+
+  <section v-else-if="caps" class="pipeline-panel" data-test="pipeline-panel">
     <div class="head">
       <span class="hint inline">
         把一串操作存成一条流水线：本机构筑 → 服务器上关服务 → 发布 → 启服务。
@@ -617,6 +671,28 @@ watch(
                 />
               </el-form-item>
 
+              <!--
+                服务器步骤的常驻权限提示（从目标页「脚本」区块搬来的，B20）。
+                挂在「步骤名」正下方而不是弹成一次性气泡：脚本失败最常见的原因
+                就是服务器账户权限不够，而那时用户往往已经忘了"这软件是拿哪个
+                账号连的"。只对服务器步骤显示 —— 本机脚本与这条无关。
+              -->
+              <el-alert
+                v-if="st.kind === 'remote'"
+                class="perm"
+                type="warning"
+                show-icon
+                :closable="false"
+                title="脚本以你当前的权限执行"
+                data-test="script-permission-hint"
+              >
+                <p class="gate-text">
+                  服务端脚本用的是<strong>你登录服务器时用的那个账户</strong>。请确认它的权限足够
+                  （例如重启服务要 <span class="mono">sudo</span> /
+                  <span class="mono">systemctl</span> 权限、写目标目录要对应属主），否则脚本会在中途失败。
+                </p>
+              </el-alert>
+
               <template v-if="st.kind !== 'deploy'">
                 <el-form-item v-if="st.kind === 'local'" label="解释器">
                   <el-select
@@ -705,13 +781,6 @@ watch(
       </div>
 
       <el-alert v-if="editorError" type="error" show-icon :closable="false" :title="editorError" />
-
-      <div class="hint note">
-        <el-icon><InfoFilled /></el-icon>
-        请确认登录服务器时用的那个账户权限足够（例如重启服务要
-        <span class="mono">sudo</span> / <span class="mono">systemctl</span> 权限），
-        否则脚本会在中途失败。
-      </div>
 
       <template #footer>
         <el-button :disabled="saving" @click="editorOpen = false">取消</el-button>
@@ -865,11 +934,20 @@ watch(
 .info {
   margin-bottom: 12px;
 }
-.note {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  margin-top: 10px;
+/*
+  「脚本以你当前的权限执行」—— 常量提示，常驻在服务器步骤的「步骤名」下面。
+  它没有 form-item 包着，所以自己留出与下一个表单项之间的间距。
+*/
+.perm {
+  margin-bottom: 12px;
+}
+.gate-text {
+  margin: 0 0 6px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.gate-text:last-of-type {
+  margin-bottom: 8px;
 }
 .grow {
   flex: 1 1 auto;

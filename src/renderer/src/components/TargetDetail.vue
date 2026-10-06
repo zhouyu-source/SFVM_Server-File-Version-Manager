@@ -6,7 +6,11 @@
  * 1. 状态卡片 —— 远端路径 / 归档目录 / 当前版本 / 最近发布 / 策略；
  * 2. **本地产物**（B11 / T11.1~T11.2 + T11.7）—— 先配好"要发什么"；
  * 3. **发布**（B11 / T11.3~T11.6）—— 确认 → 进度 → 失败详情 → 成功后刷新；
- * 4. **往期版本**（B12 / T12.1~T12.7）—— 表格 / 下载 / 删除 / 明细 / 保留策略；
+ * 4. **自动化流水线**（B21）—— 多步骤编排，发布是其中一环；紧跟其后的
+ *    **运行记录**（B20）回答"这条流水线上次跑成什么样"。B20 原本在目标页有一个
+ *    独立的「脚本」区块（跑单条脚本的表单），那个入口已被流水线的"一步"取代，
+ *    区块连同它的权限提示一起并了进来 —— 见 `PipelinePanel` 与 `RunHistoryPanel`。
+ * 5. **往期版本**（B12 / T12.1~T12.7）—— 表格 / 下载 / 删除 / 明细 / 保留策略；
  *    回滚属于 B13。这一块整体交给 `ArchiveSection`：它自己有四个会改远端状态的动作
  *    与两份要同步刷新的数据，"动作完成后刷什么"只有一处答案。
  */
@@ -20,7 +24,7 @@ import { useConnectionStore } from '../stores/connection'
 import PublishPanel from './PublishPanel.vue'
 import LocalArtifactCard from './LocalArtifactCard.vue'
 import ArchiveSection from './ArchiveSection.vue'
-import ScriptPanel from './ScriptPanel.vue'
+import RunHistoryPanel from './RunHistoryPanel.vue'
 import PipelinePanel from './PipelinePanel.vue'
 import type { TargetView, HealthReport, HealthCheck } from '../../../shared/contracts/workspace'
 import type { DeployCurrentVersion } from '../../../shared/contracts/deploy'
@@ -236,17 +240,16 @@ function icon(level: HealthCheck['level']): string {
       @saved="ws.refreshTargets(target.environmentId)"
     />
 
-    <!--
-      脚本（B20）。
-      挂在「发布」之后、与发布同级：用户提的场景就是"构筑 → 关服务 → 发布 → 启服务"，
-      脚本与发布本来就该挨着看。B21 的流水线也落在这里。
-    -->
-    <el-divider content-position="left">脚本</el-divider>
-    <ScriptPanel :target="target" />
-
     <!-- 自动化流水线（B21）—— 多步骤编排，发布可作为其中一环 -->
     <el-divider content-position="left">自动化流水线</el-divider>
     <PipelinePanel :target="target" />
+
+    <!--
+      运行记录（B20 的 `script_runs`）紧跟在流水线下面，不单开一个区块：
+      脚本入口已经并进流水线，而它回答的正是"这条流水线上次跑成什么样"。
+      **不受总闸影响** —— 关掉自定义脚本后，之前跑过的记录仍然看得到。
+    -->
+    <RunHistoryPanel :target="target" />
 
     <!-- 往期版本（B12 / T12.1~T12.7；回滚在 B13） -->
     <el-divider content-position="left">往期版本</el-divider>
