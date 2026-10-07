@@ -45,6 +45,8 @@ import {
   VideoPlay
 } from '@element-plus/icons-vue'
 import { api, IpcBusinessError } from '../api'
+import { isTerminalStatus, type JobView } from '../../../shared/contracts/job'
+import { useJobStore } from '../stores/job'
 import { confirmDanger, confirmDangerWithName } from '../utils/danger'
 import { formatDateTime } from '../utils/format'
 import {
@@ -70,6 +72,14 @@ import {
 import type { TargetView } from '../../../shared/contracts/workspace'
 
 const props = defineProps<{ target: TargetView }>()
+
+/**
+ * 发布步骤成功后要通知父级刷新（见下方 watch 的注释）。
+ * `versionTag` 传 null：任务视图里没有发布结果，当前版本号由父级刷新时自己读。
+ */
+const emit = defineEmits<{
+  deployed: [{ jobId: string; versionTag: string | null }]
+}>()
 
 const router = useRouter()
 
@@ -354,6 +364,39 @@ async function previewOf(pipelineId: string): Promise<PipelinePreview | null> {
   }
 }
 
+/* ------------------------------------------------- 发布后的页面刷新（T11.6 的流水线侧） */
+
+const jobStore = useJobStore()
+
+/**
+ * 本面板启动的、含发布步骤的任务 id。
+ *
+ * 流水线的发布步骤在**主进程**里直接调 `deploy.run`（见文件头，为避免任务框架
+ * 自锁死锁），渲染层不会像 `PublishPanel` 那样"自己发起的任务自己看得见结果"——
+ * 目标页的当前版本号 / 往期版本列表 consequently 不会刷新。所以这里盯住任务
+ * store：自己启动的含发布步骤的任务整条成功后，向上发 `deployed`，让
+ * `TargetDetail` 走与手动发布同一个刷新入口。
+ */
+const deployJobIds = ref<string[]>([])
+
+watch(
+  () => jobStore.jobs.filter((j) => deployJobIds.value.includes(j.jobId)),
+  (mine) => {
+    const done = mine.filter((j) => isTerminalStatus(j.status))
+    if (done.length === 0) return
+    const finishedIds = new Set(done.map((j) => j.jobId))
+    deployJobIds.value = deployJobIds.value.filter((id) => !finishedIds.has(id))
+    for (const job of done) {
+      if (job.status === 'succeeded') emit('deployed', { jobId: job.jobId, versionTag: null })
+    }
+  }
+)
+
+/** 任务启动成功后登记（只在确实带发布步骤时——其他步骤不影响目标页数据）。 */
+function trackDeployJob(job: JobView, hasDeployStep: boolean): void {
+  if (hasDeployStep) deployJobIds.value = [...deployJobIds.value, job.jobId]
+}
+
 async function runAll(p: PipelineView): Promise<void> {
   const preview = await previewOf(p.pipelineId)
   if (!preview) return
@@ -368,10 +411,11 @@ async function runAll(p: PipelineView): Promise<void> {
   if (!r.go) return
 
   try {
-    await api.pipelines.run({
+    const job = await api.pipelines.run({
       pipelineId: p.pipelineId,
       ...(r.typed === undefined ? {} : { typedName: r.typed })
     })
+    trackDeployJob(job, p.steps.some((s) => s.kind === 'deploy'))
     ElMessage.success('已加入任务队列，可在底部任务控制台看实时输出')
     await load(true)
   } catch (e) {
@@ -395,11 +439,12 @@ async function runOne(p: PipelineView, step: PipelineStepView): Promise<void> {
   if (!r.go) return
 
   try {
-    await api.pipelines.runStep({
+    const job = await api.pipelines.runStep({
       pipelineId: p.pipelineId,
       seq: step.seq,
       ...(r.typed === undefined ? {} : { typedName: r.typed })
     })
+    trackDeployJob(job, step.kind === 'deploy')
     ElMessage.success('已加入任务队列')
     await load(true)
   } catch (e) {
@@ -474,7 +519,7 @@ watch(
   >
     <p class="gate-text">
       这个功能默认关闭 —— 开启后可以在本机或服务器上执行你填写的任意命令，
-      并把这些步骤存成自动化流水线。
+      并把这些步骤存成自动化脚本。
     </p>
     <p class="gate-text">需要的到「设置 → 脚本执行」里打开<strong>开启自定义脚本</strong>。</p>
     <el-button size="small" :icon="CaretRight" @click="goSettings">去设置里打开</el-button>
@@ -483,8 +528,7 @@ watch(
   <section v-else-if="caps" class="pipeline-panel" data-test="pipeline-panel">
     <div class="head">
       <span class="hint inline">
-        把一串操作存成一条流水线：本机构筑 → 服务器上关服务 → 发布 → 启服务。
-        可以一键跑完整条，也可以只跑其中一步。
+        把一串操作存成一条流水线。
       </span>
       <span class="spacer" />
       <el-button

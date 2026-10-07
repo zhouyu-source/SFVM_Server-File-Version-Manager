@@ -176,6 +176,46 @@ describe('buildRollbackMarks（B19 回滚标记的判据）', () => {
     // 版本号对不上 → 这一行与那次被取代没有关系
     expect(marks.get('a1')?.supersededByRollbackAt).toBeNull()
   })
+
+  it('回滚之后又发布成功：回滚标记整体退场（发布不会给上一条台账打 ROLLED_BACK，必须在这里判）', () => {
+    const marks = buildRollbackMarks({
+      archives: [archiveRow('a1', V1), archiveRow('a2', V2, 'rb1')],
+      releases: [
+        // 时间倒序：最新的成功操作是发布
+        releaseRow({ id: 'd3', action: 'deploy', versionTag: V0, status: 'SUCCESS' }),
+        releaseRow({
+          id: 'rb1',
+          action: 'rollback',
+          versionTag: V1,
+          status: 'SUCCESS',
+          archiveId: 'a1',
+          finishedAt: T_RB1
+        })
+      ]
+    })
+    // a1 曾是"回滚来源"（tooltip 说它就是当前的线上版本 —— 发布之后这是谎话），
+    // a2 曾是"回滚归档" —— 回滚这一章翻篇了，标记一起退场
+    expect(marks.get('a1')).toEqual({ rollback: null, supersededByRollbackAt: null })
+    expect(marks.get('a2')).toEqual({ rollback: null, supersededByRollbackAt: null })
+  })
+
+  it('之后只有失败的发布：回滚标记照常显示（失败的发布不改变"线上是什么"）', () => {
+    const marks = buildRollbackMarks({
+      archives: [archiveRow('a1', V1)],
+      releases: [
+        releaseRow({ id: 'd3', action: 'deploy', versionTag: V0, status: 'FAILED' }),
+        releaseRow({
+          id: 'rb1',
+          action: 'rollback',
+          versionTag: V1,
+          status: 'SUCCESS',
+          archiveId: 'a1',
+          finishedAt: T_RB1
+        })
+      ]
+    })
+    expect(marks.get('a1')?.rollback).toEqual({ role: 'source', toVersionTag: V1, at: T_RB1 })
+  })
 })
 
 /* ------------------------------------------- 集成：list() 把标记带进 IPC */

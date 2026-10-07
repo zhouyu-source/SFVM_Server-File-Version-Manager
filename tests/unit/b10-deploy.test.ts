@@ -12,6 +12,7 @@ import { rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createDeployService } from '@main/services/deploy'
 import { createArchiveService } from '@main/services/archive'
+import { createRollbackService } from '@main/services/rollback'
 import { hashLocalArtifact } from '@main/services/hash'
 import { ErrorCode } from '@main/infra/errors'
 import { lockPathOf, stagingPayloadOf, stagingRootOf, swapSourceOf } from '@main/infra/deploy-plan'
@@ -233,6 +234,122 @@ describe('DeployService（B10 发布主流程）', () => {
     // 而且归档出来的版本号与第一次发布时的版本号一致（preferredTag 生效）
     const tags = t.repo.archives.listByTarget(id).map((a) => a.versionTag)
     expect(tags).toContain(first.versionTag)
+  })
+
+  /* ================================================ 回滚之后紧跟的发布 */
+
+  /**
+   * 造出"回滚到旧版"的真实局面：
+   *
+   * 现网 v1 → 按发布阶段 4 同样的方式归档进版本库（manifest 是真的，校验校验得了）
+   * → 现网被换成 v2 并补一条成功台账 → **真跑一次回滚**（写清单、归档前置版本、
+   * 标 ROLLED_BACK，一样不缺）。之后现网是 v1，版本库里躺着 v1（来源）与 v2
+   * （回滚前置归档）—— 正是用户报"往期版本出现两份一样"的那条路径的起点。
+   */
+  async function setupRolledBack(keepSource: boolean): Promise<{
+    targetId: string
+    sourceArchiveId: string
+  }> {
+    const id = seedDirTarget({ 'index.html': 'v3' })
+    fake.putFile('/opt/app/dist/index.html', 'v1')
+    const a1 = await archive.archiveVersion({
+      targetId: id,
+      ports: fake.archivePorts(),
+      releaseId: 'rel-seed',
+      moveMode: 'rename'
+    })
+    fake.putFile('/opt/app/dist/index.html', 'v2')
+    t.repo.releases.create({
+      id: 'rel-v2',
+      targetId: id,
+      action: 'deploy',
+      versionTag: '20250612-143100_aaaaaaa',
+      status: 'SUCCESS',
+      source: 'local',
+      rootHash: 'r2',
+      totalBytes: 2,
+      fileCount: 1
+    })
+    t.repo.releases.finish('rel-v2', 'SUCCESS')
+
+    const rollback = createRollbackService({ repo: t.repo, archive, now: () => clock })
+    const rb = await rollback.run({
+      targetId: id,
+      archiveId: a1.archive.id,
+      ports: fake.rollbackPorts(),
+      ctx: makeCtx().ctx,
+      rollbackId: 'rb-1',
+      keepSource
+    })
+    expect(rb.ok).toBe(true)
+    // 现网回到了 v1 —— 用户接下来要发新版时的起点
+    expect(fake.text('/opt/app/dist/index.html')).toBe('v1')
+    return { targetId: id, sourceArchiveId: a1.archive.id }
+  }
+
+  it('回滚到旧版之后再发布：内容与版本库里那份一致，不再重复归档', async () => {
+    const { targetId: tid, sourceArchiveId } = await setupRolledBack(true)
+    const before = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+    expect(before).toHaveLength(2)
+
+    const { ctx, text } = makeCtx()
+    const out = await service.run({ targetId: tid, ports: fake.ports(), ctx })
+    expect(out.ok).toBe(true)
+    expect(fake.text('/opt/app/dist/index.html')).toBe('v3')
+
+    // 关键断言：没有多出第三份归档 —— 与来源归档内容一致的那份被摘掉了
+    const after = t.repo.archives.listByTarget(tid)
+    expect(after.map((a) => a.id).sort()).toEqual(before)
+    // 留下来的是来源那份，v1 内容仍在版本库里
+    const kept = t.repo.archives.get(sourceArchiveId)!
+    expect(fake.text(`${kept.payloadPath}/dist/index.html`)).toBe('v1')
+    expect(text()).toContain('已去掉重复归档')
+    // 给 UI 的"本次归档版本"是**保留下来的**那份，不是刚被摘掉的那个号
+    expect(out.archivedVersionTag).toBe(kept.versionTag)
+
+    // 回滚标记随这次发布整体退场（B19 标记的生命周期）
+    for (const row of archive.list(tid)) {
+      expect(row.rollback).toBeNull()
+      expect(row.supersededByRollbackAt).toBeNull()
+    }
+  })
+
+  it('回滚时选了不保留来源：现网那份在版本库里没有副本，发布时照常归档', async () => {
+    const { targetId: tid, sourceArchiveId } = await setupRolledBack(false)
+    // 来源归档已被回滚摘除（目录 + 台账行）
+    expect(t.repo.archives.get(sourceArchiveId)).toBeUndefined()
+    const before = t.repo.archives.listByTarget(tid).length
+
+    const { ctx, text } = makeCtx()
+    const out = await service.run({ targetId: tid, ports: fake.ports(), ctx })
+    expect(out.ok).toBe(true)
+
+    // 这份归档是现网 v1 的**唯一**副本，必须保留 —— 不去重
+    const after = t.repo.archives.listByTarget(tid)
+    expect(after.length).toBe(before + 1)
+    expect(text()).toContain('唯一副本')
+    expect(fake.text(`${after[0]!.payloadPath}/dist/index.html`)).toBe('v1')
+  })
+
+  it('回滚之后手工改过现网（同字节数的改动）：指纹对不上，不去重、把改动完整归档保留', async () => {
+    const { targetId: tid } = await setupRolledBack(true)
+    // 'v1' → 'v9'：字节数没变，"路径 + 大小"核对发现不了 —— 这正是"回滚恢复后
+    // 这次归档要现算指纹"的原因。指纹对不上就不许当作重复删掉。
+    fake.putFile('/opt/app/dist/index.html', 'v9')
+    const before = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+
+    const { ctx, text } = makeCtx()
+    const out = await service.run({ targetId: tid, ports: fake.ports(), ctx })
+    expect(out.ok).toBe(true)
+
+    const after = t.repo.archives.listByTarget(tid)
+    expect(after.length).toBe(3)
+    expect(text()).toContain('不一致')
+    expect(text()).toContain('照常保留这次归档')
+    const newArchived = after.find((a) => !before.includes(a.id))!
+    // 手改的内容完整进了版本库，而不是被当作重复删掉
+    expect(fake.text(`${newArchived.payloadPath}/dist/index.html`)).toBe('v9')
+    expect(out.archivedVersionTag).toBe(newArchived.versionTag)
   })
 
   /* ==================================================== 阶段 0：前置校验 */

@@ -241,8 +241,9 @@ function icon(level: HealthCheck['level']): string {
     />
 
     <!-- 自动化流水线（B21）—— 多步骤编排，发布可作为其中一环 -->
-    <el-divider content-position="left">自动化流水线</el-divider>
-    <PipelinePanel :target="target" />
+    <el-divider content-position="left">自动化脚本</el-divider>
+    <!-- 流水线里的发布步骤跑在主进程，成功后由面板发 deployed 让本页刷新 -->
+    <PipelinePanel :target="target" @deployed="onDeployed" />
 
     <!--
       运行记录（B20 的 `script_runs`）紧跟在流水线下面，不单开一个区块：

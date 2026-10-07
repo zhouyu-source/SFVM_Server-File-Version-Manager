@@ -935,13 +935,26 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
    *
    * 也正因此两个返回值必须一起给出：只有清单被现网核对通过，
    * 才能确定"要归档的就是 X 那份内容"，才敢给它贴 X 的号。
+   *
+   * ## 顺带把"上一版是什么类型的操作"带回去
+   *
+   * 回滚恢复出来的内容在版本库里本来就有一份 —— 发布成功后要用这个事实去重
+   * （见 run() 末尾的 `discardDuplicateArchive`）。`action` 与 `archiveId` 只有
+   * 在清单核对通过时才有意义，所以必须与清单/版本号同进同出。
    */
   async function prevRelease(
     ports: DeployPorts,
     targetId: string,
     currentReleaseId: string,
     state: StageState
-  ): Promise<{ versionTag: string; items: ReleaseItem[] } | null> {
+  ): Promise<{
+    versionTag: string
+    items: ReleaseItem[]
+    /** 上一版那次操作的类型：只有回滚恢复出来的内容才可能与版本库里的某一份重复 */
+    action: string
+    /** 上一版是回滚时，它指向的来源归档（去重要用；其余情况为 null） */
+    archiveId: string | null
+  } | null> {
     const prev = repo.releases
       .listByTarget(targetId, 20)
       .find((r) => r.id !== currentReleaseId && r.status === 'SUCCESS')
@@ -977,7 +990,14 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     const actualSet = new Set(actual.map(key))
     if (actualSet.size !== expected.length) return null
     for (const e of expected) if (!actualSet.has(key(e))) return null
-    return { versionTag: prev.versionTag, items: expected }
+    // action / archiveId 必须与清单一起返回：只有清单核对通过，
+    // "现网就是上次回滚恢复的那份内容"才站得住，发布成功后的去重才敢动手
+    return {
+      versionTag: prev.versionTag,
+      items: expected,
+      action: prev.action,
+      archiveId: prev.archiveId ?? null
+    }
   }
 
   /* ------------------------------------------------------ 发布主流程 */
@@ -1393,12 +1413,34 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
        * 正好回到"发布前目标不存在"的状态。
        */
       const targetExists = (await ports.fs.stat(state.remotePath)).exists
+
+      /**
+       * 上一版是一次**回滚恢复**吗？是的话，归档的清单与版本号要换一种给法：
+       *
+       * - 常规路径：上一版清单核对通过就一起传 —— 免一次全量远端哈希（慢链路上
+       *   这一步要以分钟计），版本号也沿用上一版的；
+       * - 回滚恢复：**清单不传**（宁可贵一次全量哈希）。那份清单描述的是"版本库
+       *   里那一份"，而"现网是否仍是它"必须重新证明 —— 回滚到发布之间有人动过
+       *   服务器的话，只有完整哈希能发现；而且这次归档的指纹马上要拿去与来源
+       *   归档比对去重（见成功之后的 `discardDuplicateArchive`），指纹必须是真的。
+       *   版本号照旧沿用：内容一致时号就该一致，去重之后留下来的也正是它。
+       *
+       * 前提是来源归档**还在**（回滚时选了"不保留来源"它就没了）—— 不在的话
+       * 根本不会去重，也就不值得为此多花一次哈希。
+       */
+      const rollbackRestored = Boolean(
+        prev?.action === 'rollback' && prev.archiveId && repo.archives.get(prev.archiveId)
+      )
       const archived = targetExists
         ? await archive.archiveVersion({
             targetId: target.id,
             ports: { fs: ports.archiveFs, hash: ports.hash } satisfies ArchivePorts,
             // 清单与版本号同源：核对通过才同时传，"要归档的就是上一版那份内容"才成立
-            ...(prev ? { items: prev.items, preferredTag: prev.versionTag } : {}),
+            ...(prev
+              ? rollbackRestored
+                ? { preferredTag: prev.versionTag }
+                : { items: prev.items, preferredTag: prev.versionTag }
+              : {}),
             releaseId: release.id,
             operator: input.operator ?? null,
             note: input.note ?? null,
@@ -1413,7 +1455,11 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         state.archiveId = archived.archive.id
         ctx.log(
           `已归档当前版本为 ${archived.archive.versionTag}` +
-            (archived.hashedRemotely ? '（指纹由远端现场计算）' : '') +
+            (rollbackRestored
+              ? '（上一版由回滚恢复，指纹已重新现场计算）'
+              : archived.hashedRemotely
+                ? '（指纹由远端现场计算）'
+                : '') +
             '，归档后目标路径为空'
         )
       } else {
@@ -1442,6 +1488,35 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       progressAt(6, 1, '发布完成')
       ctx.log(`发布成功：${remotePath} 已更新为 ${resolvedTag.versionTag}`)
 
+      /**
+       * 回滚之后紧跟的发布：刚归档出来的这份，多半就是上次回滚**恢复**出来的
+       * 内容 —— 它在版本库里本来就有一份（回滚默认保留来源）。不去重的话，
+       * 「往期版本」里会出现两份一模一样的版本。
+       *
+       * 刻意放在**成功之后**而不是在阶段 4 跳过归档：阶段 4 的"目标上有内容就
+       * 必须归档、归档失败禁止继续"是整条补偿链的前提。发布已经成功，这时才摘
+       * 掉重复的那份，任何失败都只是"多留了一份重复"，绝不会丢内容 ——
+       * 所以 `discardDuplicateArchive` 的失败在这里只记警告，不上抛。
+       *
+       * 前提是 `prev` 的清单核对通过了（否则 `prev` 为 null，根本走不到这里）：
+       * 现网内容与台账对不上时不去重，照常归档 —— 那种情况下的这份归档是
+       * "台账不知道的改动"，必须完整保留。
+       */
+      let dedupeKeptTag: string | null = null
+      if (archived && prev?.action === 'rollback' && prev.archiveId) {
+        // 为什么没去重的各种情形由 archive 自己按严重程度说明（info/warn）
+        const deduped = await archive.discardDuplicateArchive({
+          archiveId: archived.archive.id,
+          keepArchiveId: prev.archiveId,
+          fs: ports.archiveFs,
+          log: (text, level) => ctx.log(text, level)
+        })
+        if (deduped.discarded) {
+          // 台账里"本次归档的版本"已经不在了；对用户有意义的是**保留下来**的那份
+          dedupeKeptTag = deduped.keptVersionTag
+        }
+      }
+
       // 保留策略：发布成功后异步执行（方案书 §6.7），不阻塞成功信号
       trackBackground(
         (async () => {
@@ -1465,8 +1540,11 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         targetId: target.id,
         versionTag: resolvedTag.versionTag,
         status: 'SUCCESS',
-        // 首次发布没有归档这一步，这里就不该有版本号（不要让 UI 显示一个不存在的往期版本）
-        ...(archived ? { archivedVersionTag: archived.archive.versionTag } : {}),
+        // 首次发布没有归档这一步，这里就不该有版本号（不要让 UI 显示一个不存在的往期版本）；
+        // 去重之后那份归档已被摘除，报的是**保留下来**的那份
+        ...(archived
+          ? { archivedVersionTag: dedupeKeptTag ?? archived.archive.versionTag }
+          : {}),
         strategy,
         ...(state.swapFallbackReason
           ? {

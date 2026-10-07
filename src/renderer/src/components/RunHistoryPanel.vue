@@ -18,16 +18,20 @@
  * 总闸关着时流水线区块整块不渲染，但**这张表照旧显示** —— 关掉总闸不等于要
  * 抹掉之前跑过的记录。
  *
- * ## 为什么用轮询而不是等任务事件
+ * ## 为什么用轮询（辅以任务状态）
  *
  * 任务事件只知道 `jobId`，而这里要的是运行记录（`runId` 那张表）。轮询还顺带
  * 覆盖了"别处发起的执行"（流水线一键跑整条、只跑某一步），不必为每种发起方式
- * 各接一次事件。
+ * 各接一次事件。但**光有轮询不够**：轮询条件是"列表里有 running 行"，而新发起的
+ * 执行那一行还没进来 —— 所以轮询条件要或上"任务 store 里本目标的活动任务数"
+ * （见下方 `activeJobCount`），并在其变化时各拉一次。
  */
 import { computed, onMounted, onScopeDispose, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Document, FolderOpened, Refresh } from '@element-plus/icons-vue'
 import { api, IpcBusinessError } from '../api'
+import { isTerminalStatus } from '../../../shared/contracts/job'
+import { useJobStore } from '../stores/job'
 import { formatDateTime, formatDuration } from '../utils/format'
 import {
   DEFAULT_SCRIPT_RUN_LIST_LIMIT,
@@ -80,9 +84,38 @@ function stopPoll(): void {
   }
 }
 
-watch(anyRunning, (running) => {
-  stopPoll()
-  if (running) pollTimer = setInterval(() => void loadRuns(true), 1500)
+const jobStore = useJobStore()
+
+/**
+ * 本目标正在跑（含排队）的任务数。
+ *
+ * 运行记录行是**任务执行时才写库**的 —— 从"点了执行"到"running 行被拉进列表"
+ * 之间有个窗口，这段时间 `anyRunning` 恒为 false，光靠它轮询永远转不起来，
+ * 新记录就"不自动出现"（只在任务 store 里能看到活动任务）。所以轮询条件要
+ * **或上本目标的活动任务数**；活动任务数变化时再各拉一次（开始时尽快显示新行、
+ * 结束时尽快拿到终态与退出码）。
+ */
+const activeJobCount = computed(
+  () =>
+    jobStore.jobs.filter((j) => j.targetId === props.target.id && !isTerminalStatus(j.status))
+      .length
+)
+
+const needPoll = computed(() => anyRunning.value || activeJobCount.value > 0)
+
+watch(
+  needPoll,
+  (polling) => {
+    stopPoll()
+    if (polling) pollTimer = setInterval(() => void loadRuns(true), 1500)
+  },
+  // 挂载/换目标时列表可能一进来就有 running 行（或活动任务），立即建轮询
+  { immediate: true }
+)
+
+watch(activeJobCount, (count, prev) => {
+  if (count > prev) void loadRuns(true)
+  else if (count === 0 && prev > 0) void loadRuns(true)
 })
 
 onScopeDispose(stopPoll)

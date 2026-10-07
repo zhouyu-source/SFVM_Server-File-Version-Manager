@@ -453,6 +453,19 @@ export interface RollbackMarkResult {
  *    并没有换成它 —— 让它顶着"当前线上版本"的标记是谎话。
  * 2. **`archived` 不筛状态**：归档行只要还在台账里，就说明那次回滚确实归档过它
  *    （失败且补偿成功的归档行会被摘掉，自然不会出现在输入里）。
+ *
+ * ## 发布成功之后，回滚标记整体退场（2026-10 用户要求）
+ *
+ * 三个标记回答的都是"这一版与**最近那次回滚**的关系"。一旦之后又发布过新版本，
+ * "线上版本"就与任何一次回滚无关了 —— 尤其是 source 那条，tooltip 写的是
+ * "这一版就是当前的线上版本"，新版本上去之后这就是谎话（旧版回滚之间互相取代
+ * 时没有这个问题：取代它的仍是一次回滚，来源标记会因 status 变成 `ROLLED_BACK`
+ * 自然消失；**发布不会给上一条台账打 `ROLLED_BACK`**，所以必须在这里显式判）。
+ *
+ * 判据：**最近一次成功的操作是发布** → 全部标记置空。两个边界：
+ * - 只看 `status === 'SUCCESS'` 的行 —— 失败的发布/回滚不改变"线上是什么"；
+ * - 台账里**还没有任何**成功操作时不抑制（比如只有一次失败的回滚：它留下的
+ *   归档行仍要如实标成 `archived`，见 B19 的用例）。
  */
 export function buildRollbackMarks(input: {
   archives: readonly RollbackMarkArchiveRow[]
@@ -478,7 +491,14 @@ export function buildRollbackMarks(input: {
   }
 
   const out = new Map<string, RollbackMarkResult>()
+  // `releases` 必须按时间倒序（`listByTarget` 的顺序）—— 与下面 supersededAt 的
+  // "先到先得"是同一个前提
+  const closedByDeploy = input.releases.find((r) => r.status === 'SUCCESS')?.action === 'deploy'
   for (const a of input.archives) {
+    if (closedByDeploy) {
+      out.set(a.id, { rollback: null, supersededByRollbackAt: null })
+      continue
+    }
     // 来源优先于"回滚归档"：同一行不可能两者都是，但来源那条更贴近"它在哪"这个问题
     const fromSource = asSource.get(a.id)
     const fromArchived = a.releaseId ? asArchived.get(a.releaseId) : undefined
@@ -1260,7 +1280,93 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
     log(`已把归档版本 ${row.versionTag} 复位到目标路径`, 'warn')
   }
 
-  return { list, count, summary, archiveVersion, verifyArchive, applyRetention, removeVersions, readDetail, undoArchive }
+  /* -------------------------------------------- 去重：丢掉与另一份相同的归档 */
+
+  /**
+   * 丢掉一份**与另一份内容完全相同**的归档（远端目录 + 台账行一起摘除）。
+   *
+   * ## 它为谁存在
+   *
+   * 回滚到旧版之后再发布新版：阶段 4 会把"现网那一份"（就是上次回滚恢复出来的
+   * 内容）再归档一次 —— 而它在版本库里本来就有一份（回滚默认保留来源）。
+   * 不去重的话，「往期版本」里会出现两份一模一样的版本，用户分不清哪份是哪份。
+   *
+   * ## 为什么在发布成功之后做、而不是在阶段 4 跳过归档
+   *
+   * 阶段 4 的"目标上有内容就必须归档、归档失败禁止继续"是整条补偿链的前提
+   * （归档失败时目标可能已经空了，只有 `undoArchive` 能把内容还回去）。
+   * 发布已经成功，这时才摘掉重复的那份 —— 任何失败都只是"多留了一份重复"，
+   * 绝不会丢内容。所以这里的失败**只上报、不抛出**。
+   *
+   * ## 判据刻意收窄（宁可不去重，也不能误删）
+   *
+   * 两份的 `rootHash` 必须完全一致 —— 这是"内容相同"唯一可用的判据。
+   * 注意它比较的是**两份各自独立落库的清单**：`keepArchiveId` 那份的清单来自它
+   * 归档时的 manifest，`archiveId` 这份来自发布时传入的上一版清单 —— 两者不是
+   * 同一次计算，只有内容真的相同时才会相等。清单对不上（比如回滚后有人动过
+   * 现网、逐文件清单根本没落库）时宁可留一份重复，也不删。
+   */
+  async function discardDuplicateArchive(input: {
+    /** 要摘除的那份（本次发布刚归档出来的） */
+    archiveId: string
+    /** 要保留的那份（上次回滚的来源归档） */
+    keepArchiveId: string
+    fs: ArchivePorts['fs']
+    log?: ArchiveLogFn
+  }): Promise<{ discarded: boolean; keptVersionTag: string | null; reason?: string }> {
+    const log: ArchiveLogFn = input.log ?? ((): void => undefined)
+    const drop = repo.archives.get(input.archiveId)
+    const keep = repo.archives.get(input.keepArchiveId)
+    if (!drop) {
+      const reason = '要摘除的归档记录不存在'
+      log(`未去除重复归档：${reason}`, 'warn')
+      return { discarded: false, keptVersionTag: null, reason }
+    }
+    if (!keep) {
+      // 预期路径：回滚时选了"不保留来源"，现网这份就是唯一副本 —— 说清楚即可，不必告警
+      const reason = '上次回滚的来源归档已不在版本库，这份归档就是唯一副本，照常保留'
+      log(`未去除重复归档：${reason}`, 'info')
+      return { discarded: false, keptVersionTag: null, reason }
+    }
+    if (drop.id === keep.id) {
+      return { discarded: false, keptVersionTag: null, reason: '两份是同一条记录' }
+    }
+    if (drop.rootHash !== keep.rootHash) {
+      // 这条值得说清楚：现网内容与版本库里那份**不一样**，所以这次归档必须留 ——
+      // （最常见的原因是回滚之后有人动过服务器）
+      const reason =
+        `现网内容与版本库中的 ${keep.versionTag} 不一致` +
+        `（${drop.rootHash.slice(0, 8)} / ${keep.rootHash.slice(0, 8)}），照常保留这次归档`
+      log(`未去除重复归档：${reason}`, 'info')
+      return { discarded: false, keptVersionTag: null, reason }
+    }
+
+    try {
+      await input.fs.rmrf(drop.storagePath)
+    } catch (err) {
+      // 目录没删掉就**不摘台账行**：那会让台账指向一个仍然存在的目录，对账反而说不清。
+      // 留着它顶多是列表里多一份重复，内容不会丢 —— 所以不上抛（调用方在成功路径上）。
+      const reason = `删除归档目录 ${drop.storagePath} 失败：${(err as Error).message}`
+      log(`未去除重复归档：${reason}`, 'warn')
+      return { discarded: false, keptVersionTag: null, reason }
+    }
+    repo.archives.remove(drop.id)
+    repo.audit.write({
+      level: 'info',
+      scope: 'archive',
+      refId: drop.id,
+      message: `去除重复归档 ${drop.versionTag}（与 ${keep.versionTag} 内容一致）`,
+      detail: JSON.stringify({
+        targetId: drop.targetId,
+        keptArchiveId: keep.id,
+        rootHash: drop.rootHash
+      })
+    })
+    log(`已去掉重复归档 ${drop.versionTag}（与 ${keep.versionTag} 内容一致），保留原版本`)
+    return { discarded: true, keptVersionTag: keep.versionTag }
+  }
+
+  return { list, count, summary, archiveVersion, verifyArchive, applyRetention, removeVersions, readDetail, undoArchive, discardDuplicateArchive }
 }
 
 export type ArchiveService = ReturnType<typeof createArchiveService>

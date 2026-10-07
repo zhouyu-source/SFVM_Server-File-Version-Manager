@@ -155,6 +155,10 @@ export const KNOWN_MANIFEST_KEYS = [
  * **为什么不落库**：这三条判据全部由 `releases` 里已有的行就能推出（`action` /
  * `status` / `archiveId` / `versionTag`）。多存一份就等于多一处会与事实不一致的
  * 副本 —— 而回滚的补偿路径（阶段 3 失败要把来源搬回去）本来就是"改台账"的重灾区。
+ *
+ * **生命周期**：三个标记只在"最近一次**成功**的操作是回滚"时出现；之后发布过
+ * 新版本，它们就整体消失 —— 那时"线上版本"已经与任何一次回滚无关（尤其 source
+ * 那条的语义是"这一版就是当前的线上版本"，继续显示就是谎话）。
  */
 export interface ArchiveRollbackMark {
   role: 'source' | 'archived'

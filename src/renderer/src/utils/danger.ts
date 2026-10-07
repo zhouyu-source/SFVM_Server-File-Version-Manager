@@ -16,6 +16,7 @@
  * 所以这里把格式固定下来：正文 = 后果 + 固定的"对服务器的影响"一行。
  */
 import { ElMessageBox } from 'element-plus'
+import type { MessageBoxData } from 'element-plus'
 
 /**
  * 三档，按"后果的可预测性"递增：
@@ -79,6 +80,39 @@ export function dangerBody(input: DangerConfirmInput): string {
 }
 
 /**
+ * 打开确认框。要求输入名称时必须走 **prompt**，不能用 confirm ——
+ *
+ * Element Plus 的 `MessageBox` 只有 `boxType === 'prompt'` 才会渲染输入框、
+ * 才会在点确认按钮时执行 `inputValidator`、resolve 的才是 `{ value, action }`；
+ * `confirm` 预设只设 `showCancelButton`，传进去的 `inputPlaceholder` /
+ * `inputValidator` 是**死选项**（输入框不出现、校验不执行），resolve 值恒为
+ * 字符串 `'confirm'` —— 曾经拿它当用户输入送回，被服务端 `assertProdConfirmed`
+ * 一眼识破（`'confirm' !== 目标名`），用户看到的就是"要输文字确认的框从没弹出来"。
+ */
+function openBox(
+  input: DangerConfirmInput & { requireTypedName: string }
+): Promise<MessageBoxData>
+function openBox(input: DangerConfirmInput): Promise<unknown>
+function openBox(input: DangerConfirmInput): Promise<unknown> {
+  const options = {
+    type: 'warning' as const,
+    confirmButtonText: input.confirmText ?? '确认执行',
+    cancelButtonText: input.cancelText ?? '取消',
+    ...(input.requireTypedName
+      ? {
+          inputPlaceholder: `请输入 ${input.requireTypedName} 以确认`,
+          // 与服务端 `assertProdConfirmed`（`typedName === target.name`）同口径：
+          // 精确比较、不 trim —— 客户端放宽只会把"差一个空格"的输入送到服务端挨拒
+          inputValidator: (v: string) => (v === input.requireTypedName ? true : '名称不一致')
+        }
+      : {})
+  }
+  return input.requireTypedName
+    ? ElMessageBox.prompt(dangerBody(input), input.title, options)
+    : ElMessageBox.confirm(dangerBody(input), input.title, options)
+}
+
+/**
  * 弹一个标准危险确认框。返回是否确认（取消一律返回 false，不抛错）。
  *
  * 不抛错的理由：所有调用点都是"取消就什么都不做"，让它们各写一段 try/catch
@@ -86,20 +120,7 @@ export function dangerBody(input: DangerConfirmInput): string {
  */
 export async function confirmDanger(input: DangerConfirmInput): Promise<boolean> {
   try {
-    await ElMessageBox.confirm(dangerBody(input), input.title, {
-      type: 'warning',
-      confirmButtonText: input.confirmText ?? '确认执行',
-      cancelButtonText: input.cancelText ?? '取消',
-      // 生产环境按名称确认 —— 与 `DangerConfirm` 组件同一套分级策略，
-      // 只是这里用的是 MessageBox 的输入框版本
-      ...(input.requireTypedName
-        ? {
-            inputPlaceholder: `请输入 ${input.requireTypedName} 以确认`,
-            inputValidator: (v: string) =>
-              v === input.requireTypedName ? true : '名称不一致'
-          }
-        : {})
-    })
+    await openBox(input)
     return true
   } catch {
     return false
@@ -120,15 +141,8 @@ export async function confirmDangerWithName(
   input: DangerConfirmInput & { requireTypedName: string }
 ): Promise<{ ok: true; typed: string } | { ok: false; typed: null }> {
   try {
-    // 带 `inputValidator` 时 `ElMessageBox.confirm` 的 resolve 值就是输入框内容
-    const typed = await ElMessageBox.confirm(dangerBody(input), input.title, {
-      type: 'warning',
-      confirmButtonText: input.confirmText ?? '确认执行',
-      cancelButtonText: input.cancelText ?? '取消',
-      inputPlaceholder: `请输入 ${input.requireTypedName} 以确认`,
-      inputValidator: (v: string) => (v === input.requireTypedName ? true : '名称不一致')
-    })
-    return { ok: true, typed: String(typed ?? '') }
+    const data = await openBox(input)
+    return { ok: true, typed: data.value }
   } catch {
     return { ok: false, typed: null }
   }

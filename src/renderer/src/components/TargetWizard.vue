@@ -254,10 +254,10 @@ function checkIcon(level: HealthCheck['level']): string {
           <el-form-item label="类型">
             <el-radio-group v-model="form.kind" data-test="target-kind">
               <el-radio-button value="dir" data-test="target-kind-dir"
-                >目录（前端 dist）</el-radio-button
+                >目录</el-radio-button
               >
               <el-radio-button value="file" data-test="target-kind-file"
-                >文件（jar 包）</el-radio-button
+                >单文件</el-radio-button
               >
             </el-radio-group>
           </el-form-item>
