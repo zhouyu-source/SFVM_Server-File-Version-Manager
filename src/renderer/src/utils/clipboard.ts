@@ -14,17 +14,19 @@ export async function writeClipboard(text: string): Promise<boolean> {
   } catch {
     /* 落到下面的兜底 */
   }
+  const ta = document.createElement('textarea')
   try {
-    const ta = document.createElement('textarea')
     ta.value = text
     ta.style.position = 'fixed'
     ta.style.opacity = '0'
     document.body.appendChild(ta)
     ta.select()
-    const ok = document.execCommand('copy')
-    document.body.removeChild(ta)
-    return ok
+    return document.execCommand('copy')
   } catch {
     return false
+  } finally {
+    // 一定要摘掉临时节点：原来 removeChild 只在成功路径上执行，
+    // 一旦 execCommand 抛错，这个 textarea 就会永远留在 DOM 里
+    ta.remove()
   }
 }

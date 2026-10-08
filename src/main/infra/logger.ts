@@ -14,7 +14,8 @@
  * 顺带好处是 logger 可注入（单测可传记录型替身）。
  */
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { readdirSync, statSync, unlinkSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { is } from '@electron-toolkit/utils'
 import { redact, scrubText } from './log-redact'
 import { MAIN_LOG_FILENAME } from './data-location'
@@ -147,19 +148,17 @@ export function initLogger(opts: InitLoggerOptions = {}): void {
 function pruneOldLogs(): void {
   try {
     const file = getImpl().transports.file.getFile()
-    const dir = file.path.replace(/[\\/][^\\/]+$/, '')
-    void import('node:fs').then((fs) => {
-      try {
-        const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000
-        for (const name of fs.readdirSync(dir)) {
-          if (!name.endsWith('.log')) continue
-          const full = `${dir}/${name}`
-          if (fs.statSync(full).mtimeMs < cutoff) fs.unlinkSync(full)
-        }
-      } catch {
-        /* 清理失败不影响主流程 */
+    const dir = dirname(file.path)
+    try {
+      const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.log')) continue
+        const full = join(dir, name)
+        if (statSync(full).mtimeMs < cutoff) unlinkSync(full)
       }
-    })
+    } catch {
+      /* 清理失败不影响主流程 */
+    }
   } catch {
     /* 日志目录尚不可用时忽略 */
   }

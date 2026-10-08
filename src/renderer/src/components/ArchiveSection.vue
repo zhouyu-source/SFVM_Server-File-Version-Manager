@@ -224,19 +224,28 @@ async function confirmRetention(): Promise<void> {
 /** 供父组件在发布成功后调用（T11.6：发布完会多出一条往期版本） */
 defineExpose({ reload: load })
 
+/**
+ * 目标切换与"发布成功"合并成一个 watcher。
+ *
+ * 拆成两个会在**切目标**时连续 load 两次：`target.id` 变了触发一次 load，
+ * 新的 `lastDeployAt` 与旧目标的不同又触发一次。一个 watcher 里判"到底哪个变了"，
+ * 保证每次变化只 load 一次。
+ */
 watch(
-  () => props.target.id,
-  () => {
-    selectedIds.value = []
-    void load()
+  () => [props.target.id, props.target.lastDeployAt] as const,
+  ([id, at], prev) => {
+    const prevId = prev?.[0]
+    const prevAt = prev?.[1]
+    if (id !== prevId) {
+      // 换目标：清掉选中并整块重来
+      selectedIds.value = []
+      void load()
+      return
+    }
+    // 同一目标下 `lastDeployAt` 变了 —— 发布成功，保留策略是异步跑的，可能刚清理过
+    if (at !== prevAt) void load()
   },
   { immediate: true }
-)
-
-// 发布成功后 `lastDeployAt` 变了 —— 保留策略是异步跑的，可能刚清理过
-watch(
-  () => props.target.lastDeployAt,
-  () => void load()
 )
 </script>
 

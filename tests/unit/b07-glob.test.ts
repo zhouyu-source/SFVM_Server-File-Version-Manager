@@ -120,4 +120,19 @@ describe('compileExclude（T07.2）', () => {
     expect(m.patterns).toEqual(['!!!'])
     expect(m.matches('anything.txt')).toBe(false)
   })
+
+  /**
+   * P1-2 回归：字符类内容会原样拼进正则，`[z-a]`（范围倒序）会让 `new RegExp`
+   * 抛 SyntaxError —— 一个坏模式曾让整个发布流程以英文正则内部错误失败。
+   * 坏规则的正确语义是"跳过并说出来"，不是炸。
+   */
+  it('语法坏的规则进 skipped 并被跳过，其余规则照常生效', () => {
+    const m = compileExclude(['*.log', '[z-a]', '', '# comment'])
+    // 只有"语法坏"的进 skipped；空行与注释是正常用法
+    expect(m.skipped).toEqual(['[z-a]'])
+    expect(m.patterns).toEqual(['*.log'])
+    // 好规则不受牵连
+    expect(m.matches('a/b.log')).toBe(true)
+    expect(m.matches('x.txt')).toBe(false)
+  })
 })

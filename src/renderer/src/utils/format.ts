@@ -74,7 +74,9 @@ export function formatDuration(startIso?: string | null, endIso?: string | null)
   if (ms < 1000) return `${ms} 毫秒`
   const totalSeconds = ms / 1000
   if (totalSeconds < 60) return `${totalSeconds.toFixed(1)} 秒`
-  const minutes = Math.floor(totalSeconds / 60)
-  const seconds = Math.round(totalSeconds % 60)
+  // 先取整秒再拆分：直接对余数 round 会让 119.6s 算出"1 分 60 秒"
+  const total = Math.round(totalSeconds)
+  const minutes = Math.floor(total / 60)
+  const seconds = total % 60
   return `${minutes} 分 ${String(seconds).padStart(2, '0')} 秒`
 }

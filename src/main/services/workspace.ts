@@ -379,8 +379,10 @@ export function createWorkspaceService(deps: WorkspaceServiceDeps) {
     remove(id: string): { removedReleases: number; removedArchives: number } {
       const row = repo.targets.get(id)
       if (!row) throw new AppError(ErrorCode.E_NOT_FOUND, { id })
-      const releases = repo.releases.listByTarget(id, 100000).length
-      const archives = repo.archives.listByTarget(id).length
+      // 用仓储计数，别用 listByTarget().length —— 后者有 limit（归档默认 1000），
+      // 超过就会被截断，删除确认里报的"将删除 N 条"因此偏小
+      const releases = repo.releases.countByTarget(id)
+      const archives = repo.archives.countByTarget(id)
       repo.targets.remove(id)
       logger.info(
         `target removed: ${row.name} (local records only; releases=${releases} archives=${archives})`

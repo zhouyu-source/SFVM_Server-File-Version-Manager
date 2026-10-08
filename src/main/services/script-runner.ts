@@ -15,6 +15,7 @@
  * 内部命令依然不可能被注入，这里放开的是用户明确要求的能力。
  */
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
 import {
@@ -173,8 +174,13 @@ export function runLocalScript(input: RunLocalScriptInput): Promise<ScriptExecOu
     })
 
     child.on('error', (err: NodeJS.ErrnoException) => {
-      // ENOENT 有两种可能：解释器没了，或工作目录不存在。分辨一下给准确的提示
-      if (err.code === 'ENOENT' && input.cwd) {
+      /**
+       * ENOENT 有两种可能：解释器没了，或工作目录不存在 —— 提示完全不同。
+       *
+       * **必须实测一下 cwd**，不能"配了 cwd 就赖 cwd"：解释器路径写错时
+       * cwd 往往是好端端的，旧写法会把用户支去查一个根本没问题的目录。
+       */
+      if (err.code === 'ENOENT' && input.cwd && !existsSync(input.cwd)) {
         settle(
           new AppError(ErrorCode.E_LOCAL_PATH_MISSING, { cwd: input.cwd }, {
             message: `工作目录不存在或不可用：${input.cwd}`

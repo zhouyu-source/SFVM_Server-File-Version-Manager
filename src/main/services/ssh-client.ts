@@ -85,6 +85,8 @@ interface Pooled {
   /** 用户主动断开，不触发重连 */
   userInitiated: boolean
   retryAttempt: number
+  /** 最近一次连接成功时间（ISO）—— 供 UI 打开时初始化状态快照（原来恒为 undefined）。 */
+  lastConnectedAt?: string
   reconnectTimer?: NodeJS.Timeout
 }
 
@@ -131,11 +133,15 @@ export class SshConnectionPool {
   getState(connectionId: string): ConnectionState {
     const p = this.pool.get(connectionId)
     if (!p) return { connectionId, status: 'idle' }
-    const status: ConnectionStatus = p.busy ? 'online' : 'online'
+    /**
+     * 状态维度里**没有** busy 这一档：`p.busy` 只是"这条连接上正跑着发布/回滚"，
+     * 底层连接依旧是可用的 online（这也正是原来 `p.busy ? 'online' : 'online'`
+     * 那个恒等三元想表达的意思 —— 只是写成了一个让人怀疑写错的谜语）。
+     */
     return {
       connectionId,
-      status,
-      lastConnectedAt: undefined,
+      status: 'online',
+      lastConnectedAt: p.lastConnectedAt,
       retryAttempt: p.retryAttempt,
       hostKeyFingerprint: p.hostKeyFingerprint
     }
@@ -269,7 +275,8 @@ export class SshConnectionPool {
       hostKeyType: capturedKeyType,
       busy: false,
       userInitiated: false,
-      retryAttempt: 0
+      retryAttempt: 0,
+      lastConnectedAt: new Date().toISOString()
     }
     this.pool.set(id, pooled)
 
@@ -282,7 +289,7 @@ export class SshConnectionPool {
       logger.warn(`ssh error on ${opts.host}: ${err.message}`)
     })
 
-    const now = new Date().toISOString()
+    const now = pooled.lastConnectedAt ?? new Date().toISOString()
     this.setState(id, 'online', { lastConnectedAt: now, hostKeyFingerprint: capturedFingerprint })
     logger.info(
       `ssh connected: ${opts.username}@${opts.host}:${opts.port} ` +
@@ -358,12 +365,12 @@ export class SshConnectionPool {
           await this.connect({ ...p.options, connectionId: id })
         } catch (err) {
           const next = p.retryAttempt + 1
-          const again = this.pool.get(id)
-          if (again) again.retryAttempt = next
-          // 递归继续退避：把累计次数带回去
+          // 把累计次数带回去，再交给 handleDisconnect 判断"继续退避还是放弃"。
+          // P1-5：这里**不能**先 pool.delete —— handleDisconnect 首行 `if (!p) return`，
+          // 先删等于让重连链在第一次失败后就断掉，状态永远停在 reconnecting。
+          // 删除动作由 handleDisconnect 自己做（它读完 p 就会删）。
           const carry: Pooled = { ...p, retryAttempt: next }
           this.pool.set(id, carry)
-          this.pool.delete(id)
           this.handleDisconnect(id)
           logger.warn(`reconnect attempt ${next} failed: ${(err as Error).message}`)
         }
@@ -409,31 +416,87 @@ export class SshConnectionPool {
     assertCommandAllowed(command)
 
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new AppError(ErrorCode.E_CONN_TIMEOUT, { command })),
-        timeoutMs
-      )
-      p.client.exec(command, (err, stream) => {
+      let settled = false
+      let timedOut = false
+      let stdout = ''
+      let stderr = ''
+      let code: number | null = null
+      let stream: ClientChannel | null = null
+      let timer: NodeJS.Timeout | null = null
+      let forceTimer: NodeJS.Timeout | null = null
+
+      function cleanup(): void {
+        if (timer) clearTimeout(timer)
+        if (forceTimer) clearTimeout(forceTimer)
+      }
+      function settle(fn: () => void): void {
+        if (settled) return
+        settled = true
+        cleanup()
+        fn()
+      }
+      /**
+       * 与 `execRaw` 同款：先 TERM 再关通道 —— 只 `close()` 的话通道断了、
+       * 远端进程可能还在跑。
+       */
+      function killRemote(): void {
+        if (!stream) return
+        try {
+          stream.signal('TERM')
+        } catch (err) {
+          logger.debug(`exec: signal TERM failed: ${(err as Error).message}`)
+        }
+        try {
+          stream.close()
+        } catch (err) {
+          logger.debug(`exec: close failed: ${(err as Error).message}`)
+        }
+      }
+
+      timer = setTimeout(() => {
+        // P1-6：超时**不能只 reject** —— 通道与监听器都得收掉，否则远端命令
+        // 继续跑、stdout 闭包继续增长，连续超时会累积（出带宽差的机器上做
+        // 大目录哈希正是最常超时的场景）。先 TERM 再关通道，给 close 一点时间
+        // 交回已收到的输出（超时那一刻的输出正是排障线索）；远端不理会 TERM
+        // 则 3 秒兜底强制结束。
+        timedOut = true
+        killRemote()
+        forceTimer = setTimeout(() => {
+          killRemote()
+          settle(() => reject(new AppError(ErrorCode.E_CONN_TIMEOUT, { command })))
+        }, 3000)
+      }, timeoutMs)
+
+      p.client.exec(command, (err, ch) => {
         if (err) {
-          clearTimeout(timer)
-          reject(new AppError(ErrorCode.E_CONN_LOST, { original: err.message }))
+          settle(() => reject(new AppError(ErrorCode.E_CONN_LOST, { original: err.message })))
           return
         }
-        let stdout = ''
-        let stderr = ''
-        let code: number | null = null
-        stream.on('data', (d: Buffer) => {
+        if (settled) {
+          // 兜底：超时兜底已把 Promise 结了，但通道刚建出来 —— 关掉它
+          try {
+            ch.close()
+          } catch {
+            /* 已经断了就算了 */
+          }
+          return
+        }
+        stream = ch
+        ch.on('data', (d: Buffer) => {
           stdout += d.toString('utf8')
         })
-        stream.stderr.on('data', (d: Buffer) => {
+        ch.stderr.on('data', (d: Buffer) => {
           stderr += d.toString('utf8')
         })
-        stream.on('exit', (c: number | null) => {
+        ch.on('exit', (c: number | null) => {
           code = c
         })
-        stream.on('close', () => {
-          clearTimeout(timer)
-          resolve({ stdout, stderr, code })
+        ch.on('close', () => {
+          if (timedOut) {
+            settle(() => reject(new AppError(ErrorCode.E_CONN_TIMEOUT, { command })))
+            return
+          }
+          settle(() => resolve({ stdout, stderr, code }))
         })
       })
     })

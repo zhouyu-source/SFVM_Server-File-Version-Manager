@@ -5,7 +5,7 @@
  * 必须同父目录，才能保证换版用 `rename` 时**同文件系统**（否则 EXDEV），
  * 这是整个原子换版方案的前提。
  */
-import { normalizeRemotePath } from './remote-path'
+import { normalizeRemotePath, requireSafeRemotePath } from './remote-path'
 
 export interface ArchiveDirInput {
   remotePath: string
@@ -33,7 +33,9 @@ function posixBasename(p: string): string {
 /**
  * 推导归档目录。
  *
- * - 自定义 `archiveDir` 优先（已规范化为绝对路径）
+ * - 自定义 `archiveDir` 优先：**必须先过 `requireSafeRemotePath`**（P1-3）——
+ *   之前只做 `normalizeRemotePath`（折叠斜杠），相对路径、`..`、换行都能原样
+ *   通过，注释里"已规范化为绝对路径"是一句空话；归档会写到工作区外的任意位置。
  * - 否则 `<父目录>/<basename>.versions`
  *
  * 例：
@@ -44,7 +46,7 @@ export function resolveArchiveDir(input: ArchiveDirInput): string {
   const remotePath = normalizeRemotePath(input.remotePath)
 
   if (input.archiveDir && input.archiveDir.trim()) {
-    return normalizeRemotePath(input.archiveDir.trim())
+    return normalizeRemotePath(requireSafeRemotePath(input.archiveDir.trim()))
   }
 
   const parent = posixDirname(remotePath)

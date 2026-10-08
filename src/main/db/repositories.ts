@@ -154,8 +154,25 @@ export function createRepositories(db: Db) {
   /* ---------------------------------------------------------- environments */
 
   const environmentsRepo = {
+    /**
+     * 环境列表顺序 = 用户自定义顺序（`sortOrder`）→ 创建时间 → id。
+     *
+     * **刻意不用 `name` 当排序键**（原先写的是 `sortOrder, name`）：`sortOrder` 目前
+     * 没有 UI 去改，所有环境都是默认值 0，于是它实际退化成了"纯按名字排" ——
+     * 用户在界面上改个名字，环境就会**跳位置**（名字排序靠后就被甩到列表最后，
+     * 看起来像是"改名把它挪走了"）。环境树是直接 `v-for` 这个顺序渲染的，
+     * 顺序一变位置就变。
+     *
+     * 换成 `createdAt` 后位置与名字无关（新建的仍追加在最后），且同一毫秒创建时
+     * 用 `id` 兜底保证顺序在全生命周期内稳定。将来若真要按名字排，
+     * 应该做成排序开关，而不是把它固定在基础顺序里。
+     */
     list: () =>
-      db.select().from(environments).orderBy(environments.sortOrder, environments.name).all(),
+      db
+        .select()
+        .from(environments)
+        .orderBy(environments.sortOrder, environments.createdAt, environments.id)
+        .all(),
 
     get: (id: string) => db.select().from(environments).where(eq(environments.id, id)).get(),
 
@@ -243,6 +260,16 @@ export function createRepositories(db: Db) {
         .orderBy(desc(releases.startedAt))
         .limit(limit)
         .all(),
+
+    /** 该目标的台账条数（删除目标时统计用，避免为了一个数字查出全部行） */
+    countByTarget: (targetId: string) => {
+      const r = db
+        .select({ c: sql<number>`count(*)` })
+        .from(releases)
+        .where(eq(releases.targetId, targetId))
+        .get()
+      return r?.c ?? 0
+    },
 
     listRecent: (limit = 100) =>
       db.select().from(releases).orderBy(desc(releases.startedAt)).limit(limit).all(),
@@ -685,6 +712,51 @@ export function createRepositories(db: Db) {
     }
   }
 
+  /**
+   * 保存一条流水线及其步骤（**落在同一个事务里**）。
+   *
+   * 以前服务层分两段调用：`pipelines.update`（自动提交）之后再
+   * `pipelineSteps.replaceAll`（自带事务）。两段之间若失败，会留下
+   * "新名字 + 旧步骤"的半成品。SQLite 本地库实际很难撞上，但收口没有代价。
+   */
+  function savePipelineWithSteps(input: {
+    id?: string
+    targetId: string
+    name: string
+    description: string | null
+    steps: Array<Omit<NewPipelineStep, 'id' | 'pipelineId'>>
+  }): string {
+    let pipelineId = ''
+    db.transaction((tx) => {
+      if (input.id) {
+        tx.update(pipelines)
+          .set({ name: input.name, description: input.description, updatedAt: ts() })
+          .where(eq(pipelines.id, input.id))
+          .run()
+        pipelineId = input.id
+      } else {
+        const stamp = ts()
+        pipelineId = newId()
+        tx.insert(pipelines)
+          .values({
+            id: pipelineId,
+            targetId: input.targetId,
+            name: input.name,
+            description: input.description,
+            createdAt: stamp,
+            updatedAt: stamp
+          })
+          .run()
+      }
+      // 步骤整组替换（理由见 pipelineStepsRepo.replaceAll 的注释）
+      tx.delete(pipelineSteps).where(eq(pipelineSteps.pipelineId, pipelineId)).run()
+      for (const s of input.steps) {
+        tx.insert(pipelineSteps).values({ ...s, id: newId(), pipelineId }).run()
+      }
+    })
+    return pipelineId
+  }
+
   return {
     connections: connectionsRepo,
     knownHosts: knownHostsRepo,
@@ -698,7 +770,8 @@ export function createRepositories(db: Db) {
     scriptRuns: scriptRunsRepo,
     scriptStepRuns: scriptStepRunsRepo,
     pipelines: pipelinesRepo,
-    pipelineSteps: pipelineStepsRepo
+    pipelineSteps: pipelineStepsRepo,
+    savePipelineWithSteps
   }
 }
 

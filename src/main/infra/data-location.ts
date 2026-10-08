@@ -76,9 +76,18 @@ export function pointerFilePath(defaultDir: string): string {
  *
  * 结尾分隔符必须去掉：`D:\SFVM\` 与 `D:\SFVM` 是同一个目录，留着它会让
  * "配置目录是否等于默认目录"这类比较全部失效（界面就会一直提示"需要重启"）。
+ *
+ * 但盘根是例外（P1-4）：`D:\` 剥掉 `\` 后变成 `D:` —— 那是**驱动器相对路径**，
+ * 语义从"盘根"变成"D 盘当前目录"（`path.resolve('D:', 'log')` 会落到该盘当前
+ * 工作目录下，而不是 `D:\log`）；POSIX 根 `/` 会剥成空串。数据目录放独立盘根
+ * 是真实需求，两种根都必须原样保留。（`statSync('D:')` 会成功——它解析为
+ * D 盘当前目录——所以下游的存在性检查拦不住这个错。）
  */
 export function normalizeDir(input: string): string {
-  return input.trim().replace(/[\\/]+$/, '')
+  const dir = input.trim().replace(/[\\/]+$/, '')
+  if (/^[a-zA-Z]:$/.test(dir)) return `${dir}\\`
+  if (dir === '' && input.trim() !== '') return '/'
+  return dir
 }
 
 /** 两个路径是否指同一个目录。Windows 上大小写不敏感，不能直接 `===`。 */

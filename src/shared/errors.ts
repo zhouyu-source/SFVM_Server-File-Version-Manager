@@ -55,6 +55,14 @@ export const ErrorCode = {
   E_VERIFY_MISMATCH: 'E_VERIFY_MISMATCH',
   E_NO_REMOTE_HASH_TOOL: 'E_NO_REMOTE_HASH_TOOL',
   E_VERIFY_DISABLED_IN_PROD: 'E_VERIFY_DISABLED_IN_PROD',
+  /**
+   * 远端文件系统权限不足（SFTP `code 3` = permission denied）。
+   *
+   * 单独一个码、不复用 `E_CONN_LOST`：连接是好的，只是这个账号读不了那个路径。
+   * 以前一律报"SSH 连接已断开" → 用户去查网络与重连，越查越远；
+   * 而且它会被传输层当瞬时故障**反复重试**（每次都在同一个权限点上再失败一遍）。
+   */
+  E_REMOTE_PERM: 'E_REMOTE_PERM',
 
   // ---- 归档与版本（§11 12、16 行）----
   E_ARCHIVE_CONFLICT: 'E_ARCHIVE_CONFLICT',
@@ -225,6 +233,10 @@ export const ERROR_TEXT: Record<ErrorCodeValue, ErrorDescriptor> = {
   E_VERIFY_DISABLED_IN_PROD: {
     message: '生产环境不允许关闭远端校验',
     hint: '请保持"发布后校验"开启，以免上传损坏的文件未被发现。'
+  },
+  E_REMOTE_PERM: {
+    message: '服务器上该路径权限不足',
+    hint: 'SSH 连接本身是好的，是登录账号读不了（或写不了）这个路径。请让运维给该账号授权，或改用有权限的账号。'
   },
 
   E_ARCHIVE_CONFLICT: {

@@ -32,6 +32,7 @@ import { logger } from '../infra/logger'
 import { normalizeRemotePath } from '../infra/remote-path'
 import { parentDirOf } from '../infra/archive-dir'
 import { joinRemote } from '../infra/hash-core'
+import { toUtcIso } from '../infra/version-tag'
 import {
   MANIFEST_FILE_NAME,
   PAYLOAD_DIR_NAME,
@@ -265,6 +266,7 @@ export function createReconcileService(deps: {
       archiveDirExists,
       counts: {
         adopted: 0,
+        foundMissing: 0,
         markedMissing: 0,
         corrupt: 0,
         ok: 0,
@@ -318,7 +320,7 @@ export function createReconcileService(deps: {
           archivedAt: row?.archivedAt ?? null,
           fileCount: row?.fileCount ?? null,
           totalBytes: row?.totalBytes ?? null,
-          note: `${manifestProblem ?? '缺少 manifest.json'}（未补录，需要人工处理）`
+          note: `${manifestProblem ?? '缺少 manifest.json'}（未补录，需要人工处理；若确认是归档失败留下的无清单副本，可直接删除该版本目录）`
         })
         continue
       }
@@ -371,6 +373,9 @@ export function createReconcileService(deps: {
          * 唯一可靠记录 —— 用"现在"会让 MT-06（删库后重建）的时间对不上，
          * 而且往期版本列表的排序会整体乱掉。
          */
+        // P1-1：manifest 时间是本地偏移格式，落库前归一成 UTC（见 toUtcIso 注释）。
+        const manifestTimeParsed = toUtcIso(manifest.archivedAt)
+        const adoptedAt = manifestTimeParsed ?? new Date().toISOString()
         const created = repo.archives.create({
           targetId: target.id,
           versionTag: tag,
@@ -383,13 +388,16 @@ export function createReconcileService(deps: {
           releaseId: manifest.sourceReleaseId ?? null,
           note: manifest.note ?? null,
           status: payloadExists ? 'valid' : 'missing',
-          archivedAt: manifest.archivedAt
+          // P1-1：manifest 里的时间（本地偏移格式）必须归一成 UTC 再落库 ——
+          // archived_at 列上的排序/统计是字符串比较，两种格式混存会错序。
+          // manifest 时间解析失败（不该发生）→ 用重建时刻兜底，报告里注明。
+          archivedAt: adoptedAt
         })
         report.counts.adopted += 1
         report.adopted.push({
           versionTag: tag,
           archiveId: created.id,
-          archivedAt: manifest.archivedAt,
+          archivedAt: created.archivedAt,
           fileCount: manifest.fileCount,
           totalBytes: manifest.totalBytes,
           how: 'adopted'
@@ -403,9 +411,11 @@ export function createReconcileService(deps: {
           archivedAt: manifest.archivedAt,
           fileCount: manifest.fileCount,
           totalBytes: manifest.totalBytes,
-          note: payloadExists ? '已按 manifest 补录' : '已补录，但归档内容目录不存在（标为 missing）'
+          note:
+            (payloadExists ? '已按 manifest 补录' : '已补录，但归档内容目录不存在（标为 missing）') +
+            (manifestTimeParsed ? '' : '；manifest 时间无法解析，台账已用重建时刻')
         })
-        log(`补录版本 ${tag}（${manifest.fileCount} 个文件，${manifest.archivedAt}）`)
+        log(`补录版本 ${tag}（${manifest.fileCount} 个文件，${created.archivedAt}）`)
         continue
       }
 
@@ -417,7 +427,11 @@ export function createReconcileService(deps: {
         (row.kind === 'file' ? 'file' : 'dir') !== (manifest.kind === 'file' ? 'file' : 'dir')
 
       if (!payloadExists) {
-        if (doMarkMissing && row.status !== 'missing') repo.archives.setStatus(row.id, 'missing')
+        report.counts.foundMissing += 1
+        if (doMarkMissing && row.status !== 'missing') {
+          repo.archives.setStatus(row.id, 'missing')
+          report.counts.markedMissing += 1
+        }
         report.missing.push({ versionTag: tag, archiveId: row.id })
         report.items.push({
           versionTag: tag,
@@ -484,8 +498,11 @@ export function createReconcileService(deps: {
     const remoteSet = new Set(remoteTags)
     for (const row of ledger) {
       if (remoteSet.has(row.versionTag)) continue
-      if (doMarkMissing && row.status !== 'missing') repo.archives.setStatus(row.id, 'missing')
-      report.counts.markedMissing += 1
+      report.counts.foundMissing += 1
+      if (doMarkMissing && row.status !== 'missing') {
+        repo.archives.setStatus(row.id, 'missing')
+        report.counts.markedMissing += 1
+      }
       report.missing.push({ versionTag: row.versionTag, archiveId: row.id })
       report.items.push({
         versionTag: row.versionTag,
@@ -499,8 +516,13 @@ export function createReconcileService(deps: {
         note: '台账里有，但远端归档目录里已经没有这个版本'
       })
     }
-    if (report.counts.markedMissing > 0) {
-      log(`${report.counts.markedMissing} 个版本在远端已不存在，台账已标记为「目录缺失」`, 'warn')
+    if (report.counts.foundMissing > 0) {
+      log(
+        doMarkMissing
+          ? `${report.counts.markedMissing} 个版本在远端已不存在，台账已标记为「目录缺失」`
+          : `${report.counts.foundMissing} 个版本在远端已不存在（本次为只读预演，台账未改动）`,
+        'warn'
+      )
     }
 
     /* ---- 5) 深度校验（可选，慢） ---- */
@@ -554,7 +576,7 @@ export function createReconcileService(deps: {
 
     report.durationMs = Date.now() - started
     log(
-      `对账完成：补录 ${report.counts.adopted}、缺失 ${report.counts.markedMissing}、` +
+      `对账完成：补录 ${report.counts.adopted}、缺失 ${report.counts.foundMissing}、` +
         `损坏 ${report.counts.corrupt}、正常 ${report.counts.ok}（${report.durationMs}ms）`
     )
     repo.audit.write({

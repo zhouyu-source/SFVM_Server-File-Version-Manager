@@ -333,8 +333,13 @@ async function withRetry<T>(
     try {
       return await fn(attempt)
     } catch (err) {
-      // 取消是用户意图，绝不重试
-      if (err instanceof AppError && err.code === ErrorCode.E_JOB_CANCELLED) throw err
+      // 取消是用户意图，绝不重试；权限错误重试多少次都是同一个结果，重试只会拖慢报错
+      if (
+        err instanceof AppError &&
+        (err.code === ErrorCode.E_JOB_CANCELLED || err.code === ErrorCode.E_REMOTE_PERM)
+      ) {
+        throw err
+      }
       attempt++
       if (attempt >= attempts) throw err
       onRetry?.()
@@ -684,8 +689,15 @@ export function createSftpTransferPort(sftp: TransferSftpLike): TransferPort {
       sftp.stat(absPath, (err, stats) => {
         if (err) {
           const e = err as { code?: number; message?: string }
-          if (e.code === 2 || /no such file/i.test(e.message ?? '')) resolve(null)
-          else reject(new AppError(ErrorCode.E_CONN_LOST, { path: absPath, original: e.message }))
+          const msg = e.message ?? ''
+          if (e.code === 2 || /no such file/i.test(msg)) {
+            resolve(null)
+          } else if (e.code === 3 || /permission denied/i.test(msg)) {
+            // 连接是好的，只是这个账号读不了该路径 —— 归因到权限，别报成"连接已断开"
+            reject(new AppError(ErrorCode.E_REMOTE_PERM, { path: absPath, original: msg }))
+          } else {
+            reject(new AppError(ErrorCode.E_CONN_LOST, { path: absPath, original: msg }))
+          }
           return
         }
         resolve(stats.size ?? 0)

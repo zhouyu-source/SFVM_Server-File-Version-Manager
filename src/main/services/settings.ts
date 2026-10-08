@@ -19,6 +19,7 @@
  */
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
+import { requireSafeRemotePath } from '../infra/remote-path'
 import {
   CONFIG_BUNDLE_SCHEMA_VERSION,
   SETTING_KEYS,
@@ -259,7 +260,24 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
         )
         continue
       }
-      if (repo.targets.findByPath(environmentId, t.remotePath)) {
+      /**
+       * 路径校验（P2-10）：正常保存走 `workspace.create` 的 `safePath()`，
+       * 而**导入是直接写库、绕过了那道校验**。一份被手工改过（或来自别的版本）的
+       * 配置文件里可能带着 `..` / 换行 / 非绝对路径 —— 它们随后会被拼进远端命令，
+       * 属于路径逃逸。所以这里逐个过一遍，坏路径**跳过该目标**并计入 warnings。
+       */
+      let remotePath: string
+      let archiveDir: string | null
+      try {
+        remotePath = requireSafeRemotePath(t.remotePath)
+        archiveDir = t.archiveDir ? requireSafeRemotePath(t.archiveDir) : null
+      } catch (err) {
+        result.targets.skipped++
+        warnings.push(`目标「${t.name}」的远端路径不合法，已跳过：${(err as Error).message}`)
+        continue
+      }
+
+      if (repo.targets.findByPath(environmentId, remotePath)) {
         result.targets.skipped++
         warnings.push(`目标「${t.name}」（${t.remotePath}）已存在，跳过。`)
         continue
@@ -268,8 +286,8 @@ export function createSettingsService(deps: SettingsServiceDeps): SettingsServic
         environmentId,
         name: t.name,
         kind: t.kind,
-        remotePath: t.remotePath,
-        archiveDir: t.archiveDir,
+        remotePath,
+        archiveDir,
         localPath: t.localPath,
         localExclude: JSON.stringify(t.localExclude),
         verifyRemote: t.verifyRemote,

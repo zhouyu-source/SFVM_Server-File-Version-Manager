@@ -7,7 +7,7 @@
  * 不假设测试机在哪个时区，任何机器上结果都一样。
  */
 import { describe, expect, it } from 'vitest'
-import { formatDateTime, formatTime } from '@renderer/utils/format'
+import { formatDateTime, formatDuration, formatTime } from '@renderer/utils/format'
 
 describe('时间格式化（utils/format）', () => {
   it('formatDateTime：空值 → "-"，解析失败 → 原样返回', () => {
@@ -34,5 +34,17 @@ describe('时间格式化（utils/format）', () => {
   it('formatTime：仍是 HH:mm:ss（任务日志用，不带日期）', () => {
     const local = new Date(2026, 9, 2, 8, 5, 9)
     expect(formatTime(local.toISOString())).toBe('08:05:09')
+  })
+
+  it('formatDuration：先取整秒再拆分钟，不会出现"1 分 60 秒"（P2-20）', () => {
+    const start = new Date(2026, 9, 2, 8, 0, 0).toISOString()
+    // 119.6 秒：旧实现 round(59.6)=60 → 打出 "1 分 60 秒"
+    expect(formatDuration(start, new Date(2026, 9, 2, 8, 1, 59, 600).toISOString())).toBe(
+      '2 分 00 秒'
+    )
+    // 62.4 秒 → 1 分 02 秒
+    expect(formatDuration(start, new Date(2026, 9, 2, 8, 1, 2, 400).toISOString())).toBe(
+      '1 分 02 秒'
+    )
   })
 })

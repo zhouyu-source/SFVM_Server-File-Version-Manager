@@ -10,7 +10,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import {
   cleanupAbandonedDataDir,
   clearDataLocation,
@@ -49,6 +49,20 @@ describe('data-location 纯函数', () => {
   it('normalizeDir 去掉首尾空白与结尾分隔符', () => {
     expect(normalizeDir('  D:\\a\\b\\  ')).toBe('D:\\a\\b')
     expect(normalizeDir('/opt/app/')).toBe('/opt/app')
+  })
+
+  /**
+   * P1-4 回归：盘根是剥尾分隔符的例外。`D:\` 剥成 `D:` 是**驱动器相对路径**
+   * （`path.resolve('D:', 'log')` 落到 D 盘当前目录而非 `D:\log`）；
+   * `/` 会剥成空串。数据目录放独立盘根是真实需求。
+   */
+  it('normalizeDir 保留盘根语义（不退化成驱动器相对路径）', () => {
+    expect(normalizeDir('D:\\')).toBe('D:\\')
+    expect(normalizeDir('e:/')).toBe('e:\\')
+    expect(normalizeDir('/')).toBe('/')
+    if (process.platform === 'win32') {
+      expect(resolve(normalizeDir('D:\\'), 'log')).toBe('D:\\log')
+    }
   })
 
   it('sameDir 把 `D:\\a\\b\\` 与 `D:\\a\\b` 认作同一处', () => {

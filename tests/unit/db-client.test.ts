@@ -17,6 +17,7 @@ import {
   pruneBackups
 } from '@main/db/client'
 import { ALL_TABLES } from '@main/db/schema'
+import { schemaVersionOf } from '@main/db'
 import { makeTestDb } from '../helpers/db'
 
 describe('openDatabase：PRAGMA 与迁移', () => {
@@ -231,5 +232,23 @@ describe('备份（T02.8）', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('schemaVersionOf：从迁移目录推导（P2-17）', () => {
+  it('取文件名里最大的序号', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sfvm-schema-'))
+    try {
+      writeFileSync(join(dir, '0000_a.sql'), '')
+      writeFileSync(join(dir, '0003_b.sql'), '')
+      writeFileSync(join(dir, 'notes.txt'), '') // 非迁移文件不参与
+      expect(schemaVersionOf(dir)).toBe('0003')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('目录读不出来时退回兜底常量（不抛错）', () => {
+    expect(schemaVersionOf(join(tmpdir(), 'sfvm-schema-does-not-exist'))).toBe('0000')
   })
 })

@@ -24,6 +24,12 @@
 export interface ExcludeMatcher {
   /** 规范化后的规则原文（去掉 `!` 与空规则后的展示形式） */
   readonly patterns: string[]
+  /**
+   * 因正则编译失败而被忽略的规则原文（P1-2）。
+   * 调用方**必须**把这件事说出来（日志/UI 提示）—— 用户写的规则没生效还不知道，
+   * 排除结果就会与预期悄悄偏离，这类"部分生效"最难排查。
+   */
+  readonly skipped: readonly string[]
   /** 该相对路径是否应被排除 */
   matches(relPath: string): boolean
   /** 命中它的那条规则（便于 UI/日志说明"被 *.map 排除"）；未命中返回 null */
@@ -108,10 +114,16 @@ function globToRegExpSource(glob: string): string {
 
 const GLOB_META = /[*?[]/
 
-function compileOne(rawInput: string): CompiledPattern | null {
+/** 单条规则的编译结果：`skip` 的原因决定要不要向用户说明（P1-2）。 */
+type CompileOutcome =
+  | { ok: true; pattern: CompiledPattern }
+  | { ok: false; reason: 'empty' | 'comment' | 'too-long' | 'invalid-syntax' }
+
+function compileOne(rawInput: string): CompileOutcome {
   let raw = rawInput.trim()
-  if (!raw || raw.startsWith('#')) return null
-  if (raw.length > MAX_EXCLUDE_PATTERN_LENGTH) return null
+  if (!raw) return { ok: false, reason: 'empty' }
+  if (raw.startsWith('#')) return { ok: false, reason: 'comment' }
+  if (raw.length > MAX_EXCLUDE_PATTERN_LENGTH) return { ok: false, reason: 'too-long' }
 
   const original = raw
   const negate = raw.startsWith('!')
@@ -123,21 +135,31 @@ function compileOne(rawInput: string): CompiledPattern | null {
   raw = raw.replace(/^(\.\/)+/, '')
   // 目录标记：末尾斜杠本身不改变语义（见文件头第 5 条）
   raw = raw.replace(/\/+$/, '')
-  if (!raw) return null
+  if (!raw) return { ok: false, reason: 'empty' }
 
   const anchored = raw.includes('/')
   if (raw.startsWith('/')) raw = raw.replace(/^\/+/, '')
-  if (!raw) return null
+  if (!raw) return { ok: false, reason: 'empty' }
 
   // 后缀规则：裸的、以 . 开头、不含通配符
   if (!anchored && raw.startsWith('.') && !GLOB_META.test(raw)) {
-    return { raw: original, negate, anchored, suffix: raw, regex: /$^/ }
+    return { ok: true, pattern: { raw: original, negate, anchored, suffix: raw, regex: /$^/ } }
   }
 
   const src = globToRegExpSource(raw)
   // 编译期锚定整串：候选串由下方按"层前缀"枚举后传入
-  const regex = new RegExp(`^${src}$`)
-  return { raw: original, negate, anchored, suffix: null, regex }
+  //
+  // P1-2：字符类内容会原样拼进正则，`[z-a]`（范围倒序）、`[\]`（未闭合）等
+  // 会让 `new RegExp` 抛 SyntaxError。这个异常发生在**匹配器编译阶段**，
+  // 单条规则的容错拦不住它 —— 一个坏模式曾让整个发布流程以英文正则内部错误失败。
+  // 坏一条规则的正确语义是"跳过并说出来"（与空行/注释/超长一致），不是炸。
+  let regex: RegExp
+  try {
+    regex = new RegExp(`^${src}$`)
+  } catch {
+    return { ok: false, reason: 'invalid-syntax' }
+  }
+  return { ok: true, pattern: { raw: original, negate, anchored, suffix: null, regex } }
 }
 
 function segmentsOf(relPath: string): string[] {
@@ -176,14 +198,21 @@ function matchOne(p: CompiledPattern, relPath: string): boolean {
   return false
 }
 
-/** 编译一组排除规则。空/非法规则被静默跳过（不影响发布，只是不排除）。 */
+/** 编译一组排除规则。空/注释/超长规则静默跳过；**语法坏**的规则进 `skipped`（P1-2）。 */
 export function compileExclude(patterns: readonly string[] | null | undefined): ExcludeMatcher {
   const list = Array.isArray(patterns) ? patterns.slice(0, MAX_EXCLUDE_PATTERNS) : []
   const compiled: CompiledPattern[] = []
+  const skipped: string[] = []
   for (const p of list) {
     if (typeof p !== 'string') continue
     const c = compileOne(p)
-    if (c) compiled.push(c)
+    if (c.ok) {
+      compiled.push(c.pattern)
+    } else if (c.reason === 'invalid-syntax') {
+      // 只把"语法坏"的收集出来 —— 空行与注释是正常用法，超长已有上限语义，
+      // 把它们也报出来只会制造噪音
+      skipped.push(p)
+    }
   }
 
   /**
@@ -201,6 +230,7 @@ export function compileExclude(patterns: readonly string[] | null | undefined): 
 
   return {
     patterns: compiled.map((c) => c.raw),
+    skipped,
     matchedBy(relPath: string): string | null {
       return lastHit(relPath)?.raw ?? null
     },

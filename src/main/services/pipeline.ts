@@ -203,7 +203,6 @@ export function createPipelineService(deps: PipelineServiceDeps): PipelineServic
       })
     }
 
-    let pipelineId: string
     if (input.pipelineId) {
       const existing = repo.pipelines.get(input.pipelineId)
       if (!existing) throw new AppError(ErrorCode.E_NOT_FOUND, { pipelineId: input.pipelineId })
@@ -215,24 +214,16 @@ export function createPipelineService(deps: PipelineServiceDeps): PipelineServic
           pipelineId: input.pipelineId
         })
       }
-      repo.pipelines.update(input.pipelineId, {
-        name: input.name,
-        description: input.description ?? null
-      })
-      pipelineId = input.pipelineId
-    } else {
-      const created = repo.pipelines.create({
-        targetId: input.targetId,
-        name: input.name,
-        description: input.description ?? null
-      })
-      pipelineId = created.id
     }
 
-    // 步骤**整组替换**（理由见 repositories 里的说明：上移/下移在逐条 diff 下会撞唯一约束）
-    repo.pipelineSteps.replaceAll(
-      pipelineId,
-      input.steps.map((s, i) => ({
+    // 名称/描述与步骤**在同一个事务里落库**（P2-15）：分两段写会出现"新名字 + 旧步骤"
+    // 的半成品。步骤整组替换（理由见 repositories：上移/下移在逐条 diff 下会撞唯一约束）。
+    const pipelineId = repo.savePipelineWithSteps({
+      ...(input.pipelineId ? { id: input.pipelineId } : {}),
+      targetId: input.targetId,
+      name: input.name,
+      description: input.description ?? null,
+      steps: input.steps.map((s, i) => ({
         seq: i + 1,
         name: s.name,
         kind: s.kind,
@@ -245,7 +236,7 @@ export function createPipelineService(deps: PipelineServiceDeps): PipelineServic
         timeoutMs: s.timeoutMs,
         onFailure: s.onFailure
       }))
-    )
+    })
 
     logger.info(
       `pipeline saved: id=${pipelineId} target=${input.targetId} steps=${input.steps.length}`

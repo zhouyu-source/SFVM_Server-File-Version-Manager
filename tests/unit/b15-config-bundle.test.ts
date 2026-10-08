@@ -207,6 +207,21 @@ describe('B15 / T15.3 配置导出与导入', () => {
     expect(paths).toEqual(['/opt/web/dist', '/opt/web/dist-v2'])
   })
 
+  it('导入时逐条校验远端路径：坏路径跳过该目标并告警（不绕过 safePath）（P2-10）', () => {
+    seedRich()
+    const bundle = JSON.parse(JSON.stringify(makeService().exportBundle())) as ConfigBundle
+    // 手工把路径改成非法（模拟配置文件被改过）：导入是**直接写库**，
+    // 旧实现会照单收下，坏路径随后被拼进远端命令 → 路径逃逸
+    bundle.targets[0]!.remotePath = '/opt/../etc'
+    t.repo.targets.listAll().forEach((x) => t.repo.targets.remove(x.id))
+
+    const r = makeService().importBundle({ text: JSON.stringify(bundle) })
+    expect(r.targets.created).toBe(0)
+    expect(r.targets.skipped).toBe(1)
+    expect(r.warnings.some((w) => w.includes('远端路径不合法'))).toBe(true)
+    expect(t.repo.targets.listAll()).toHaveLength(0)
+  })
+
   it('环境引用的连接不存在 → 跳过该环境并说明原因（不静默丢弃）', () => {
     seedRich()
     const bundle = JSON.parse(JSON.stringify(makeService().exportBundle())) as ConfigBundle

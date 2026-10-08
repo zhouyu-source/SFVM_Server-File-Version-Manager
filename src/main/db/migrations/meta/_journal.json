@@ -22,6 +22,13 @@
       "when": 1791279845025,
       "tag": "0002_past_pestilence",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1791394672905,
+      "tag": "0003_normalize_archived_at_utc",
+      "breakpoints": true
     }
   ]
 }

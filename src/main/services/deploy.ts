@@ -48,13 +48,14 @@ import { stat as statLocal } from 'node:fs/promises'
 import { AppError, ErrorCode, type ErrorCodeValue } from '../infra/errors'
 import { logger } from '../infra/logger'
 import { newId } from '../db/id'
-import { normalizeRemotePath } from '../infra/remote-path'
+import { assertSafeRemotePath, normalizeRemotePath } from '../infra/remote-path'
 import { parentDirOf, resolveArchiveDir, posixBasename } from '../infra/archive-dir'
 import { joinRemote } from '../infra/hash-core'
 import {
   buildChmodCommand,
   buildChownCommand,
   buildDfCommand,
+  buildWriteProbeCommand,
   parseDfOutput
 } from '../infra/remote-exec'
 import {
@@ -549,6 +550,23 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
   }> {
     const { ports } = input
     const { target, kind, remotePath, parentDir, archiveDir, base } = resolvePaths(input.targetId)
+
+    /**
+     * `parentDir` 由 `remotePath` 推出来，而 `remotePath` 在写库时已过 `safePath`；
+     * 这里在**动远端之前**再显式过一遍 `assertSafeRemotePath`（P2-11 顺带）。
+     *
+     * 单靠 `buildWriteProbeCommand` 内部的 `quoteRemotePath` 也能拦住，但那条路径在
+     * `try/catch` 里，抛错会被吞成一句 warn，最后呈现为"父目录不可写" —— 一句
+     * 与真实原因（路径根本不合法）不符的结论。所以在入口就把它变成明确错误。
+     */
+    const parentCheck = assertSafeRemotePath(parentDir)
+    if (!parentCheck.ok) {
+      throw new AppError(ErrorCode.E_PATH_UNSAFE, {
+        parentDir,
+        reason: parentCheck.reason
+      })
+    }
+
     const items: PrecheckItem[] = []
 
     /* 1) 连接：能走到这里说明连接已就绪（IPC 层保证），仍显式呈现 */
@@ -685,9 +703,13 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     )
 
     /* 4) 父目录可写（要在这里建暂存目录与往期版本目录） */
+    //
+    // 走 `buildWriteProbeCommand`（与 ssh-client 同一来源）：路径先过
+    // `assertSafeRemotePath` 再过 `quoteShellArg`。旧实现自己做了 `'` → `'\''`
+    // 转义，但**没有**先校验路径，带换行的路径能截断单引号参数。
     let parentWritable = false
     try {
-      const r = await ports.exec(`test -w '${parentDir.replace(/'/g, `'\\''`)}'`)
+      const r = await ports.exec(buildWriteProbeCommand(parentDir))
       parentWritable = r.code === 0
     } catch (err) {
       logger.warn(`父目录可写探测失败：${(err as Error).message}`)
@@ -696,7 +718,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       // 父目录可能还不存在（首次发布到新目录），先建出来再探
       try {
         await ports.fs.mkdirp(parentDir)
-        const r = await ports.exec(`test -w '${parentDir.replace(/'/g, `'\\''`)}'`)
+        const r = await ports.exec(buildWriteProbeCommand(parentDir))
         parentWritable = r.code === 0
       } catch (err) {
         logger.warn(`创建/探测父目录失败：${(err as Error).message}`)
@@ -1010,7 +1032,11 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     if (localBusy.has(input.targetId)) {
       throw new AppError(ErrorCode.E_TARGET_BUSY, { targetId: input.targetId })
     }
-    localBusy.add(input.targetId)
+    // `add` 刻意放在下面紧邻 `try` 的位置（P0-2）：add 与 try 之间原本夹着
+    // `releases.create` 等非保护代码，那里抛错会让 finally 永不执行，
+    // targetId 就永久卡在 busy。现在这段（建台账行 + 组装 state）先跑，
+    // 抛错时 busy 尚未置位，无需清理；add 之后到 try 之间全是同步闭包定义，
+    // JS 单线程下不存在被并发插入的窗口。
 
     const releaseId = input.releaseId ?? makeReleaseId()
     const strategy: DeployStrategy =
@@ -1077,6 +1103,8 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       const pct = Math.max(0, Math.min(100, Math.round(r.from + (r.to - r.from) * ratio)))
       ctx.progress({ percent: pct, stage: stageText(stageIndex), message })
     }
+
+    localBusy.add(input.targetId)
 
     try {
       /* =============== 阶段 0：前置校验 =============== */
@@ -1483,8 +1511,28 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       goto('SUCCESS', 6)
       progressAt(6, 0, '收尾')
       await cleanupAfterSuccess(ports, state, ctx)
-      repo.targets.markDeployed(target.id)
-      release = repo.releases.finish(release.id, 'SUCCESS')!
+      // P0-1：这两条是**成功后的记账**，任何一条抛错都不能进补偿 —— 补偿会把
+      // 目标路径上刚发成功的新版本删掉。记账失败只留错误日志，台账与事实的
+      // 偏差交给 B14 对账修正（服务器上的内容才是事实）。
+      // 两条各自兜底：第一条失败不能连累第二条继续记账。
+      try {
+        repo.targets.markDeployed(target.id)
+      } catch (err) {
+        logger.error(
+          `发布已成功但 markDeployed 失败（releaseId=${release.id}），请执行对账修正：` +
+            `${(err as Error).message}`
+        )
+        ctx.log(`警告：发布成功，但更新目标状态失败（${(err as Error).message}）`, 'warn')
+      }
+      try {
+        release = repo.releases.finish(release.id, 'SUCCESS')!
+      } catch (err) {
+        logger.error(
+          `发布已成功但台账收尾失败（releaseId=${release.id}），请执行对账修正：` +
+            `${(err as Error).message}`
+        )
+        ctx.log(`警告：发布成功，但写台账终态失败（${(err as Error).message}）`, 'warn')
+      }
       progressAt(6, 1, '发布完成')
       ctx.log(`发布成功：${remotePath} 已更新为 ${resolvedTag.versionTag}`)
 
@@ -1730,8 +1778,12 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
      * 补偿顺序是**由外到内**的：先清掉可能存在的半个新版本，
      * 再把旧版本放回目标路径，最后才清暂存、放锁。
      * 反过来会出现"目标路径已被别的内容占着，旧版本搬不回来"的死局。
+     *
+     * 条件是 `=== 5` 而不是 `>= 5`（P0-1）：只有**换版本身没完成**才允许碰目标路径。
+     * `goto('SUCCESS', 6)` 之后，目标路径上就是刚交付的新版本——阶段 6 的任何失败
+     * 都无权把它删掉（那等于"失败处理比原故障更破坏"）。
      */
-    if (stage >= 5) {
+    if (stage === 5) {
       try {
         if ((await ports.fs.stat(state.remotePath)).exists) {
           await ports.fs.rmrf(state.remotePath)

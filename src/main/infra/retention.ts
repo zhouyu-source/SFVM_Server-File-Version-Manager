@@ -79,8 +79,14 @@ export function planRetention(
   })
 
   if (policy.mode === 'count') {
-    const keep = newestFirst.slice(0, policy.value)
-    const drop = newestFirst.slice(policy.value)
+    // P2-12：时间解析不出来的行**绝不参与淘汰** —— 与文件头"一律保留"的承诺、
+    // 以及下方 days 模式的既有行为对齐。之前的实现把坏行排到"最旧"端
+    //（parseTime 失败 → -Infinity），count 模式会把它们最先删掉。
+    const parsable = newestFirst.filter((a) => parseTime(a.archivedAt) !== null)
+    const broken = newestFirst.filter((a) => parseTime(a.archivedAt) === null)
+
+    const keep = [...parsable.slice(0, policy.value), ...broken]
+    const drop = parsable.slice(policy.value)
     // §6.7："其余按 archived_at 升序删除" —— 即最旧的先删
     const remove = [...drop].reverse().map((a) => ({
       id: a.id,
@@ -90,7 +96,11 @@ export function planRetention(
     return {
       keep: keep.map((a) => a.id),
       remove,
-      text: `保留最近 ${policy.value} 个版本，需删除 ${remove.length} 个`
+      text:
+        broken.length > 0
+          ? `保留最近 ${policy.value} 个版本，需删除 ${remove.length} 个` +
+            `（另有 ${broken.length} 个归档时间异常的版本已跳过清理，请执行对账处理）`
+          : `保留最近 ${policy.value} 个版本，需删除 ${remove.length} 个`
     }
   }
 

@@ -374,6 +374,27 @@ describe('assertCommandAllowed（出口自检，B08 起为收口点）', () => {
     expect(() => assertCommandAllowed('   ')).toThrow(UnsafeCommandError)
     expect(() => assertCommandAllowed('uname\0-s')).toThrow(UnsafeCommandError)
   })
+
+  it('拒绝引号外的换行/控制字符（换行是 shell 的隐藏分隔符）（P2-8）', () => {
+    // 旧实现只按 ; | & 切段，换行不当分隔符 → 整串被当成"以 test 开头的一段"整体放行
+    expect(() => assertCommandAllowed("test -w '/opt/a'\nrm -rf /")).toThrow(UnsafeCommandError)
+    expect(() => assertCommandAllowed('df -Pk /tmp\r\nrm -rf /')).toThrow(UnsafeCommandError)
+    // 引号内的换行是合法数据（不进骨架），不能误拒
+    expect(() => assertCommandAllowed("df -Pk '/opt/a\nb'")).not.toThrow()
+  })
+
+  it('拒绝引号外的重定向（> / >> / 2>）（P2-9）', () => {
+    for (const bad of [
+      'df -Pk /tmp > /etc/passwd',
+      'df -Pk /tmp >> /tmp/x',
+      'test -w /a 2>/dev/null',
+      'uname -s >out'
+    ]) {
+      expect(() => assertCommandAllowed(bad), `应拒绝：${bad}`).toThrow(UnsafeCommandError)
+    }
+    // 引号内的 > 只是普通字符（路径里可能有），放行
+    expect(() => assertCommandAllowed("df -Pk '/opt/a>b'")).not.toThrow()
+  })
 })
 
 /* ----------------------------------------------------- 既有行为的回归 */

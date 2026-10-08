@@ -359,10 +359,12 @@ export function splitShellSegments(command: string): Segment[] {
  * 一旦将来有人图省事绕开模板直接拼字符串，这道检查会在开发阶段就炸出来，
  * 而不是在生产上悄悄执行一条任意命令。
  *
- * 三重判定：
+ * 五重判定：
  * 1. 每个命令段的首个 token 必须在白名单（挡 `rm -rf /`、`cd x && cat ...`）
  * 2. 引号外的命令替换（反引号 / `$(`）一律拒绝（挡"第二次求值"）
  * 3. 单引号必须配平
+ * 4. 引号外的换行/控制字符一律拒绝（换行是 shell 的隐藏分隔符，见 P2-8）
+ * 5. 引号外的 `>` 重定向一律拒绝（远端只跑只读探测命令，见 P2-9）
  */
 export function assertCommandAllowed(command: string): void {
   if (typeof command !== 'string' || !command.trim()) {
@@ -373,6 +375,30 @@ export function assertCommandAllowed(command: string): void {
   for (const { raw, unquotedSkeleton } of splitShellSegments(command)) {
     const trimmed = raw.trim()
     if (!trimmed) continue
+
+    /**
+     * P2-8：**引号外**的换行/控制字符一律拒绝。
+     *
+     * `splitShellSegments` 只按 `;` / `|` / `&` 切段，**不把换行当分隔符** ——
+     * 于是 `test -w /x<换行>rm -rf /` 会被当成"一段以 test 开头的命令"整个放行，
+     * 而 shell 会在换行处另起一条命令。引号内的换行是合法数据（不进 skeleton），
+     * 所以只查骨架，与 `assertSafeRemotePath` 对路径同一条规则。
+     */
+    // eslint-disable-next-line no-control-regex
+    if (/[\x00-\x1f\x7f]/.test(unquotedSkeleton)) {
+      throw new UnsafeCommandError('命令含引号外的换行或控制字符', { command })
+    }
+
+    /**
+     * P2-9：引号外的 `>`（含 `>>`、`2>`）一律拒绝。
+     *
+     * 白名单里的命令全是**探测类**（uname / df / test / sha256sum …），不需要重定向；
+     * 而重定向能改写远端文件，等于绕过"文件操作一律走 SFTP、远端只跑只读命令"的约束。
+     */
+    if (unquotedSkeleton.includes('>')) {
+      throw new UnsafeCommandError('命令含重定向（> / >>）', { command })
+    }
+
     const first = trimmed.split(/\s+/)[0] as string
     if (!(ALLOWED_COMMANDS as readonly string[]).includes(first)) {
       throw new UnsafeCommandError(`命令段以非白名单程序开头：${first}`, { command })

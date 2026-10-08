@@ -102,7 +102,14 @@ export const reconcileReportSchema = z.object({
   counts: z.object({
     /** 远端有、台账没有（本次补录） */
     adopted: z.number().int().min(0),
-    /** 台账有但远端已经没了 */
+    /**
+     * **发现**台账有、远端已不在的版本数（只读，不管有没有真去标记）。
+     *
+     * 与 `markedMissing` 分开是因为"只读预演"（`markMissing:false`）下
+     * 我们并没有改动台账，把发现数也报成"已标记"就是在撒谎。
+     */
+    foundMissing: z.number().int().min(0),
+    /** 台账有但远端已经没了，且本次**真的**在台账里标记了 */
     markedMissing: z.number().int().min(0),
     /** 深度校验发现内容与 manifest 不符 */
     corrupt: z.number().int().min(0),

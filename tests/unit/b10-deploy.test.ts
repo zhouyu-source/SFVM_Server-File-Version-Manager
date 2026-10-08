@@ -7,7 +7,7 @@
  * 关键断言都围绕"目标路径为空的窗口"：阶段 4 会把目标清空、阶段 5 才就位，
  * 所以每个失败用例都必须回答"此刻失败，用户还剩什么" —— 见各用例名与断言。
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createDeployService } from '@main/services/deploy'
@@ -955,5 +955,56 @@ describe('DeployService（B10 发布主流程）', () => {
       { relPath: 'a.txt', hash: sha256('hello'), size: 5, mtime: expect.any(String) }
     ])
     expect(r.rootHash).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  /* ==================================== P0 回归（缺陷审计 2026-10-08 复核） */
+
+  /**
+   * P0-1：收尾阶段的台账写失败**绝不能**触发"删新版本、搬旧版"的补偿。
+   * 修复前：markDeployed 抛错 → catch → stage>=5 → rmrf 目标路径 + undoArchive，
+   * 刚发布成功的内容被"失败处理"亲手删掉。
+   */
+  it('回归 P0-1：markDeployed 抛错 → 发布仍成功，目标路径上的新版本原封不动', async () => {
+    const id = seedDirTarget({ 'index.html': 'v2' })
+    fake.putFile('/opt/app/dist/index.html', 'v1')
+
+    const spy = vi.spyOn(t.repo.targets, 'markDeployed').mockImplementation(() => {
+      throw new Error('database is locked')
+    })
+    const { ctx, text } = makeCtx()
+    const out = await service.run({ targetId: id, ports: fake.ports(), ctx })
+    spy.mockRestore()
+
+    expect(out.ok).toBe(true)
+    expect(out.status).toBe('SUCCESS')
+    // 目标路径上是新版本 —— 补偿链没有碰它
+    expect(fake.text('/opt/app/dist/index.html')).toBe('v2')
+    // 补偿的两个破坏性动作都没有发生
+    expect(text()).not.toContain('清理换版残留')
+    expect(text()).not.toContain('归档复位')
+    // 记账失败被明确说出来，而不是静默吞掉
+    expect(text()).toContain('更新目标状态失败')
+  })
+
+  /**
+   * P0-2：建台账行抛错时 localBusy 不能被污染 —— 否则该目标在重启前
+   * 所有发布/回滚/预检都报 E_TARGET_BUSY，无自愈路径。
+   */
+  it('回归 P0-2：releases.create 抛错后，同一目标立即可再次发布（不卡 E_TARGET_BUSY）', async () => {
+    const id = seedDirTarget()
+    fake.putFile('/opt/app/dist/index.html', 'v1')
+
+    const spy = vi.spyOn(t.repo.releases, 'create').mockImplementationOnce(() => {
+      throw new Error('database is locked')
+    })
+    await expect(
+      service.run({ targetId: id, ports: fake.ports(), ctx: makeCtx().ctx })
+    ).rejects.toThrow('database is locked')
+    spy.mockRestore()
+
+    // 紧接着的第二次发布必须正常走通
+    const out = await service.run({ targetId: id, ports: fake.ports(), ctx: makeCtx().ctx })
+    expect(out.ok).toBe(true)
+    expect(fake.text('/opt/app/dist/index.html')).toBe('v1' /* 本地产物默认 v1 */)
   })
 })

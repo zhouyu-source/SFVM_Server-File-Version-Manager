@@ -47,6 +47,39 @@ describe('count 模式', () => {
     const plan = planRetention(shuffled, { mode: 'count', value: 2 }, NOW)
     expect(plan.keep).toEqual(['id-9', 'id-8'])
   })
+
+  /**
+   * P2-12 回归：archived_at 解析不出来的行**一律保留**（文件头承诺 #1）。
+   * 修复前坏行被排到"最旧"端（parseTime 失败 → -Infinity），count 模式最先删它
+   * —— 全项目唯一会自动删服务器数据的逻辑，删了不该删的行。
+   */
+  it('时间解析失败的行绝不参与淘汰（count 模式），并在策略文本里说明', () => {
+    const withBroken: RetainCandidate[] = [
+      ...FIVE,
+      { id: 'id-bad', versionTag: '20250601-000000_bbbbbbb', archivedAt: 'not-a-time' }
+    ]
+    const plan = planRetention(withBroken, { mode: 'count', value: 3 }, NOW)
+
+    // 坏行保留，且淘汰的仍是可解析行中最旧的两个
+    expect(plan.keep).toContain('id-bad')
+    expect(plan.remove.map((r) => r.id)).toEqual(['id-1', 'id-6'])
+    // 要说出来，不能静默跳过
+    expect(plan.text).toContain('时间异常')
+    expect(plan.text).toContain('1 个')
+  })
+
+  it('全部行的时间都解析失败 → 什么都不删', () => {
+    // 注意：V8 的 Date.parse 出奇宽松（'garbage-1' 都能解析出时刻），
+    // 这里用确实解析不出任何时刻的串
+    const allBroken: RetainCandidate[] = [
+      { id: 'b1', versionTag: 'v1', archivedAt: '??? 无法解析' },
+      { id: 'b2', versionTag: 'v2', archivedAt: '0000-00-00T00:00:00' }
+    ]
+    const plan = planRetention(allBroken, { mode: 'count', value: 1 }, NOW)
+    expect(plan.remove).toEqual([])
+    // 坏行之间按 id 兜底排序（与可解析行的排序规则一致），这里只关心"都在"
+    expect([...plan.keep].sort()).toEqual(['b1', 'b2'])
+  })
 })
 
 describe('days 模式', () => {

@@ -117,6 +117,25 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     await fetchTargets(id)
   }
 
+  /**
+   * 只重取**环境列表本身**（拿回后端现算的 `targetCount`），不重取目标列表。
+   *
+   * 目标的增 / 删 / 改都会改变某个环境的 `targetCount`，而它是后端从 `targets`
+   * 表现算出来的**另一份**数据（`services/workspace.ts` 的 `listEnvironments`）：
+   * 只刷新 `targetsByEnv` 的话，环境名右边那个绿色数字会停在旧值，
+   * 要重启应用才更新（用户报的就是这个）。
+   *
+   * 刻意不用 `fetchEnvironments()`：那会把**所有**环境的目标都重取一遍，
+   * 为了一个数字不值当（而且它会重设选中态）。
+   */
+  async function refreshEnvCounts(): Promise<void> {
+    try {
+      environments.value = await api.env.list()
+    } catch (e) {
+      error.value = (e as IpcBusinessError).toUserText()
+    }
+  }
+
   function selectEnvironment(id: string): void {
     currentEnvId.value = id
     currentTargetId.value = null
@@ -188,6 +207,8 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   ): Promise<TargetCreateResult> {
     const result = await api.targets.create(input)
     await fetchTargets(input.environmentId)
+    // 环境名右边的目标计数来自 environments（后端现算），必须一起刷新
+    await refreshEnvCounts()
     currentTargetId.value = result.target.id
     return result
   }
@@ -195,6 +216,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
   async function updateTarget(id: string, patch: Partial<TargetInput>): Promise<TargetView> {
     const updated = await api.targets.update(id, patch)
     await refreshTargets(updated.environmentId)
+    await refreshEnvCounts()
     return updated
   }
 
@@ -209,6 +231,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
     const r = await api.targets.remove(id)
     if (currentTargetId.value === id) currentTargetId.value = null
     if (envId) await fetchTargets(envId)
+    await refreshEnvCounts()
     return r
   }
 

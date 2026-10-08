@@ -705,8 +705,6 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
           kind,
           ...(input.signal ? { signal: input.signal } : {})
         })
-        // 副本已逐条核对过，这时才敢清空目标
-        await input.ports.fs.rmrf(remotePath)
       } else {
         await input.ports.fs.rename(remotePath, artifactAt)
       }
@@ -722,6 +720,29 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
               : '归档当前版本失败（目标未被改动）'
         }
       )
+    }
+
+    /**
+     * 复制模式下"清空目标"是**独立的一步、独立的失败语义**。
+     *
+     * 走到这里归档副本已经完整落在归档目录里（`copyArtifactInto` 逐条核对过），
+     * 与上一步"复制没做完"是两回事：若仍报"复制未完成"，用户会去重发一遍，
+     * 而真正该做的是先对账清掉那份无清单的残留副本。目标本身没被改动。
+     */
+    if (moveMode === 'copy') {
+      try {
+        await input.ports.fs.rmrf(remotePath)
+      } catch (err) {
+        throw new AppError(
+          ErrorCode.E_ARCHIVE_FAILED,
+          { remotePath, storagePath, moveMode, stage: 'clear-target', original: (err as Error).message },
+          {
+            message:
+              '归档副本已完成，但清空目标失败（目标未被改动）。' +
+              '归档目录里残留一份无清单副本，请勿重复发布，先到「往期版本 → 对账」处理。'
+          }
+        )
+      }
     }
 
     /* ---- 5) 写 manifest（先 .tmp 再 rename，绝不产生半截文件） ----
@@ -1376,6 +1397,12 @@ export function compareByArchivedAtDesc(
   a: { archivedAt: string },
   b: { archivedAt: string }
 ): number {
+  // P1-1：解析成时刻再比较。列里理论上已统一为 UTC，但迁移特意保留的
+  // "解析失败的坏行"与任何未来的格式漂移，都不该靠字符串序碰运气。
+  const ta = Date.parse(a.archivedAt)
+  const tb = Date.parse(b.archivedAt)
+  if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return tb - ta
+  // 双方至少有一方解析失败、或同一时刻 → 退回字符串序，保证结果稳定可复现
   return compareRelPathUtf8(b.archivedAt, a.archivedAt)
 }
 

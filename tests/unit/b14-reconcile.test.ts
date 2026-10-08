@@ -122,10 +122,14 @@ describe('ReconcileService（B14 对账与恢复）', () => {
     expect(row.rootHash).toBe(sha256('v1'))
     expect(row.status).toBe('valid')
     /**
-     * **最关键的一条**：时间来自 manifest，不是"现在"。
+     * **最关键的一条**：时刻来自 manifest，不是"现在"。
      * 用"现在"的话，MT-06（删库后重建）的时间对不上，往期版本列表的排序也会整体乱掉。
+     *
+     * P1-1：manifest 里是本地偏移格式（`+08:00`），落库前**归一成 UTC** ——
+     * archived_at 列上的排序/统计是字符串比较，两种格式混存会跨 UTC 日界错序。
+     * 时刻必须与 manifest 一致（12:00+08:00 == 04:00Z），只是格式统一。
      */
-    expect(row.archivedAt).toBe('2026-09-10T12:00:00+08:00')
+    expect(row.archivedAt).toBe('2026-09-10T04:00:00.000Z')
     expect(r.adopted[0]).toMatchObject({ how: 'adopted' })
   })
 
@@ -197,13 +201,15 @@ describe('ReconcileService（B14 对账与恢复）', () => {
     })
 
     const r = await run()
+    expect(r.counts.foundMissing).toBe(1)
     expect(r.counts.markedMissing).toBe(1)
     expect(t.repo.archives.listByTarget(targetId, 10)[0]!.status).toBe('missing')
 
-    // 重置后关掉开关再看一次
+    // 重置后关掉开关再看一次：只读预演**不标记**，也不该把"发现"记成"已标记"（P2-3）
     t.repo.archives.setStatus(t.repo.archives.listByTarget(targetId, 10)[0]!.id, 'valid')
     const r2 = await run({ markMissing: false })
-    expect(r2.counts.markedMissing).toBe(1)
+    expect(r2.counts.foundMissing).toBe(1)
+    expect(r2.counts.markedMissing).toBe(0)
     expect(t.repo.archives.listByTarget(targetId, 10)[0]!.status).toBe('valid')
   })
 

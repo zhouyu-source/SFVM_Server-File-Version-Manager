@@ -88,29 +88,47 @@ async function askRemoveLock(): Promise<void> {
 const hasFindings = computed(() => {
   const c = report.value?.counts
   if (!c) return false
-  return c.adopted > 0 || c.markedMissing > 0 || c.corrupt > 0 || c.withoutManifest > 0
+  return c.adopted > 0 || c.foundMissing > 0 || c.markedMissing > 0 || c.corrupt > 0 || c.withoutManifest > 0
 })
 
+/**
+ * 每次发起的序号。对账要跑好几秒，期间用户可能切走目标 ——
+ * 只有"最后一次发起"才允许写回报告与状态。旧报告挂到新目标上比"数据旧"严重得多：
+ * 用户可能基于一份错目标的对账结果去做修复动作。
+ */
+let runToken = 0
+
 async function run(): Promise<void> {
+  const targetId = props.target.id
+  const token = ++runToken
   running.value = true
   errorText.value = ''
   try {
-    report.value = await api.reconcile.run({
-      targetId: props.target.id,
+    const r = await api.reconcile.run({
+      targetId,
       deep: deep.value,
       adopt: adopt.value
     })
-    if (report.value.counts.adopted > 0 || report.value.counts.markedMissing > 0) {
+    // 目标已切换 / 又发起了新一次对账 → 丢弃这份结果
+    if (token !== runToken || props.target.id !== targetId) return
+    report.value = r
+    const c = r.counts
+    if (c.adopted > 0 || c.markedMissing > 0) {
       emit('changed')
       ElMessage.success('对账完成，台账已按远端修正')
+    } else if (c.foundMissing > 0) {
+      ElMessage.success(
+        `对账完成：发现 ${c.foundMissing} 个版本远端已不存在（未标记，台账未改动）`
+      )
     } else {
       ElMessage.success('对账完成，台账与远端一致')
     }
   } catch (e) {
+    if (token !== runToken || props.target.id !== targetId) return
     report.value = null
     errorText.value = (e as IpcBusinessError).toUserText()
   } finally {
-    running.value = false
+    if (token === runToken) running.value = false
   }
 }
 

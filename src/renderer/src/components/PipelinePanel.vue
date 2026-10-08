@@ -116,14 +116,21 @@ const loading = ref(false)
 const loadError = ref('')
 
 async function load(silent = false): Promise<void> {
+  // 竞态守卫（P1-8）：发起时记下目标，返回时目标已切换就丢弃这份旧响应——
+  // 否则快速切换目标时，先发的慢响应后到，界面上显示 A 目标的流水线、
+  // 操作上下文却是 B 目标，可能对错误的对象执行运行/删除。
+  const requested = props.target.id
   if (!silent) loading.value = true
   try {
-    list.value = await api.pipelines.list({ targetId: props.target.id })
+    const result = await api.pipelines.list({ targetId: requested })
+    if (props.target.id !== requested) return
+    list.value = result
     loadError.value = ''
   } catch (e) {
+    if (props.target.id !== requested) return
     if (!silent) loadError.value = (e as IpcBusinessError).toUserText()
   } finally {
-    if (!silent) loading.value = false
+    if (!silent && props.target.id === requested) loading.value = false
   }
 }
 

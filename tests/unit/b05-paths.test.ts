@@ -203,4 +203,28 @@ describe('parentDirOf / posixBasename', () => {
     expect(posixBasename('/opt/app/dist')).toBe('dist')
     expect(posixBasename('/dist')).toBe('dist')
   })
+
+  /**
+   * P1-3 回归：自定义 archiveDir 之前只做 normalizeRemotePath（折叠斜杠），
+   * 相对路径 / `..` / 换行都能原样通过 —— 归档会写到工作区外的任意位置。
+   * 现在必须先过 `requireSafeRemotePath`。
+   */
+  it('自定义 archiveDir 必须是安全的绝对路径，否则拒绝', () => {
+    expect(() =>
+      resolveArchiveDir({ remotePath: '/opt/app/dist', archiveDir: 'rel/versions' })
+    ).toThrow(UnsafePathError)
+    expect(() =>
+      resolveArchiveDir({ remotePath: '/opt/app/dist', archiveDir: '/opt/../etc/versions' })
+    ).toThrow(UnsafePathError)
+    expect(() =>
+      resolveArchiveDir({ remotePath: '/opt/app/dist', archiveDir: '/opt/a\nb' })
+    ).toThrow(UnsafePathError)
+    // 合法的绝对路径照常；空白值仍走推导
+    expect(resolveArchiveDir({ remotePath: '/opt/app/dist', archiveDir: '/data/versions' })).toBe(
+      '/data/versions'
+    )
+    expect(resolveArchiveDir({ remotePath: '/opt/app/dist', archiveDir: '   ' })).toBe(
+      '/opt/app/dist.versions'
+    )
+  })
 })

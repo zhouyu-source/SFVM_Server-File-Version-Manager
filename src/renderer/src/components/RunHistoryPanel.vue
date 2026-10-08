@@ -33,6 +33,7 @@ import { api, IpcBusinessError } from '../api'
 import { isTerminalStatus } from '../../../shared/contracts/job'
 import { useJobStore } from '../stores/job'
 import { formatDateTime, formatDuration } from '../utils/format'
+import { writeClipboard } from '../utils/clipboard'
 import {
   DEFAULT_SCRIPT_RUN_LIST_LIMIT,
   LOCAL_SHELL_LABELS,
@@ -255,12 +256,11 @@ async function revealOutput(step: ScriptStepRunView): Promise<void> {
 }
 
 async function copyTail(step: ScriptStepRunView): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(step.outputTail ?? '')
-    ElMessage.success('已复制输出尾部')
-  } catch {
-    ElMessage.warning('复制失败，请手动选中复制')
-  }
+  // 走统一的 writeClipboard（内部对 navigator.clipboard 与 execCommand 双路兜底），
+  // 别直接摸 navigator.clipboard —— 那样在不支持的环境下"点了没反应"且无法自证
+  const ok = await writeClipboard(step.outputTail ?? '')
+  if (ok) ElMessage.success('已复制输出尾部')
+  else ElMessage.warning('复制失败，请手动选中复制')
 }
 
 /* -------------------------------------------------------------- 生命周期 */

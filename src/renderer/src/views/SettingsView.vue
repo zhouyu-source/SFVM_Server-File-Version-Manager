@@ -52,6 +52,7 @@ import { api, IpcBusinessError } from '../api'
 import { useMenuStore } from '../stores/menu'
 import { confirmDanger } from '../utils/danger'
 import { formatBytes } from '../utils/format'
+import { writeClipboard } from '../utils/clipboard'
 import type { AppInfoOutput, DataLocationOutput } from '../../../shared/contracts/app'
 import {
   DEFAULT_APP_SETTINGS,
@@ -378,11 +379,11 @@ async function exportToFile(): Promise<void> {
 async function copyExport(): Promise<void> {
   copying.value = true
   try {
-    await navigator.clipboard.writeText(exportText.value)
-    ElMessage.success('已复制到剪贴板')
-  } catch {
-    // 剪贴板可能被系统策略拒绝：让用户手动全选（textarea 是可选的）
-    ElMessage.warning('复制失败，请手动全选文本框内容复制')
+    // 统一走 writeClipboard（含 execCommand 兜底）—— 剪贴板在新 API 不可用的环境下
+    // 直接摸 navigator.clipboard 会失败，用户只能"手动全选文本框"（下面仍保留了这条后路）
+    const ok = await writeClipboard(exportText.value)
+    if (ok) ElMessage.success('已复制到剪贴板')
+    else ElMessage.warning('复制失败，请手动全选文本框内容复制')
   } finally {
     copying.value = false
   }

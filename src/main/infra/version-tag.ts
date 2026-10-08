@@ -50,6 +50,19 @@ export function toLocalIso(at: Date): string {
   )
 }
 
+/**
+ * 任意 ISO-8601 时间串 → **UTC** ISO（`Z` 后缀）。解析失败返回 `null`。
+ *
+ * P1-1：台账 `archived_at` 列必须**只有一种格式**。列上的排序（`ORDER BY DESC`）
+ * 与统计（`min`/`max`）都是字符串比较，`+08:00` 与 `Z` 两种格式混存时，
+ * 字典序与真实时刻最多差 8 小时，跨 UTC 日界会整体错序。
+ * manifest 里保留本地偏移格式（展示口径不变），但**落库前必须经这里归一**。
+ */
+export function toUtcIso(value: string): string | null {
+  const t = Date.parse(value)
+  return Number.isFinite(t) ? new Date(t).toISOString() : null
+}
+
 /** `yyyyMMdd-HHmmss`（本地时区）。 */
 export function formatTagTime(at: Date): string {
   return (

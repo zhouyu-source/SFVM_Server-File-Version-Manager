@@ -154,6 +154,14 @@ export async function collectLocalFiles(opts: {
   maxFiles?: number
 }): Promise<CollectResult> {
   const matcher = compileExclude(opts.exclude)
+  // P1-2：语法坏（正则编译失败）的排除规则会被跳过 —— 必须说出来，否则用户
+  // 写的规则没生效还不知道，"排除结果与预期偏离"这类问题最难排查。
+  if (matcher.skipped.length > 0) {
+    logger.warn(
+      `${matcher.skipped.length} 条排除规则无法解析，已忽略：` +
+        matcher.skipped.map((s) => JSON.stringify(s)).join('、')
+    )
+  }
   const maxFiles = opts.maxFiles ?? MAX_LOCAL_FILES
   const files: LocalFileEntry[] = []
   let excludedCount = 0

@@ -1,6 +1,6 @@
 {
   "name": "sfvm",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "服务器文件版本管理工具 (Server File Version Manager)",
   "private": true,
   "type": "module",

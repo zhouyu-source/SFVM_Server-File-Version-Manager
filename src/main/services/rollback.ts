@@ -546,8 +546,13 @@ export function createRollbackService(deps: {
       /* =============== 阶段 6：收尾（不允许抛错） =============== */
       stage = 6
       progressAt(6, 0, '收尾')
-      lockHeld = false
+      /**
+       * **先真放掉锁、再把 lockHeld 置 false**。反过来（旧写法）会让"放锁失败"
+       * 被记成"锁已放掉"，补偿里的 `if (lockHeld)` 于是跳过重试，锁就留在服务器上了 ——
+       * 之后这个目标的所有发布都会被这把陈旧锁挡住。
+       */
       await releaseRemoteLock(input.ports.fs, remotePath, log)
+      lockHeld = false
 
       repo.releases.finish(input.rollbackId, 'SUCCESS')
       repo.targets.markDeployed(target.id)
@@ -647,7 +652,8 @@ export function createRollbackService(deps: {
   }): Promise<RollbackFailure> {
     const { err, stage, remotePath, lockHeld } = args
     const appErr = err instanceof AppError ? err : null
-    const code = appErr ? appErr.code : ErrorCode.E_UNKNOWN
+    let code = appErr ? appErr.code : ErrorCode.E_UNKNOWN
+    let hint = appErr?.hint
     const message = (err as Error).message
 
     /**
@@ -719,13 +725,29 @@ export function createRollbackService(deps: {
     }
 
     if (lockHeld) {
-      await releaseRemoteLock(args.input.ports.fs, remotePath, args.log)
+      // 收尾阶段放锁失败时会走到这里再试一次。仍失败就**改成需要人工处理的指引**：
+      // 这把锁会让该目标后续的发布一直被拒（E_DEPLOY_BLOCKED），用户必须知道去哪儿清。
+      try {
+        await releaseRemoteLock(args.input.ports.fs, remotePath, args.log)
+      } catch (e) {
+        code = ErrorCode.E_LOCK_STALE
+        hint = '远端锁未能自动释放。请到「往期版本 → 对账」清理该目标的锁后再重试。'
+        args.compensations.push({
+          action: 'release-lock',
+          ok: false,
+          detail: (e as Error).message
+        })
+        args.log(
+          `补偿失败：远端锁未能释放（${(e as Error).message}）。请到「往期版本 → 对账」清理该目标的锁。`,
+          'error'
+        )
+      }
     }
 
     return {
       code,
       message,
-      ...(appErr?.hint ? { hint: appErr.hint } : {}),
+      ...(hint ? { hint } : {}),
       compensations: args.compensations
     }
   }

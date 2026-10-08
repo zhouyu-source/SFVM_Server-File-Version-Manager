@@ -16,7 +16,7 @@
  * 下载跑在 `JobService` 里（可取消、有进度、有日志），进度与底部任务条同源，
  * 这里只是换个更贴近操作的呈现。**不在组件里另算进度**。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onScopeDispose, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Close, Download, FolderOpened } from '@element-plus/icons-vue'
 import { api, IpcBusinessError } from '../api'
@@ -122,6 +122,14 @@ watch(saveDirInput, (v) => {
   if (!next || next === plan.value?.saveDir) return
   if (saveDirTimer) clearTimeout(saveDirTimer)
   saveDirTimer = setTimeout(() => void loadPlan(next), 350)
+})
+
+// 组件销毁时清掉待触发的防抖定时器：不然它会在组件早已卸载后再去打一次 IPC
+onScopeDispose(() => {
+  if (saveDirTimer) {
+    clearTimeout(saveDirTimer)
+    saveDirTimer = null
+  }
 })
 
 async function pickDir(): Promise<void> {

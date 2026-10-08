@@ -14,7 +14,7 @@
  * "带病继续"只会把故障推迟到第一次读表，表现是窗口永不出现、进程却留在任务管理器里。
  */
 import { app } from 'electron'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DB_FILENAME, openDatabase, type OpenedDb } from './client'
 import { createRepositories, type Repositories } from './repositories'
@@ -24,8 +24,30 @@ import { AppError, ErrorCode } from '../infra/errors'
 let opened: OpenedDb | null = null
 let repos: Repositories | null = null
 
-/** 当前 schema 版本，用于备份文件命名（T02.8）。 */
+/** 兜底版本号：迁移目录读不出来时用（正常路径永远走 `schemaVersionOf`）。 */
 export const SCHEMA_VERSION = '0000'
+
+/**
+ * 从迁移目录推导当前 schema 版本：取文件名里最大的序号（`0003_xxx.sql` → `0003`）。
+ *
+ * 以前这里是一个**手写常量**，长期停在 `'0000'` 而迁移目录早就有 0001/0002/0003 ——
+ * 于是备份文件名里的版本号一直在说谎，新增迁移也没人记得回来改。改成推导后不再漂移。
+ */
+export function schemaVersionOf(folder: string): string {
+  try {
+    let max = -1
+    for (const name of readdirSync(folder)) {
+      const m = /^(\d+)[_-]/.exec(name)
+      if (!m) continue
+      const n = Number(m[1])
+      if (Number.isFinite(n) && n > max) max = n
+    }
+    if (max >= 0) return String(max).padStart(4, '0')
+  } catch {
+    /* 目录不可读时退回兜底常量 */
+  }
+  return SCHEMA_VERSION
+}
 
 function resolveMigrationsFolder(): string {
   const candidates = [
@@ -76,7 +98,7 @@ export function openAppDatabase(dataDir?: string): Repositories {
     // 一定有值：`resolveMigrationsFolder()` 找不到就抛错，不走"不迁移"的降级路径
     migrationsFolder: folder,
     backupKeep: 3,
-    schemaVersion: SCHEMA_VERSION,
+    schemaVersion: schemaVersionOf(folder),
     onLog: (m) => logger.info(m)
   })
 

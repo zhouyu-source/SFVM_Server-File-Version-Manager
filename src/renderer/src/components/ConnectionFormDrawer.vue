@@ -140,7 +140,11 @@ function buildInput(): ConnectionInput {
     if (form.secret) input.secret = form.secret
   } else if (form.authType === 'password') {
     input.privateKeyPath = null
-    if (replacingSecret.value && form.secret) {
+    if (replacingSecret.value) {
+      // "更换密码"模式下**原样提交**（P1-7）：非空 = 换成新密码；
+      // 空串 = 清除已保存的密码（契约 semantics：'' 即清除，
+      // 后端 connection.ts 按 undefined=不改 / ''=清除 / 其他=重设 三分）。
+      // 之前用 `if (form.secret)` 过滤空串，导致"清除"永远到不了后端。
       input.secret = form.secret
     } else if (!isEditing.value && form.secret) {
       input.secret = form.secret
