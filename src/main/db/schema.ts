@@ -125,7 +125,13 @@ export const releases = sqliteTable(
     /** 'local' | 'archive' */
     source: text('source'),
     localPath: text('local_path'),
-    /** rollback 时的来源版本 */
+    /**
+     * 本次操作关联的那份归档 —— **两侧语义不同，别当成同一个东西改**：
+     * - `action='rollback'`：来源归档（要恢复到的那一版）。这个值被发布去重依赖
+     *   （`prev.archiveId` 当 `keepArchiveId`），改了去重会算错对象。
+     * - `action='deploy'`：本次发布阶段 4 归档出来的**旧版本**。崩溃恢复的
+     *   「恢复旧版本」靠它找到可复位的内容；补偿里的 `undoArchive` 摘掉归档行后清空。
+     */
     archiveId: text('archive_id'),
     /** 目录指纹 / 文件哈希 */
     rootHash: text('root_hash'),

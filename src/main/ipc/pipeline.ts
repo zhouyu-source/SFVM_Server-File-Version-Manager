@@ -34,6 +34,7 @@ import {
   pipelineSaveInputSchema
 } from '../../shared/contracts/pipeline'
 import { pipelineNeedsRemote, type PipelineDeployPort, type PipelineService } from '../services/pipeline'
+import { cleanupDeployResidue } from '../services/deploy-residue'
 import type { RawExecFn } from '../services/script-runner'
 import type { JobService } from '../services/job'
 import type { ConnectionService } from '../services/connection'
@@ -69,12 +70,19 @@ export function createPipelineDeployPort(args: {
   openPorts: DeployPortsOpener
   deploy: DeployService
   pool: SshConnectionPool
+  /** 第二道清理要读目标行（M6）—— 与 `ipc/deploy.ts` 的 `cleanup` 同一份实现 */
+  repo: Repositories
 }): PipelineDeployPort {
   return {
     precheck: async (targetId) => {
       // 前置校验自己开一条通道：它只读不写，与后面的发布通道互不影响
-      const { ports } = await args.openPorts(targetId)
-      return args.deploy.precheck({ targetId, ports })
+      const opened = await args.openPorts(targetId)
+      try {
+        return await args.deploy.precheck({ targetId, ports: opened.ports })
+      } finally {
+        // S2：这条通道只活到前置校验结束
+        opened.release?.()
+      }
     },
     run: async ({ targetId, ctx, releaseId }) => {
       const opened = await args.openPorts(targetId)
@@ -90,8 +98,21 @@ export function createPipelineDeployPort(args: {
         })
       } finally {
         args.pool.setBusy(opened.connectionId, false)
+        // S2：发布步骤的通道活到 `deploy.run` 返回为止
+        opened.release?.()
       }
-    }
+    },
+    // M6：与直接点发布共用同一份残留清理（避免两个入口各写一遍、迟早漏一处）
+    cleanupResidue: (input) =>
+      cleanupDeployResidue(
+        {
+          repo: args.repo,
+          openPorts: args.openPorts,
+          cleanResidue: (i) => args.deploy.cleanResidue(i),
+          setBusy: (connectionId, busy) => args.pool.setBusy(connectionId, busy)
+        },
+        input
+      )
   }
 }
 

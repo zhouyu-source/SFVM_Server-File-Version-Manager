@@ -14,6 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { registerAppHandlers } from '@main/ipc/app'
+import { terminalCandidates } from '@main/infra/open-shell'
 import { unregisterAllHandlers } from '@main/infra/ipc'
 import { IPC_CHANNELS } from '@shared/channels'
 import type { IpcResult } from '@shared/ipc'
@@ -35,15 +36,47 @@ interface SpawnCall {
 }
 
 const spawnCalls: SpawnCall[] = []
-/** 命中"起不来"的命令名（模拟 ENOENT） */
+/** 命中"起不来"的命令名（模拟**同步**抛 ENOENT —— 少数实现会这样） */
 let spawnFailsFor = new Set<string>()
+/** 命中"起不来"的命令名（模拟真实 `spawn` 的**异步** `'error'` 事件） */
+let spawnErrorsFor = new Set<string>()
 
-function fakeSpawn(command: string, args: readonly string[]): { unref: () => void } {
+/**
+ * 假 child：真实 `spawn` 成功返回的对象至少有 `unref`，而 L14 起我们还会
+ * `on('error')` —— 替身必须跟着长，否则测不到"异步失败"这条路。
+ */
+class FakeChild {
+  private readonly handlers = new Map<string, Array<(err: Error) => void>>()
+  on(event: string, fn: (err: Error) => void): this {
+    const list = this.handlers.get(event) ?? []
+    list.push(fn)
+    this.handlers.set(event, list)
+    return this
+  }
+  unref(): void {
+    /* 父进程不必等它 */
+  }
+  /**
+   * 异步报错。用微任务触发（不是 `setTimeout`）：它确定性地早于 handler 里
+   * `setImmediate` 那一跳，用例不会变成"谁先后到看运气"。
+   */
+  emitAsyncError(err: Error): void {
+    queueMicrotask(() => {
+      for (const fn of this.handlers.get('error') ?? []) fn(err)
+    })
+  }
+}
+
+function fakeSpawn(command: string, args: readonly string[]): FakeChild {
   if (spawnFailsFor.has(command)) {
     throw Object.assign(new Error(`spawn ${command} ENOENT`), { code: 'ENOENT' })
   }
   spawnCalls.push({ command, args: [...args] })
-  return { unref: (): void => undefined }
+  const child = new FakeChild()
+  if (spawnErrorsFor.has(command)) {
+    child.emitAsyncError(Object.assign(new Error(`spawn ${command} ENOENT`), { code: 'ENOENT' }))
+  }
+  return child
 }
 
 const tempDirs: string[] = []
@@ -82,6 +115,7 @@ beforeEach(() => {
   __resetShell()
   spawnCalls.length = 0
   spawnFailsFor = new Set()
+  spawnErrorsFor = new Set()
 })
 
 afterEach(() => {
@@ -209,5 +243,36 @@ describe('app.openTerminal（T11.7）', () => {
     const r = await invoke<OpenShellResult>(IPC_CHANNELS.APP_OPEN_TERMINAL, { path: makeDir() })
     expect(r.ok).toBe(true)
     expect(spawnCalls[0]!.command).toBe('gnome-terminal')
+  })
+
+  /**
+   * L14：真实 `spawn` 对"命令不存在"**不抛**，它是异步用 `'error'` 报的。
+   * 旧实现既没挂监听、又无条件 `return {ok:true}` —— Linux 上候选终端全都不在时
+   * 主进程会冒出未捕获异常，界面那边却显示"已打开"。
+   */
+  it('L14：spawn 异步报 ENOENT → 不崩、如实回退（不是无条件返回 ok）', async () => {
+    if (process.platform === 'linux') {
+      spawnErrorsFor.add('x-terminal-emulator')
+      const r = await invoke<OpenShellResult>(IPC_CHANNELS.APP_OPEN_TERMINAL, { path: makeDir() })
+      expect(r.ok).toBe(true)
+      expect(spawnCalls.map((c) => c.command)).toContain('gnome-terminal')
+      return
+    }
+    // 非 Linux 只有一个候选：异步失败必须如实变成 ok:false（而不是"点了没反应"）
+    spawnErrorsFor.add(process.platform === 'win32' ? 'cmd.exe' : 'open')
+    const r = await invoke<OpenShellResult>(IPC_CHANNELS.APP_OPEN_TERMINAL, { path: makeDir() })
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('ENOENT')
+  })
+
+  it('L14：候选全部异步失败 → 带回最后一条原因（用户能照做）', async () => {
+    const dir = makeDir()
+    const all = terminalCandidates(process.platform, dir).map((c) => c.command)
+    for (const c of all) spawnErrorsFor.add(c)
+    const r = await invoke<OpenShellResult>(IPC_CHANNELS.APP_OPEN_TERMINAL, { path: dir })
+    expect(r.ok).toBe(false)
+    expect(r.reason).toContain('ENOENT')
+    // 每个候选都被真的试过（回退链完整，不是第一个失败就收工）
+    expect(spawnCalls.map((x) => x.command)).toEqual(all)
   })
 })

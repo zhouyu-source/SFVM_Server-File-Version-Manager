@@ -236,6 +236,21 @@ export function createRollbackService(deps: {
 
     let stage = 0
     let lockHeld = false
+    /**
+     * 换版方式与"实际是否用了 rename"（L13）。
+     *
+     * **必须在 `try` 之外声明**：失败分支也要回答"到底是怎么换的"。
+     * 旧写法在失败分支直接用 `keepSource ? 'copy' : 'rename'` —— 那等于假设
+     * "不保留来源就一定 rename"，而目标在挂载点/跨设备时实际走的是 copy
+     * （`moveMode` 由 `canRename` 决定），返回给界面的却是 rename：展示与事实相反。
+     */
+    /**
+     * 不写初值：阶段 0 拿到 `canRename` 就立即赋值（`:356`），而这之后才有人读它
+     * —— 写个 `= 'copy'` 只会是"无人读取的初值"（eslint `no-useless-assignment`）。
+     * `useRename` 则**必须**有初值：失败分支会在阶段 3 之前读它。
+     */
+    let moveMode: 'rename' | 'copy'
+    let useRename = false
     /** 阶段 2 归档出来的那条记录（阶段 3 失败时用它把当前版本搬回来） */
     let archivedByThisRun: { archiveId: string; versionTag: string; moveMode: 'rename' | 'copy' } | null =
       null
@@ -343,7 +358,7 @@ export function createRollbackService(deps: {
       if (!canRename) {
         log(`换版将使用复制模式：${mountInfo.reason ?? '目标位于挂载点/跨设备'}`, 'warn')
       }
-      const moveMode: 'rename' | 'copy' = canRename ? 'rename' : 'copy'
+      moveMode = canRename ? 'rename' : 'copy'
 
       await acquireRemoteLock({
         fs: input.ports.fs,
@@ -460,7 +475,7 @@ export function createRollbackService(deps: {
 
       // 保留来源 → 必须复制（rename 会把归档里的内容搬走，台账行就成了空壳）
       // 删除来源 → 优先 rename（快，且天然原子）
-      const useRename = !keepSource && moveMode === 'rename'
+      useRename = !keepSource && moveMode === 'rename'
       if (useRename) {
         await input.ports.fs.rename(artifactAt, remotePath)
       } else {
@@ -498,13 +513,24 @@ export function createRollbackService(deps: {
        * 顺带影响 `prevRelease()` 的挑选：它按 `status === 'SUCCESS'` 找上一版，
        * 被标掉的行不再参与 —— 正是我们要的（它的内容已经不在线上了）。
        */
-      const superseded = repo.releases
-        .listByTarget(target.id, 20)
-        .find((r) => r.id !== input.rollbackId && r.status === 'SUCCESS')
-      if (superseded) {
-        assertTransition(superseded.status as 'SUCCESS', 'ROLLED_BACK')
-        repo.releases.update(superseded.id, { status: 'ROLLED_BACK' })
-        log(`已把被取代的版本 ${superseded.versionTag} 标记为 ROLLED_BACK`)
+      /**
+       * M3：阶段 5 起的每一步都**各自兜底**（与发布侧 P0-1 同款）。
+       * 走到这里目标路径上已经是回滚后的正确内容，任何一步记账失败都只该告警，
+       * 不能让 `run()` 的 catch 把它记成 FAILED —— 用户看到 FAILED 会重试，
+       * 而重试会再归档一次（版本库多一份重复）。
+       */
+      try {
+        const superseded = repo.releases
+          .listByTarget(target.id, 20)
+          .find((r) => r.id !== input.rollbackId && r.status === 'SUCCESS')
+        if (superseded) {
+          assertTransition(superseded.status as 'SUCCESS', 'ROLLED_BACK')
+          repo.releases.update(superseded.id, { status: 'ROLLED_BACK' })
+          log(`已把被取代的版本 ${superseded.versionTag} 标记为 ROLLED_BACK`)
+        }
+      } catch (err) {
+        logger.error(`回滚已成功但标记被取代版本失败：${(err as Error).message}`)
+        log(`警告：未能把被取代的版本标记为 ROLLED_BACK（${(err as Error).message}）`, 'warn')
       }
 
       /**
@@ -516,16 +542,22 @@ export function createRollbackService(deps: {
        */
       if (artifactItems && artifactItems.length > 0) {
         if (artifactItems.length <= MAX_RELEASE_ITEMS_PERSIST) {
-          repo.releaseItems.addMany(
-            artifactItems.map((i) => ({
-              releaseId: input.rollbackId,
-              relPath: i.relPath,
-              hash: i.hash,
-              size: i.size,
-              mtime: i.mtime ?? null
-            }))
-          )
-          log(`已把所选版本的逐文件清单记入台账（${artifactItems.length} 条），下次发布可比对差异`)
+          try {
+            repo.releaseItems.addMany(
+              artifactItems.map((i) => ({
+                releaseId: input.rollbackId,
+                relPath: i.relPath,
+                hash: i.hash,
+                size: i.size,
+                mtime: i.mtime ?? null
+              }))
+            )
+            log(`已把所选版本的逐文件清单记入台账（${artifactItems.length} 条），下次发布可比对差异`)
+          } catch (err) {
+            // 明细是"锦上添花"：没有它只是下次发布要多算一次远端哈希，不该让回滚失败
+            logger.error(`回滚已成功但写入逐文件清单失败：${(err as Error).message}`)
+            log(`警告：逐文件清单未能写入台账（${(err as Error).message}），下次发布会现场计算`, 'warn')
+          }
         } else {
           log(
             `文件数 ${artifactItems.length} 超过 ${MAX_RELEASE_ITEMS_PERSIST}，本次不落逐文件清单`,
@@ -534,28 +566,57 @@ export function createRollbackService(deps: {
         }
       }
 
-      await finalizeSource({
-        keepSource,
-        row: { id: row.id, storagePath: row.storagePath, versionTag: row.versionTag },
-        fs: input.ports.fs,
-        log
-      })
+      try {
+        await finalizeSource({
+          keepSource,
+          row: { id: row.id, storagePath: row.storagePath, versionTag: row.versionTag },
+          fs: input.ports.fs,
+          log
+        })
+      } catch (err) {
+        logger.error(`回滚已成功但收尾来源版本失败：${(err as Error).message}`)
+        log(`警告：来源版本收尾失败（${(err as Error).message}），请执行「对账」修正`, 'warn')
+      }
 
-      repo.releases.update(input.rollbackId, { currentStep: rollbackStageText(6) })
+      try {
+        repo.releases.update(input.rollbackId, { currentStep: rollbackStageText(6) })
+      } catch (err) {
+        logger.error(`回滚已成功但更新当前步骤失败：${(err as Error).message}`)
+      }
 
       /* =============== 阶段 6：收尾（不允许抛错） =============== */
       stage = 6
       progressAt(6, 0, '收尾')
       /**
-       * **先真放掉锁、再把 lockHeld 置 false**。反过来（旧写法）会让"放锁失败"
-       * 被记成"锁已放掉"，补偿里的 `if (lockHeld)` 于是跳过重试，锁就留在服务器上了 ——
-       * 之后这个目标的所有发布都会被这把陈旧锁挡住。
+       * **按返回值判断是否真的放掉了锁**（M2）。`releaseRemoteLock` 不抛错，
+       * 所以只看"await 完了没有"是看不出成败的：放锁失败也得让 `lockHeld` 保持 true，
+       * 补偿里的 `if (lockHeld)` 才会再试一次并把它记进补偿清单 ——
+       * 否则锁留在服务器上，该目标之后的所有发布都会被陈旧锁挡住。
        */
-      await releaseRemoteLock(input.ports.fs, remotePath, log)
-      lockHeld = false
+      const released = await releaseRemoteLock(input.ports.fs, remotePath, log)
+      if (released) lockHeld = false
 
-      repo.releases.finish(input.rollbackId, 'SUCCESS')
-      repo.targets.markDeployed(target.id)
+      // M3：这两条是**成功后的记账**，任何一条抛错都不能进补偿 —— 走 catch 会执行
+      // `finish(...,'FAILED')`，把一次已经完成的回滚记成失败（服务器上的内容才是事实）。
+      // 与发布侧 P0-1 同款：各自兜底，前一条失败不连累后一条继续记账。
+      try {
+        repo.targets.markDeployed(target.id)
+      } catch (err) {
+        logger.error(
+          `回滚已成功但 markDeployed 失败（rollbackId=${input.rollbackId}），请执行对账修正：` +
+            `${(err as Error).message}`
+        )
+        log(`警告：回滚成功，但更新目标状态失败（${(err as Error).message}）`, 'warn')
+      }
+      try {
+        repo.releases.finish(input.rollbackId, 'SUCCESS')
+      } catch (err) {
+        logger.error(
+          `回滚已成功但台账收尾失败（rollbackId=${input.rollbackId}），请执行对账修正：` +
+            `${(err as Error).message}`
+        )
+        log(`警告：回滚成功，但写台账终态失败（${(err as Error).message}）`, 'warn')
+      }
       progressAt(6, 1, '回滚完成')
       log(`回滚完成：${remotePath} 现在是 ${row.versionTag}`)
 
@@ -595,7 +656,8 @@ export function createRollbackService(deps: {
         rollbackId: input.rollbackId,
         targetId: target.id,
         versionTag: row.versionTag,
-        moveMode: keepSource ? 'copy' : 'rename',
+        // L13：复用与成功分支同一个表达式 —— 挂载点 + 不保留来源时实际是 copy
+        moveMode: useRename ? 'rename' : 'copy',
         verified: !skipVerify,
         durationMs: Date.now() - started,
         failure
@@ -633,7 +695,14 @@ export function createRollbackService(deps: {
         'warn'
       )
     }
-    repo.archives.remove(inputFn.row.id)
+    // M3：摘台账行同样要兜底。目录已经删了、行没摘掉 → 版本库里留一条指向不存在
+    // 目录的记录（看起来还是 valid）；而抛出去会把一次**已经完成**的回滚记成 FAILED。
+    try {
+      repo.archives.remove(inputFn.row.id)
+    } catch (err) {
+      logger.error(`回滚后摘除归档台账行失败（archiveId=${inputFn.row.id}）：${(err as Error).message}`)
+      inputFn.log(`警告：版本库记录未能摘除，请执行「对账」修正：${(err as Error).message}`, 'warn')
+    }
     return { sourceRemoved: true }
   }
 
@@ -727,18 +796,20 @@ export function createRollbackService(deps: {
     if (lockHeld) {
       // 收尾阶段放锁失败时会走到这里再试一次。仍失败就**改成需要人工处理的指引**：
       // 这把锁会让该目标后续的发布一直被拒（E_DEPLOY_BLOCKED），用户必须知道去哪儿清。
-      try {
-        await releaseRemoteLock(args.input.ports.fs, remotePath, args.log)
-      } catch (e) {
+      // 成败看返回值（releaseRemoteLock 不抛错）—— 否则"没放掉"会被记成放掉了。
+      const released = await releaseRemoteLock(args.input.ports.fs, remotePath, args.log)
+      if (released) {
+        args.compensations.push({ action: 'release-lock', ok: true })
+      } else {
         code = ErrorCode.E_LOCK_STALE
         hint = '远端锁未能自动释放。请到「往期版本 → 对账」清理该目标的锁后再重试。'
         args.compensations.push({
           action: 'release-lock',
           ok: false,
-          detail: (e as Error).message
+          detail: '远端锁未能自动释放'
         })
         args.log(
-          `补偿失败：远端锁未能释放（${(e as Error).message}）。请到「往期版本 → 对账」清理该目标的锁。`,
+          '补偿失败：远端锁未能释放。请到「往期版本 → 对账」清理该目标的锁。',
           'error'
         )
       }

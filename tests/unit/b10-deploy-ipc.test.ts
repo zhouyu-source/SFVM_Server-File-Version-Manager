@@ -184,6 +184,8 @@ describe('发布 IPC 接线（T10.12）', () => {
   }
   let openCalls: string[]
   let busyLog: Array<{ connectionId: string; busy: boolean }>
+  /** S2：每次 `openPorts` 拿到的通道被 `release()` 掉时记一笔（通道泄漏的哨兵） */
+  let releasedIds: string[]
 
   beforeEach(() => {
     t = makeTestDb()
@@ -192,6 +194,7 @@ describe('发布 IPC 接线（T10.12）', () => {
     remote = new MiniRemote()
     openCalls = []
     busyLog = []
+    releasedIds = []
 
     const seeded = seedBasic(repo, { kind: 'dir', remotePath: '/opt/app/dist' })
     targetId = seeded.target.id
@@ -233,7 +236,13 @@ describe('发布 IPC 接线（T10.12）', () => {
       hostname: () => 'builder.local',
       openPorts: async (id: string): Promise<OpenedPorts> => {
         openCalls.push(id)
-        return { connectionId: 'conn-1', ports: { fs: remote.asFsPort() } as unknown as DeployPorts }
+        // S2：真实 `createDeployPortsOpener` 会给出 release；这里给一个哨兵，
+        // 好让"每次开的通道都被还回去了"在单测里可见
+        return {
+          connectionId: 'conn-1',
+          ports: { fs: remote.asFsPort() } as unknown as DeployPorts,
+          release: () => releasedIds.push(id)
+        }
       }
     })
   })
@@ -264,6 +273,8 @@ describe('发布 IPC 接线（T10.12）', () => {
     expect(deploy.precheck).toHaveBeenCalledTimes(1)
     expect(deploy.precheck.mock.calls[0]?.[0]).toMatchObject({ targetId })
     expect(openCalls).toEqual([targetId])
+    // S2：一次 precheck = 一条通道，用完必须还回去
+    expect(releasedIds).toEqual([targetId])
   })
 
   it('deploy.start：起一个目标车道的 deploy 任务，releaseId 就是任务 id，期间连接标记 busy', async () => {
@@ -299,6 +310,8 @@ describe('发布 IPC 接线（T10.12）', () => {
       { connectionId: 'conn-1', busy: false }
     ])
     expect(jobs.get(view.jobId)?.status).toBe('succeeded')
+    // S2：发布跑完后这条通道必须被还回去 —— 否则一次发布就在服务器上留一条 session
+    expect(releasedIds).toEqual([targetId])
   })
 
   it('deploy.run 返回 ok:false 时任务必须记成失败（B11 回归：曾经被记成"已完成"）', async () => {
@@ -420,6 +433,8 @@ describe('发布 IPC 接线（T10.12）', () => {
     // 清理用的是**一条新通道**（openPorts 被再次调用），不是那条已经卡死的旧通道
     await waitFor(() => remote.has(staging) === false)
     expect(openCalls.length).toBeGreaterThanOrEqual(2)
+    // S2：开的每一条通道（发布那条 + 补偿那条）都要还回去，一条都不能留在池里
+    expect(releasedIds.length).toBe(openCalls.length)
     expect(remote.has(myLock)).toBe(false)
     // busy 也要放掉（run 卡住时只有 cleanup 能放）
     expect(busyLog.at(-1)).toEqual({ connectionId: 'conn-1', busy: false })

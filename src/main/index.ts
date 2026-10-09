@@ -2,7 +2,13 @@ import { app, BrowserWindow, dialog, shell } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
-import { initLogger, logFilePath, logger, setLogLevel } from './infra/logger'
+import {
+  initLogger,
+  logFilePath,
+  logger,
+  SCRIPT_RUNS_DIR_NAME,
+  setLogLevel
+} from './infra/logger'
 import {
   cleanupAbandonedDataDir,
   clearDataLocation,
@@ -434,12 +440,6 @@ if (!gotLock) {
       // T15.2：新建目标时继承设置里的默认保留策略
       defaultRetainPolicy: () => settingsService.current().defaultRetainPolicy
     })
-    registerWorkspaceHandlers({
-      workspace: workspaceService,
-      connections: connectionService,
-      pool,
-      repo
-    })
 
     // B08：任务编排（队列 + 进度推送 + 退出保护）
     //
@@ -450,6 +450,16 @@ if (!gotLock) {
     detachJobPush = attachJobEventPush({ jobs: jobService })
     registerJobHandlers({ jobs: jobService })
     jobGuard = createJobGuard({ jobs: jobService })
+
+    // 工作区 handler 放在任务服务之后：删除目标 / 环境前要查"这个目标上有没有任务在跑"
+    // （M8，`assertTargetIdle`），而这个判断依赖 `jobService`。
+    registerWorkspaceHandlers({
+      workspace: workspaceService,
+      connections: connectionService,
+      pool,
+      repo,
+      jobs: jobService
+    })
 
     // B09：往期版本（归档 / 校验 / 保留策略）+ B12：下载 / 明细 / 手工删除
     // 归档与校验都要远端 SFTP，因此与工作区一样依赖连接池；端口在主进程接线层组装
@@ -523,22 +533,20 @@ if (!gotLock) {
 
     // B20：自定义脚本（本机 / 服务器各能跑一条，留档在 script_runs）
     // 依赖 JobService（脚本以任务形式跑，与同目标的发布/回滚**共用车道**即天然互斥）
+    //
+    // 注意：这里只注册**只读**通道（能力探测 / 运行记录）。执行入口是 B21 的流水线
+    // ——`scripts.runStep` 早已在渲染层无人调用，已按 M15 删除（见 `ipc/script.ts` 文件头）。
     const scriptService = createScriptService({
       repo,
       // 总闸现取：用户随时可能关掉，而"关掉之后正在排队的任务也不该再跑"要靠它
       allowUserScripts: () => allowUserScripts(),
       gitBashPath: () => settingsService.current().gitBashPath,
-      // 完整输出落在数据目录的日志区（B18 起日志跟着数据目录走）
+      // 完整输出落在数据目录的日志区（B18 起日志跟着数据目录走）。
+      // 目录名与 `pruneOldLogs()` 共用同一个常量（M13：那份输出也要按保留期清）。
       runsDir: () =>
-        join(logDirOf(openedDataDir() ?? app.getPath('userData')), 'script-runs')
+        join(logDirOf(openedDataDir() ?? app.getPath('userData')), SCRIPT_RUNS_DIR_NAME)
     })
-    registerScriptHandlers({
-      scripts: scriptService,
-      jobs: jobService,
-      connections: connectionService,
-      pool,
-      repo
-    })
+    registerScriptHandlers({ scripts: scriptService })
 
     // B21：自动化流水线（多步骤编排，发布可作为其中一环）
     //
@@ -551,7 +559,8 @@ if (!gotLock) {
       deploy: createPipelineDeployPort({
         openPorts: deployPortsOpener,
         deploy: deployService,
-        pool
+        pool,
+        repo
       }),
       allowUserScripts: () => allowUserScripts()
     })

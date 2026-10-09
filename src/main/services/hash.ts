@@ -50,6 +50,17 @@ import type {
 /** 本地哈希的分块大小（方案书 §6.6 指定 64 KB）。 */
 export const HASH_CHUNK_SIZE = 64 * 1024
 
+/**
+ * 远端"清单校验"（`sha256sum -c` / `shasum -a 256 -c`）的超时（L2）。
+ *
+ * 与 `execRaw` 的默认值同档（5 分钟）：它和用户脚本一样属于"耗时随数据量增长"的
+ * 那一类命令。连接层的 15 秒默认值只适合 `df` / `chmod` / `test -w` 这种秒回命令。
+ *
+ * 仍在等真实产物规模数据来校准（方案书 §四-3：多大规模的大目录会超过多久），
+ * 所以先取一个**明显不会再误伤**的值，而不是继续用 15 秒。
+ */
+export const HASH_VERIFY_TIMEOUT_MS = 300_000
+
 /** 目录递归层级上限，防御异常目录结构。 */
 export const MAX_WALK_DEPTH = 64
 
@@ -355,8 +366,16 @@ export interface RemoteHashPort {
   writeTextFile(remoteAbsPath: string, content: string): Promise<void>
   /** 删除远端文件；失败不致命（临时目录会另行清理） */
   removeFile(remoteAbsPath: string): Promise<void>
-  /** 执行一条**已经白名单化**的命令 */
-  runCommand(cmd: string): Promise<{ stdout: string; stderr: string; code: number | null }>
+  /**
+   * 执行一条**已经白名单化**的命令。
+   *
+   * `timeoutMs` 只给"按产物规模合法地跑很久"的那一条（清单校验）用 ——
+   * 默认超时是连接层的 15 秒，对大目录哈希明显偏短（L2）。
+   */
+  runCommand(
+    cmd: string,
+    timeoutMs?: number
+  ): Promise<{ stdout: string; stderr: string; code: number | null }>
   /** 打开远端文件读流（降级路径） */
   readStream(remoteAbsPath: string): NodeJS.ReadableStream
   /** 递归列出远端目录下的文件（相对路径 + 大小 [+ mtime]） */
@@ -468,7 +487,10 @@ async function verifyViaCommand(
   }
   try {
     await port.writeTextFile(manifestPath, content)
-    const res = await port.runCommand(cmd)
+    // L2：`sha256sum -c` 的耗时**与产物规模成正比**，是最常撞超时的一条。
+    // 连接层的默认 15 秒是给 `df` / `chmod` 那种"秒回"命令定的，对大目录哈希
+    // 明显偏短；这里显式给一个与"用户脚本"同档的长超时。
+    const res = await port.runCommand(cmd, HASH_VERIFY_TIMEOUT_MS)
     outcome.stdout = res.stdout
     outcome.stderr = res.stderr
     outcome.code = res.code
@@ -753,8 +775,14 @@ export async function listRemoteFiles(
 export interface CreateSftpHashPortInput {
   /** ssh2 的 SFTPWrapper；结构性匹配由调用方断言 */
   sftp: HashSftpLike
-  /** 执行已白名单化命令的函数（通常来自 SshConnectionPool.exec 的绑定版本） */
-  exec: (cmd: string) => Promise<{ stdout: string; stderr: string; code: number | null }>
+  /**
+   * 执行已白名单化命令的函数（通常来自 SshConnectionPool.exec 的绑定版本）。
+   * `timeoutMs` 缺省时用连接层自己的默认值。
+   */
+  exec: (
+    cmd: string,
+    timeoutMs?: number
+  ) => Promise<{ stdout: string; stderr: string; code: number | null }>
   capability: RemoteHashPort['capability']
   tmpDir: string
 }
@@ -808,9 +836,9 @@ export function createSftpHashPort(input: CreateSftpHashPortInput): RemoteHashPo
     },
     writeTextFile,
     removeFile,
-    async runCommand(cmd: string) {
+    async runCommand(cmd: string, timeoutMs?: number) {
       assertCommandAllowed(cmd)
-      return input.exec(cmd)
+      return input.exec(cmd, timeoutMs)
     },
     readStream(remoteAbsPath: string) {
       return sftp.createReadStream(normalizeRemotePath(remoteAbsPath), {

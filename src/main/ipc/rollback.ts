@@ -59,6 +59,8 @@ export interface RollbackIpcDeps {
     connectionId: string
     ports: DeployPorts
     rollbackPorts: RollbackPorts
+    /** 释放这条通道（S2）；单测注入的假端口没有，调用方写 `?.()` */
+    release?: () => void
   }>
 }
 
@@ -77,6 +79,7 @@ export function registerRollbackHandlers(deps: RollbackIpcDeps): void {
     connectionId: string
     ports: DeployPorts
     rollbackPorts: RollbackPorts
+    release: () => void
   }> {
     const target = repo.targets.get(targetId)
     if (!target) throw new AppError(ErrorCode.E_NOT_FOUND, { targetId })
@@ -97,18 +100,20 @@ export function registerRollbackHandlers(deps: RollbackIpcDeps): void {
       throw new AppError(ErrorCode.E_CONN_LOST, { connectionId, reason: 'capability-missing' })
     }
 
-    const sftp = (await pool.sftp(connectionId)) as unknown as DeploySftpLike
+    // S2：通道的释放权交给调用方（回滚 + 补偿都要用同一批端口）
+    const { sftp: rawSftp, release } = await pool.openChannel(connectionId)
+    const sftp = rawSftp as unknown as DeploySftpLike
     const ports = createSftpDeployPorts({
       sftp,
       capability,
       tmpDir: joinRemote(normalizeRemotePath(capability.homeDir?.trim() || '/tmp'), '.sfvm-tmp'),
-      exec: (cmd) => pool.exec(connectionId, cmd),
+      exec: (cmd, timeoutMs) => pool.exec(connectionId, cmd, timeoutMs),
       hostname: hostname()
     })
 
     // `DeployPorts` 在结构上就满足 `RollbackPorts`（多出来的 `transfer` 用不上），
     // 这里原样传即可 —— 不写 `as` 是为了让"哪天两边端口形状真不一致"变成编译错误。
-    return { connectionId, ports, rollbackPorts: ports }
+    return { connectionId, ports, rollbackPorts: ports, release }
   }
 
   const openPorts = deps.openPorts ?? openPortsDefault
@@ -168,6 +173,8 @@ export function registerRollbackHandlers(deps: RollbackIpcDeps): void {
           return outcome
         } finally {
           pool.setBusy(opened.connectionId, false)
+          // S2：这次回滚的通道到此为止（补偿走的是 cleanup 里另开的那条）
+          opened.release?.()
         }
       },
       async cleanup(reason, ctx) {
@@ -176,27 +183,32 @@ export function registerRollbackHandlers(deps: RollbackIpcDeps): void {
         try {
           // 新开一条通道：失败/取消时旧通道很可能已经不可用
           const opened = await openPorts(input.targetId)
-          pool.setBusy(opened.connectionId, false)
-
-          /**
-           * 回滚不像发布那样有暂存目录要清 —— 它只可能留下**锁**。
-           *
-           * 而且只删"锁里写的正是本次任务"的那把：不这么判就等于给了任务层
-           * 一个删别人锁的开关（另一台机器可能正在发布）。
-           */
-          const remotePath = normalizeRemotePath(t.remotePath)
-          const lockPath = lockPathOf(remotePath)
           try {
-            const text = await opened.ports.fs.readTextFile(lockPath)
-            const lock = parseLockPayload(text, new Date())
-            if (lock?.releaseId === ctx.jobId) {
-              await opened.ports.fs.removeFile(lockPath)
-              ctx.log(`已释放远端锁（${reason}）`, 'warn')
-            } else if (lock) {
-              ctx.log(`远端锁属于另一次操作（releaseId=${lock.releaseId}），不清理`, 'warn')
+            pool.setBusy(opened.connectionId, false)
+
+            /**
+             * 回滚不像发布那样有暂存目录要清 —— 它只可能留下**锁**。
+             *
+             * 而且只删"锁里写的正是本次任务"的那把：不这么判就等于给了任务层
+             * 一个删别人锁的开关（另一台机器可能正在发布）。
+             */
+            const remotePath = normalizeRemotePath(t.remotePath)
+            const lockPath = lockPathOf(remotePath)
+            try {
+              const text = await opened.ports.fs.readTextFile(lockPath)
+              const lock = parseLockPayload(text, new Date())
+              if (lock?.releaseId === ctx.jobId) {
+                await opened.ports.fs.removeFile(lockPath)
+                ctx.log(`已释放远端锁（${reason}）`, 'warn')
+              } else if (lock) {
+                ctx.log(`远端锁属于另一次操作（releaseId=${lock.releaseId}），不清理`, 'warn')
+              }
+            } catch {
+              // 读不到 = 没有锁，正常
             }
-          } catch {
-            // 读不到 = 没有锁，正常
+          } finally {
+            // S2：这次补偿用的通道用完就关
+            opened.release?.()
           }
         } catch (err) {
           // 清理失败只记日志：不能覆盖原始失败原因（方案书 §6.11）

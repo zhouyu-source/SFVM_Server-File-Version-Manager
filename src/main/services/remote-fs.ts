@@ -19,6 +19,12 @@ import { STAGING_PREFIX } from '../../shared/contracts/deploy'
 /** 只用到 SFTPWrapper 的这几个方法，便于测试替身。 */
 export interface SftpLike {
   stat(path: string, cb: (err: Error | undefined | null, stats: Stats) => void): void
+  /**
+   * 与 `stat` 的区别是**不跟随符号链接**（SSH_FXP_LSTAT）。
+   * `rmrf` 的安全判定必须用它：`stat` 会把 `current -> releases/xxx` 解析成
+   * 一个普通目录，于是"删 current"变成"删掉 releases/xxx 里面的全部内容"。
+   */
+  lstat(path: string, cb: (err: Error | undefined | null, stats: Stats) => void): void
   readdir(
     path: string,
     cb: (err: Error | undefined | null, list: Array<{ filename: string; attrs: Stats }>) => void
@@ -42,6 +48,13 @@ export interface RemoteEntry {
 export interface RemoteStat {
   exists: boolean
   isDirectory: boolean
+  /**
+   * 是否符号链接。只有 `lstat` 会给出真实值 —— `stat` 跟随链接，
+   * 拿到的永远是被指向目标的形态（这正是 S3 的成因）。
+   *
+   * 可选是为了不逼着每个假实现都补字段；`lstat()` 一定给值。
+   */
+  isSymbolicLink?: boolean
   size: number
   mtime?: string
   mode?: number
@@ -162,6 +175,37 @@ export function createRemoteFs(sftp: SftpLike) {
     return (await stat(path)).exists
   }
 
+  /**
+   * lstat：与 `stat` 相同的返回形态，但**不跟随符号链接**。
+   *
+   * 存在的理由只有一个：`rmrf` 必须能分辨"这本身是一个链接"。
+   * `stat` 会把它解析成被指向的那个目录，于是"删掉 current"就变成
+   * "删掉 releases/xxx 里的全部内容" —— 不可逆，且路径上完全看不出来。
+   */
+  async function lstat(path: string): Promise<RemoteStat> {
+    const p = normalizeRemotePath(path)
+    try {
+      const s = await new Promise<Stats>((resolve, reject) => {
+        sftp.lstat(p, (err, stats) => (err ? reject(err) : resolve(stats)))
+      })
+      return {
+        exists: true,
+        isDirectory: s.isDirectory(),
+        isSymbolicLink: s.isSymbolicLink(),
+        size: s.size ?? 0,
+        mtime: toIso(s.mtime),
+        mode: s.mode,
+        uid: s.uid,
+        gid: s.gid
+      }
+    } catch (err) {
+      if (isNoSuchFile(err)) {
+        return { exists: false, isDirectory: false, isSymbolicLink: false, size: 0 }
+      }
+      throw new AppError(ErrorCode.E_CONN_LOST, { path: p, original: (err as Error).message })
+    }
+  }
+
   async function readdir(
     path: string
   ): Promise<Array<{ name: string; isDirectory: boolean; size: number; mtime?: string }>> {
@@ -241,6 +285,9 @@ export function createRemoteFs(sftp: SftpLike) {
    *    （如 `/var2`、`/srv`、`/tmp` 本身）
    * 3. 递归深度上限，防御异常目录结构
    *
+   * 上面三层全是**字符串形态**判定，看不见空间重定向 —— 所以还有第 4 层：
+   * **顶层是符号链接就拒绝**（用 `lstat` 判定，见下）。
+   *
    * 顺序刻意如此：先名单后层级，让名单命中时能给出更直白的错误文案。
    */
   async function rmrf(path: string): Promise<void> {
@@ -263,6 +310,29 @@ export function createRemoteFs(sftp: SftpLike) {
       )
     }
 
+    /**
+     * **符号链接一律拒绝整树删除**（S3）。
+     *
+     * `stat` 跟随链接：目标路径被配成 `current -> releases/20261009-xxx` 时
+     * （生产上极常见的"当前版本指针"写法），`stat` 报它是一个普通目录，
+     * 于是下面的递归会顺着链接读进 `releases/xxx` 并把内容逐个删掉 ——
+     * 链接本身还在，指向的东西没了。
+     *
+     * "删链接本身"这件事本工具也不做：`unlink` 一个指向目录的链接需要
+     * 调用方先确认它指向哪里，这不是工具能替人判断的。
+     */
+    const lst = await lstat(p)
+    if (lst.isSymbolicLink) {
+      throw new AppError(
+        ErrorCode.E_PATH_UNSAFE,
+        { path: p, reason: 'refuse-rm-symlink' },
+        {
+          message: `拒绝删除符号链接：${p}（它指向别处，本工具不会顺着链接删内容，也不会替你删这个链接）`,
+          hint: '请先人工确认它指向哪里，再决定是否手工处理。'
+        }
+      )
+    }
+
     await removeRecursive(p, 0)
   }
 
@@ -270,7 +340,9 @@ export function createRemoteFs(sftp: SftpLike) {
     if (depth > MAX_DEPTH) {
       throw new AppError(ErrorCode.E_UNKNOWN, { path, reason: 'max-depth-exceeded' })
     }
-    const st = await stat(path)
+    // 用 lstat 而不是 stat：**里层**的符号链接也绝不能被当成目录递归进去。
+    // 顶层已在 rmrf 里拦过，这里是同一条规矩的延续（且不额外多一次系统调用）。
+    const st = await lstat(path)
     if (!st.exists) return
 
     if (!st.isDirectory) {
@@ -349,6 +421,7 @@ export function createRemoteFs(sftp: SftpLike) {
 
   return {
     stat,
+    lstat,
     exists,
     readdir,
     mkdirp,

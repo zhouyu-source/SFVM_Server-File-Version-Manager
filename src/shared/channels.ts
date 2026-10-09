@@ -163,8 +163,6 @@ export const IPC_CHANNELS = {
    * 只有一个答案来源。
    */
   SCRIPTS_CAPABILITIES: 'scripts.capabilities',
-  /** 跑一条脚本（本机或服务器）：内部走 JobService（可取消、进度与日志进任务台） */
-  SCRIPTS_RUN_STEP: 'scripts.runStep',
   /** 某个目标的运行记录（**纯读台账**，不连服务器） */
   SCRIPTS_RUNS: 'scripts.runs',
   /** 一次运行的详情：每步的状态 / 退出码 / 耗时 / 输出尾部 */

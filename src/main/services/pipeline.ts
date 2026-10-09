@@ -36,7 +36,7 @@ import { hostname as osHostname } from 'node:os'
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
 import { auditRunFinished, auditRunStarted } from './script-audit'
-import type { JobContext, JobProgressInput, JobSpec } from './job'
+import type { JobCleanupReason, JobContext, JobProgressInput, JobSpec } from './job'
 import type { JobLogLevel } from '../../shared/contracts/job'
 import type { RawExecFn } from './script-runner'
 import type { Repositories } from '../db/repositories'
@@ -66,16 +66,31 @@ import type { ScriptRunStatus } from '../../shared/contracts/script'
 /* -------------------------------------------------------------------- 端口 */
 
 /**
- * 发布步骤要走的那两条路。
+ * 发布步骤要走的那几条路。
  *
  * **必须是"直接调用"而不是"再建一个任务"** —— 任务框架按 `t:<targetId>` 分车道、
  * 同车道串行，而整条流水线自己就占着那条车道，再建任务就是排在队尾永远轮不到，
- * 也就是自锁死锁（T21.3）。所以这里注入的是 `precheck` 与 `run` 两个**函数**，
+ * 也就是自锁死锁（T21.3）。所以这里注入的是 `precheck` / `run` 两个**函数**，
  * 由接线层（`ipc/pipeline.ts`）实现成"开端口 → 标记连接 busy → 调用服务"。
  */
 export interface PipelineDeployPort {
   precheck(targetId: string): Promise<DeployPrecheckReport>
   run(input: { targetId: string; ctx: JobContext; releaseId: string }): Promise<DeployOutcome>
+  /**
+   * 发布步骤失败/取消后的**第二道清理**（M6）：另开一条新通道，按 `jobId`
+   * 删掉本次的暂存目录、并按 `releaseId === jobId` 精确放锁。
+   *
+   * 为什么必须单独一条：`deploy.run()` 自己的补偿用的是**那条已经出问题的通道**
+   * （断链/超时/被回收），它在服务器上什么也做不了。直接点发布时这道保险
+   * 一直在（`ipc/deploy.ts` 的 `cleanup`），流水线曾经完全没有 ——
+   * 于是流水线发布失败后残留只能等锁自然过期或人工走对账。
+   */
+  cleanupResidue(input: {
+    targetId: string
+    jobId: string
+    reason: JobCleanupReason
+    log: (text: string, level?: JobLogLevel) => void
+  }): Promise<void>
 }
 
 export interface PipelineServiceDeps {
@@ -668,6 +683,23 @@ export function createPipelineService(deps: PipelineServiceDeps): PipelineServic
           )
         }
         return scripts.detail(runId)
+      },
+      /**
+       * 第二道清理（M6）：只对**含发布步骤**的流水线有意义 ——
+       * 纯脚本步骤不碰远端暂存目录，也没有发布锁。
+       *
+       * 走到这里说明任务失败 / 被取消 / 放弃退出（成功不会走 cleanup，
+       * 见 `job.ts` 的 `execute()`）。清理失败不抛错（`cleanupDeployResidue`
+       * 内部吞掉），否则会覆盖原始失败原因。
+       */
+      async cleanup(reason, ctx) {
+        if (!args.steps.some((s) => s.kind === 'deploy')) return
+        await deps.deploy.cleanupResidue({
+          targetId: args.targetId,
+          jobId: ctx.jobId,
+          reason,
+          log: (text, level) => ctx.log(text, level)
+        })
       }
     }
   }

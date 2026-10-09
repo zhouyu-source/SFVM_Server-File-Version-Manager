@@ -7,6 +7,11 @@
  * 2. **把"跑一条脚本"包成任务**（`stepJob`）。任务化不是形式主义：它白拿三件事 ——
  *    可取消、进度与日志进底部任务台、与同目标的发布/回滚**天然互斥**
  *    （任务按 `t:<targetId>` 分车道、同车道串行）。
+ *    **注意**：B21 起脚本执行的入口只有流水线（`services/pipeline.ts` 的 `jobOf`），
+ *    单条脚本那条 IPC（`scripts.runStep`）已按 M15 删除。`stepJob` 因此暂时没有
+ *    生产调用方 —— 保留它是为了不把 `b20-script.test.ts` 里那批"总闸 / 留档 /
+ *    失败必须抛错"的语义测试连根拔掉（那批测试正是靠它当载具）。真要连同
+ *    服务层一起清掉时，得先把那些断言迁到 `runScriptStep` + 流水线任务上。
  * 3. **留档**：把每次运行写进 `script_runs` / `script_step_runs`。任务框架不保留
  *    `run()` 的返回值、也不落库，所以**这里**才是"上次那步成没成、退出码多少"的答案。
  *
@@ -90,7 +95,7 @@ export interface ScriptJobIo {
   /**
    * 打开远端执行通道。**懒开**：只有任务真的跑起来才连服务器。
    *
-   * 若在 `scripts.runStep` 的 IPC 里就连服务器，那么"连不上"会变成一次普通的
+   * 若在建任务的那个 IPC handler 里就连服务器，那么"连不上"会变成一次普通的
    * IPC 失败 —— 任务台里什么都不留，用户看不到任何线索。放进 `run()` 里则
    * 变成一次**任务失败**，带日志、带错误码，与发布的行为一致。
    */
@@ -99,7 +104,13 @@ export interface ScriptJobIo {
 
 export interface ScriptService {
   capabilities(): ScriptCapabilities
-  /** 构造"跑一条脚本"的任务规格（B21 的流水线用 `pipelineJob`，不走这里） */
+  /**
+   * 构造"跑一条脚本"的任务规格。
+   *
+   * **当前没有生产调用方**（B21 的流水线有自己的 `jobOf`，不走这里；单条脚本的
+   * IPC 通道已按 M15 删除）。留着它是为了 `b20-script.test.ts` 那批语义测试的载具，
+   * 详见文件头第 2 条。
+   */
   stepJob(input: ScriptRunStepInput, io: ScriptJobIo): JobSpec
   list(targetId: string, limit?: number): ScriptRunView[]
   detail(runId: string): ScriptRunView
@@ -376,6 +387,14 @@ export function createScriptService(deps: ScriptServiceDeps): ScriptService {
     let path: string | null = null
     let bytes = 0
     let truncated = false
+    /**
+     * L3：`close()` 之后这个 sink 就**封口**了。
+     *
+     * 不封口的话 `write()` 会看到 `fd === null` 而重新 `openSync(path,'a')` ——
+     * 那是一个**再没人关**的 fd（取消/超时路径上 `close()` 已经跑过），
+     * 连续触发就是稳定的句柄泄漏。落在封口之后的输出也没有接收方了：直接丢。
+     */
+    let finalized = false
 
     return {
       get outputPath() {
@@ -388,6 +407,7 @@ export function createScriptService(deps: ScriptServiceDeps): ScriptService {
         return truncated
       },
       write(text: string): void {
+        if (finalized) return
         bytes += Buffer.byteLength(text, 'utf8')
         if (truncated) return
         try {
@@ -415,6 +435,7 @@ export function createScriptService(deps: ScriptServiceDeps): ScriptService {
         }
       },
       close(): void {
+        finalized = true
         if (fd !== null) {
           try {
             closeSync(fd)

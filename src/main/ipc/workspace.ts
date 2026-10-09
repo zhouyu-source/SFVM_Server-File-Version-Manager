@@ -12,6 +12,7 @@ import { z } from 'zod'
 import { registerHandler } from '../infra/ipc'
 import { logger } from '../infra/logger'
 import { AppError, ErrorCode } from '../infra/errors'
+import { assertTargetIdle } from './target-busy'
 import { IPC_CHANNELS } from '../../shared/channels'
 import {
   environmentInputSchema,
@@ -28,6 +29,7 @@ import type { WorkspaceService } from '../services/workspace'
 import type { ConnectionService } from '../services/connection'
 import type { SshConnectionPool } from '../services/ssh-client'
 import { createRemoteFs, type SftpLike } from '../services/remote-fs'
+import type { JobService } from '../services/job'
 import type { Repositories } from '../db/repositories'
 
 const idSchema = z.object({ id: z.string().min(1) })
@@ -37,10 +39,12 @@ export interface WorkspaceIpcDeps {
   connections: ConnectionService
   pool: SshConnectionPool
   repo: Repositories
+  /** 删除目标 / 环境前要确认该目标上没有任务在跑（M8） */
+  jobs: JobService
 }
 
 export function registerWorkspaceHandlers(deps: WorkspaceIpcDeps): void {
-  const { workspace, connections, pool, repo } = deps
+  const { workspace, connections, pool, repo, jobs } = deps
   const { environments, targets } = workspace
 
   /* ------------------------------------------------------------- 环境 */
@@ -59,8 +63,20 @@ export function registerWorkspaceHandlers(deps: WorkspaceIpcDeps): void {
   /**
    * 删除环境：只删本机配置与台账索引。
    * 返回值里带上被级联删除的目标数，便于 UI 反馈与审计。
+   *
+   * M8：**级联删除会把该环境下所有目标的台账（含 releases / archives）一起删掉**，
+   * 而正在跑的任务不会因此停下 —— 它收尾时会往一个 `target_id` 已不存在的表里写孤儿行，
+   * 任务台显示"已完成"但结果查不到、也无法回滚；任务的 `cleanup()` 还会因为
+   * `repo.targets.get()` 返回空而跳过放锁，把远端锁留在服务器上。
+   * 所以这里先逐个检查该环境下的目标是否空闲，任何一个在跑就整体拒绝。
    */
   registerHandler(IPC_CHANNELS.ENV_REMOVE, idSchema, ({ id }) => {
+    for (const t of targets.list(id)) {
+      assertTargetIdle(jobs, t.id, {
+        action: '删除该环境',
+        hint: `目标「${t.name}」上还有任务在跑。请等它结束，或先在底部任务控制台取消它。`
+      })
+    }
     const r = environments.remove(id)
     repo.audit.write({
       level: 'info',
@@ -90,6 +106,12 @@ export function registerWorkspaceHandlers(deps: WorkspaceIpcDeps): void {
     ({ id, patch }) => targets.update(id, patch)
   )
   registerHandler(IPC_CHANNELS.TARGETS_REMOVE, idSchema, ({ id }) => {
+    // M8：该目标上有任务在跑时不允许删除 —— 见 ENV_REMOVE 的同款说明。
+    // 服务端也拦一道（不只靠 UI 禁用按钮）：IPC 通道可以被其它窗口/脚本直接调用。
+    assertTargetIdle(jobs, id, {
+      action: '删除该目标',
+      hint: '请等它结束，或先在底部任务控制台取消它。'
+    })
     const r = targets.remove(id)
     repo.audit.write({
       level: 'info',
@@ -268,48 +290,52 @@ export function registerWorkspaceHandlers(deps: WorkspaceIpcDeps): void {
     }
 
     const capability = pool.capabilityOf(connId)
-    const sftp = (await pool.sftp(connId)) as unknown as SftpLike
-    const fs = createRemoteFs(sftp)
 
-    try {
-      const [targetStat, parentStat, archiveStat] = await Promise.all([
-        fs.stat(remotePath),
-        fs.stat(parent),
-        fs.stat(archiveDir)
-      ])
+    // S2：体检只在这条通道的**作用域**内读远端事实 —— 以前这条通道开完就再也不关，
+    // 一次体检 = 一条永久占用的 session，累计几次就撞上 sshd 的 MaxSessions。
+    return pool.withSftp(connId, async (rawSftp) => {
+      const fs = createRemoteFs(rawSftp as unknown as SftpLike)
 
-      // 归档目录下既存版本数量（用于提示"可对账导入"）
-      let existingVersions = 0
-      if (archiveStat.exists && archiveStat.isDirectory) {
-        try {
-          const entries = await fs.readdir(archiveDir)
-          existingVersions = entries.filter((e) => e.isDirectory).length
-        } catch {
-          existingVersions = 0
+      try {
+        const [targetStat, parentStat, archiveStat] = await Promise.all([
+          fs.stat(remotePath),
+          fs.stat(parent),
+          fs.stat(archiveDir)
+        ])
+
+        // 归档目录下既存版本数量（用于提示"可对账导入"）
+        let existingVersions = 0
+        if (archiveStat.exists && archiveStat.isDirectory) {
+          try {
+            const entries = await fs.readdir(archiveDir)
+            existingVersions = entries.filter((e) => e.isDirectory).length
+          } catch {
+            existingVersions = 0
+          }
+        }
+
+        return {
+          connectionOk: true,
+          capability,
+          targetExists: targetStat.exists,
+          targetIsDirectory: targetStat.exists ? targetStat.isDirectory : undefined,
+          // 父目录不存在也视为不可写（无法在其下创建 .versions）
+          parentWritable: parentStat.exists && parentStat.isDirectory,
+          archiveDirExists: archiveStat.exists && archiveStat.isDirectory,
+          existingVersions
+        }
+      } catch (e) {
+        logger.warn(`health check probe failed: ${(e as Error).message}`)
+        return {
+          connectionOk: true,
+          capability,
+          targetExists: false,
+          parentWritable: false,
+          archiveDirExists: false,
+          existingVersions: 0
         }
       }
-
-      return {
-        connectionOk: true,
-        capability,
-        targetExists: targetStat.exists,
-        targetIsDirectory: targetStat.exists ? targetStat.isDirectory : undefined,
-        // 父目录不存在也视为不可写（无法在其下创建 .versions）
-        parentWritable: parentStat.exists && parentStat.isDirectory,
-        archiveDirExists: archiveStat.exists && archiveStat.isDirectory,
-        existingVersions
-      }
-    } catch (e) {
-      logger.warn(`health check probe failed: ${(e as Error).message}`)
-      return {
-        connectionOk: true,
-        capability,
-        targetExists: false,
-        parentWritable: false,
-        archiveDirExists: false,
-        existingVersions: 0
-      }
-    }
+    })
   }
 
   /** 仅在用户明确选择"现在创建空目录"时调用。 */
@@ -318,9 +344,11 @@ export function registerWorkspaceHandlers(deps: WorkspaceIpcDeps): void {
     if (!env) throw new AppError(ErrorCode.E_NOT_FOUND, { environmentId })
     if (!pool.isOnline(env.connectionId)) await connections.connect(env.connectionId)
 
-    const sftp = (await pool.sftp(env.connectionId)) as unknown as SftpLike
-    const fs = createRemoteFs(sftp)
-    await fs.mkdirp(remotePath)
+    // S2：建目录是一条通道一次的事
+    await pool.withSftp(env.connectionId, async (rawSftp) => {
+      const fs = createRemoteFs(rawSftp as unknown as SftpLike)
+      await fs.mkdirp(remotePath)
+    })
     logger.info(`created empty target dir on request: ${remotePath}`)
     repo.audit.write({
       level: 'info',

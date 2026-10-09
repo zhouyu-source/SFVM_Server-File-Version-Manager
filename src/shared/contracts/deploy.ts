@@ -263,6 +263,13 @@ export type PrecheckKey =
   | 'file-name'
   | 'remote-target'
   | 'parent-writable'
+  /**
+   * 目标位于挂载点 / 与父目录跨设备（将退化成复制模式）。
+   *
+   * 与 `disk-space` 分开：`PrecheckItem.key` 同时是列表渲染的 key，两者在
+   * `mode === 'full'` 时会同时出现，共用 one key 就是重复 key（L12）。
+   */
+  | 'filesystem'
   | 'disk-space'
   | 'residue'
   | 'lock'

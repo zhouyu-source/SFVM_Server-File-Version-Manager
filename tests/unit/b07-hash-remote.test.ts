@@ -12,6 +12,7 @@ import { createHash } from 'node:crypto'
 import { Readable } from 'node:stream'
 import {
   createSftpHashPort,
+  HASH_VERIFY_TIMEOUT_MS,
   listRemoteFiles,
   verifyRemote,
   type HashSftpLike,
@@ -38,6 +39,8 @@ class MemoryRemote implements RemoteHashPort {
   files = new Map<string, Buffer>()
   removed: string[] = []
   commands: string[] = []
+  /** 每次 `runCommand` 拿到的超时参数（L2：清单校验要长超时） */
+  commandTimeouts: Array<number | undefined> = []
   manifestContent: string | null = null
   tmpDir = '/home/u/.sfvm-tmp'
   cap: Cap
@@ -95,8 +98,12 @@ class MemoryRemote implements RemoteHashPort {
    * - 输出 `<名字>: OK` / `<名字>: FAILED` / `<名字>: FAILED open or read`（**不回显哈希**）
    * - 全部 OK 时退出码 0，否则 1
    */
-  async runCommand(cmd: string): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  async runCommand(
+    cmd: string,
+    timeoutMs?: number
+  ): Promise<{ stdout: string; stderr: string; code: number | null }> {
     this.commands.push(cmd)
+    this.commandTimeouts.push(timeoutMs)
     const m = /^cd '(.+?)' && (sha256sum|shasum -a 256) -c( --status)? '(.+?)'$/.exec(cmd)
     if (!m) return { stdout: '', stderr: 'unexpected command', code: 127 }
     const cwd = m[1] as string
@@ -181,6 +188,27 @@ describe('verifyRemote 命令分支（T07.7）', () => {
     expect(remote.commands[0]).toContain(`sha256sum -c '/home/u/.sfvm-tmp/sfvm-rel-1.sha256'`)
     // 清单按 coreutils 格式、两空格分隔
     expect(remote.manifestContent).toBe(buildSha256SumFile(expected))
+  })
+
+  /**
+   * L2：清单校验（`sha256sum -c`）的耗时**与产物规模成正比**，要显式给长超时。
+   *
+   * 连接层的默认 15 秒是给 `df` / `chmod` / `test -w` 那种秒回命令定的；
+   * 大目录哈希是最常撞超时的一条（`ssh-client.ts` 自己的注释早就写了这句）。
+   */
+  it('L2：清单校验拿到长超时（不是连接层默认的 15 秒）', async () => {
+    const remote = new MemoryRemote({ hasSha256sum: true, hasShasum: true })
+    remote.put(`${PAYLOAD}/a.js`, 'AAA')
+
+    await verifyRemote({
+      port: remote,
+      payloadDir: PAYLOAD,
+      expected: itemsOf({ 'a.js': 'AAA' }),
+      releaseId: 'rel-l2'
+    })
+
+    expect(remote.commandTimeouts[0]).toBe(HASH_VERIFY_TIMEOUT_MS)
+    expect(HASH_VERIFY_TIMEOUT_MS).toBeGreaterThan(15_000)
   })
 
   it('清单在校验完立即从远端删除（方案书 §6.6）', async () => {

@@ -16,8 +16,12 @@
  * MT-02 的形态就是"发布中链路断了"。此时 `DeployService` 自己的补偿会去删暂存目录，
  * 但它拿的是**那条已经断掉的通道**，必然失败 —— 于是服务器上会留下一个
  * `.sfvm-staging-<id>`。JobService 在任务进入终态时会调用 `cleanup`，
- * 我们在这里**重新开一条 SFTP 通道**（`pool.sftp()` 每次都新建一条）再删一次。
+ * 我们在这里**重新开一条 SFTP 通道**（`openChannel()` 每次都新建一条）再删一次。
  * 只要 SSH 还能连上（断的是那条会话，不是网络），残留就能当场清掉。
+ *
+ * 这段逻辑**不在本文件**：它被抽到 `services/deploy-residue.ts`，因为流水线里的
+ * 「发布」步骤（`services/pipeline.ts` 的 `jobOf()`）也需要同一份（M6）——
+ * 两个入口各写一遍，迟早有一边忘了删锁或忘了放 busy。
  *
  * 这也解释了 `cleanup` 的边界：它**只删能证明是自己留下的东西** ——
  * 本次 releaseId 的暂存目录，以及**锁文件里 releaseId 与本任务一致**时的锁。
@@ -30,7 +34,7 @@ import { AppError, ErrorCode, type ErrorCodeValue } from '../infra/errors'
 import { IPC_CHANNELS } from '../../shared/channels'
 import { joinRemote } from '../infra/hash-core'
 import { normalizeRemotePath } from '../infra/remote-path'
-import { lockPathOf, parseLockPayload, stagingRootOf } from '../infra/deploy-plan'
+import { cleanupDeployResidue } from '../services/deploy-residue'
 import {
   deployCancelInputSchema,
   deployCleanResidueInputSchema,
@@ -63,7 +67,7 @@ export interface DeployIpcDeps {
   /**
    * 端口装配的可注入点（**仅供单测**）。
    *
-   * 生产路径是"`pool.sftp()` 开一条通道 → 包成四个端口"。单测若要覆盖这条路径，
+   * 生产路径是"`openChannel()` 开一条通道 → 包成四个端口"。单测若要覆盖这条路径，
    * 就得伪造一整条 ssh2 形状的 SFTP 通道；那种替身越像手写的 ssh2，越容易掩盖
    * 真实语义差异（B07 的教训），而且它并不能证明我们的接线是对的。
    *
@@ -78,6 +82,14 @@ export interface DeployIpcDeps {
 export interface OpenedPorts {
   ports: DeployPorts
   connectionId: string
+  /**
+   * 释放这条通道（S2）。**生产路径一定有**；单测注入的假端口没有 ——
+   * 所以是可选，调用方一律写 `opened.release?.()`。
+   *
+   * 为什么不让 `openPorts` 自己用完就关：端口要活到**整次操作结束**
+   * （发布跑完、补偿再删一次），关早了等于发布到一半把通道掐了。
+   */
+  release?: () => void
 }
 
 /** "目标 → 端口"的可注入形式（发布与流水线里的发布步骤共用）。 */
@@ -86,7 +98,7 @@ export type DeployPortsOpener = (targetId: string) => Promise<OpenedPorts>
 /**
  * 发布用的一条 SFTP 通道包出的全部端口。
  *
- * `pool.sftp()` **每次都新建一条通道**，所以这个函数被再调用一次就等于
+ * `openChannel()` **每次都新建一条通道**，所以这个函数被再调用一次就等于
  * "换一条新通道重试" —— `cleanup` 正是靠这一点在断链后还能清理。
  *
  * B21 把"从目标解析出一条可用连接并包成端口"抽成了独立工厂：流水线里的
@@ -125,7 +137,10 @@ export function createDeployPortsOpener(
       })
     }
 
-    const sftp = (await deps.pool.sftp(connectionId)) as unknown as DeploySftpLike
+    // S2：拿到通道的同时拿到释放函数，**由调用方**在操作结束时 release
+    // （端口要活到发布跑完，这里不能自己关）
+    const { sftp: rawSftp, release } = await deps.pool.openChannel(connectionId)
+    const sftp = rawSftp as unknown as DeploySftpLike
     const tmpDir = joinRemote(
       normalizeRemotePath(capability.homeDir?.trim() || '/tmp'),
       '.sfvm-tmp'
@@ -137,9 +152,10 @@ export function createDeployPortsOpener(
         sftp,
         capability,
         tmpDir,
-        exec: (cmd) => deps.pool.exec(connectionId, cmd),
+        exec: (cmd, timeoutMs) => deps.pool.exec(connectionId, cmd, timeoutMs),
         hostname: hostname()
-      })
+      }),
+      release
     }
   }
 }
@@ -225,63 +241,25 @@ export function registerDeployHandlers(deps: DeployIpcDeps): void {
           return outcome
         } finally {
           pool.setBusy(opened.connectionId, false)
+          // S2：这次发布的通道到此为止（补偿走的是 cleanup 里另开的那条）
+          opened.release?.()
         }
       },
       async cleanup(reason, ctx) {
+        // 逻辑抽到 `services/deploy-residue.ts`：**流水线里的发布步骤**也要用同一份
+        // （M6 —— 以前 `jobOf()` 没写 `cleanup`，流水线发布失败后残留只能等锁过期）。
+        //
         // 走到这里说明任务被取消 / 放弃退出 / 失败了。`run` 的 finally 通常已经把
         // busy 放掉；但如果 run 卡住迟迟不返回，就只剩这里能放 —— 所以再放一次。
-        const target2 = repo.targets.get(input.targetId)
-        if (!target2) return
-
-        try {
-          // 关键：**新开一条通道**。失败时旧通道很可能已经不可用（MT-02 就是断链）
-          const opened = await openPorts(input.targetId)
-          pool.setBusy(opened.connectionId, false)
-
-          const remotePath = normalizeRemotePath(target2.remotePath)
-          const stagingRoot = stagingRootOf(remotePath, ctx.jobId)
-
-          const st = await opened.ports.fs.stat(stagingRoot)
-          if (!st.exists) {
-            ctx.log(`清理检查：远端无暂存残留（${reason}）`)
-          } else {
-            const r = await deploy.cleanResidue({
-              targetId: input.targetId,
-              paths: [stagingRoot],
-              fs: opened.ports.fs
-            })
-            if (r.removed.length > 0) ctx.log(`已清理远端暂存目录 ${stagingRoot}`, 'warn')
-            for (const f of r.failed) {
-              ctx.log(`暂存目录未能清理（${f.reason}）：${f.path}`, 'warn')
-            }
-          }
-
-          // 锁：只在"锁里写的正是本次任务"时才删。
-          // 不这么判就等于给了任务层一个删别人锁的开关（另一台机器可能正在发布）。
-          const lockPath = lockPathOf(remotePath)
-          try {
-            const text = await opened.ports.fs.readTextFile(lockPath)
-            const lock = parseLockPayload(text, new Date())
-            if (lock?.releaseId === ctx.jobId) {
-              await opened.ports.fs.removeFile(lockPath)
-              ctx.log('已释放远端发布锁', 'warn')
-            } else if (lock) {
-              ctx.log(`远端锁属于另一次发布（releaseId=${lock.releaseId}），不清理`, 'warn')
-            } else if (text !== null) {
-              ctx.log(`远端锁内容无法解析，未自动清理：${lockPath}`, 'warn')
-            }
-          } catch {
-            // 读不到 = 没有锁，正常
-          }
-        } catch (err) {
-          // 清理失败只记日志：**不能覆盖原始失败原因**（方案书 §6.11）。
-          // 实在清不掉时，下次发布的前置校验仍会认出这个残留并提示。
-          ctx.log(
-            `远端残留清理未完成：${(err as Error).message}` +
-              '（可在恢复连接后重试，或在下一次发布时确认清理）',
-            'warn'
-          )
-        }
+        await cleanupDeployResidue(
+          {
+            repo,
+            openPorts,
+            cleanResidue: (input) => deploy.cleanResidue(input),
+            setBusy: (connectionId, busy) => pool.setBusy(connectionId, busy)
+          },
+          { targetId: input.targetId, jobId: ctx.jobId, reason, log: (text, level) => ctx.log(text, level) }
+        )
       }
     }
   }
@@ -289,8 +267,12 @@ export function registerDeployHandlers(deps: DeployIpcDeps): void {
   /* ------------------------------------------------------------ IPC 通道 */
 
   registerHandler(IPC_CHANNELS.DEPLOY_PRECHECK, deployPrecheckInputSchema, async ({ targetId }) => {
-    const { ports } = await openPorts(targetId)
-    return deploy.precheck({ targetId, ports })
+    const opened = await openPorts(targetId)
+    try {
+      return await deploy.precheck({ targetId, ports: opened.ports })
+    } finally {
+      opened.release?.()
+    }
   })
 
   /**
@@ -334,12 +316,16 @@ export function registerDeployHandlers(deps: DeployIpcDeps): void {
     IPC_CHANNELS.DEPLOY_CLEAN_RESIDUE,
     deployCleanResidueInputSchema,
     async ({ targetId, paths }) => {
-      const { ports } = await openPorts(targetId)
-      const r = await deploy.cleanResidue({ targetId, paths, fs: ports.fs })
-      logger.info(
-        `deploy.cleanResidue: target=${targetId} removed=${r.removed.length} failed=${r.failed.length}`
-      )
-      return r
+      const opened = await openPorts(targetId)
+      try {
+        const r = await deploy.cleanResidue({ targetId, paths, fs: opened.ports.fs })
+        logger.info(
+          `deploy.cleanResidue: target=${targetId} removed=${r.removed.length} failed=${r.failed.length}`
+        )
+        return r
+      } finally {
+        opened.release?.()
+      }
     }
   )
 }

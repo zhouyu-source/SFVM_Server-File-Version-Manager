@@ -448,12 +448,22 @@ export function createReconcileService(deps: {
       }
 
       if (drifted && doAdopt) {
-        // 台账记的与 manifest 不符 → **以 manifest 为准**（远端是真相来源）
+        /**
+         * 台账记的与 manifest 不符 → **以 manifest 为准**（远端是真相来源）。
+         *
+         * `archivedAt` 同样要归一成 UTC 再落库（M1）：manifest 里的时间是
+         * **本地偏移格式**（`2026-10-09T12:00:00+08:00`），而 `archived_at` 列上的
+         * 排序/统计是**字符串比较** —— 迁移 0003 已经把存量行统一成 UTC，
+         * 这里若原样写回本地偏移，就会在列里重新混入两种格式、把顺序搞乱
+         * （正是上面"补录"分支已经用 `toUtcIso` 规避的那个坑，修正分支漏了）。
+         * manifest 时间解析不出来时保留台账原值：改成"现在"会让这条版本的
+         * 归档时间凭空变新，比"沿用旧值"更失真。
+         */
         repo.archives.update(row.id, {
           rootHash: manifest.rootHash,
           totalBytes: manifest.totalBytes,
           fileCount: manifest.fileCount,
-          archivedAt: manifest.archivedAt,
+          archivedAt: toUtcIso(manifest.archivedAt) ?? row.archivedAt,
           status: 'valid'
         })
         report.counts.adopted += 1

@@ -70,7 +70,6 @@ import type {
   ScriptCapabilities,
   ScriptRunDetailInput,
   ScriptRunListInput,
-  ScriptRunStepInput,
   ScriptRunView
 } from '../shared/contracts/script'
 import type {
@@ -383,10 +382,6 @@ const api = {
     /** 总闸状态 + 本机可用的解释器（决定界面把哪些选项灰掉） */
     capabilities: (): Promise<IpcResult<ScriptCapabilities>> =>
       ipcRenderer.invoke(IPC_CHANNELS.SCRIPTS_CAPABILITIES),
-
-    /** 跑一条脚本；立刻返回任务视图，进度/日志走 jobs.onProgress / onLog */
-    runStep: (input: ScriptRunStepInput): Promise<IpcResult<JobView>> =>
-      ipcRenderer.invoke(IPC_CHANNELS.SCRIPTS_RUN_STEP, input),
 
     /** 某个目标的运行记录（纯读台账） */
     runs: (input: ScriptRunListInput): Promise<IpcResult<ScriptRunView[]>> =>

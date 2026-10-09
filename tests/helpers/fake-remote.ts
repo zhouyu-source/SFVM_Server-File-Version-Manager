@@ -71,6 +71,13 @@ export class FakeRemote {
   renamePrefixFailures = new Map<string, OneShot>()
   /** rmrf 这些精确路径时失败 */
   rmrfFailures = new Set<string>()
+  /**
+   * 删这些精确文件时失败（模拟权限不足 / 文件被占用）。
+   *
+   * 用于钉住"释放远端锁失败"这条路径（M2）：`releaseRemoteLock` 不抛错，
+   * 如果没有这个注入点，"放锁失败"只会走成一次静默的 warn —— 补偿清单会谎报成功。
+   */
+  removeFileFailures = new Set<string>()
   /** 上传到这些精确路径时失败（模拟链路中断 / 磁盘满） */
   putFailures = new Set<string>()
   /** 建这些精确路径时失败 */
@@ -134,6 +141,19 @@ export class FakeRemote {
   has(path: string): boolean {
     const p = normalizeRemotePath(path)
     return this.files.has(p) || this.dirs.has(p)
+  }
+
+  /**
+   * 覆盖某个目录的 mode（默认 `DIR_MODE`）。
+   *
+   * 用来构造"原权限位不足 3 位"这种真实但少见的现场（如 `0o40040` → 权限位 `0o40`）：
+   * 发布阶段 5 会把它捕获成 `originalMode`，再拿去恢复权限（L10/A1）。
+   */
+  setDirMode(path: string, mode: number): void {
+    const p = normalizeRemotePath(path)
+    this.putDir(p)
+    const cur = this.dirs.get(p) ?? { mode, uid: 0, gid: 0 }
+    this.dirs.set(p, { ...cur, mode })
   }
 
   read(path: string): Buffer {
@@ -232,7 +252,9 @@ export class FakeRemote {
   }
 
   removeFile(path: string): void {
-    this.files.delete(normalizeRemotePath(path))
+    const p = normalizeRemotePath(path)
+    if (this.removeFileFailures.has(p)) throw new Error(`模拟删除文件失败：${p}`)
+    this.files.delete(p)
   }
 
   rmrf(path: string): void {

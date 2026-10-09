@@ -29,6 +29,7 @@
 import { randomUUID } from 'node:crypto'
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
+import { redact, scrubText } from '../infra/log-redact'
 import {
   MAX_JOB_LOGS,
   isTerminalStatus,
@@ -169,13 +170,44 @@ function cancelledError(jobId: string): AppError {
   return new AppError(ErrorCode.E_JOB_CANCELLED, { jobId })
 }
 
+/**
+ * 任务失败详情里可能夹带凭据，进 UI 前统一脱敏（T01.2 / M7 / A2）。
+ *
+ * 两道一起用，因为各自只覆盖一半：
+ * - `redact()` 按**敏感键名**替换结构里的值（`password` / `token` …），
+ *   但**不碰自由文本** —— `{ command: 'mysql -pHunter2' }` 这种原样放行；
+ * - `scrubText()` 扫自由文本里的 `password=xxx` / `http://u:p@h` 形态，
+ *   但认不出结构键名，也认不出裸串。
+ *
+ * 之所以在**这里**兜（而不是只靠各调用点自觉不塞敏感字段）：`detail` 是任意的、
+ * 由无数个抛出点决定，集中过一道才能保证"无论谁往 detail 里放什么"都不会直接
+ * 出现在任务失败详情面板上。
+ */
+function sanitizeDetail(detail: unknown): unknown {
+  return scrubStrings(redact(detail))
+}
+
+function scrubStrings(value: unknown, depth = 0): unknown {
+  if (depth > 8) return '[depth-limit]'
+  if (typeof value === 'string') return scrubText(value)
+  if (Array.isArray(value)) return value.map((v) => scrubStrings(v, depth + 1))
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = scrubStrings(v, depth + 1)
+    }
+    return out
+  }
+  return value
+}
+
 function toErrorInfo(err: unknown): JobErrorInfo {
   if (err instanceof AppError) {
     return {
       code: err.code,
       message: err.message,
       ...(err.hint ? { hint: err.hint } : {}),
-      ...(err.detail === undefined ? {} : { detail: err.detail })
+      ...(err.detail === undefined ? {} : { detail: sanitizeDetail(err.detail) })
     }
   }
   const message = err instanceof Error ? err.message : String(err)
@@ -453,8 +485,11 @@ export function createJobService(options: JobServiceOptions = {}): JobService {
     }
 
     rec.finishedAt = now().toISOString()
-    running.delete(rec.jobId)
-    runningLanes.delete(rec.lane)
+    // 只有「确实在跑」的任务才占着车道。取消排队任务时它从未进过 running，
+    // 若此处无条件删车道，pump() 会把下一个排队任务当成车道空闲而启动，
+    // 与仍在跑的那个同目标任务并发 —— 而 takeNextRunnable 的
+    // `if (runningLanes.has(lane)) continue` 此时已失效。
+    if (running.delete(rec.jobId)) runningLanes.delete(rec.lane)
 
     // 释放车道（若还有排队任务，pump 会从 lanes 里取，不需保留空车道）
     const q = lanes.get(rec.lane)

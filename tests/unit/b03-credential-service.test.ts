@@ -328,3 +328,148 @@ describe('ConnectionService（T03.8）', () => {
     }
   })
 })
+
+/* ------------------------------------------------------ P2 回归：M11 / S5 */
+
+/**
+ * M11：连接参数（或凭据）改了，池里那条会话必须被丢掉。
+ *
+ * 缺陷回顾：池里存的是**建连那一刻**的 options 快照（含已解密的 secret 与已读盘的
+ * 私钥 Buffer），而退避重连正是原样重放这份快照。运维改完密码后不主动断开的话，
+ * 下一次自动重连仍用旧凭据 → 5 次退避全部「认证失败」→ 落到 offline 只能重启应用，
+ * 且报错与"用了旧凭据"毫无关联。
+ */
+describe('P2 回归：M11（会话参数变更 → 丢弃池内会话）', () => {
+  it('改 host/port/用户名/认证方式/私钥/密码 → 断开；改纯展示字段 → 不动它', () => {
+    const t = makeTestDb()
+    try {
+      const pool = new SshConnectionPool()
+      const svc = createConnectionService({ repo: t.repo, pool })
+      const conn = svc.create({
+        name: 'x',
+        host: '10.0.0.1',
+        username: 'u',
+        authType: 'password',
+        secret: 'pw'
+      })
+
+      const dropped: string[] = []
+      pool.disconnect = (id: string): void => {
+        dropped.push(id)
+      }
+
+      // 展示类字段：池里那条会话照样能用 —— 改个备注不该把用户在线中的连接踢下线
+      svc.update(conn.id, { name: '改名' })
+      svc.update(conn.id, { remark: '备注' })
+      svc.update(conn.id, { keepaliveMs: 30_000 })
+      svc.update(conn.id, { autoConnect: false })
+      expect(dropped, '这些字段不影响一条已建会话能不能继续用').toEqual([])
+
+      // 会话参数：每一个都必须断（漏掉任何一个 = 改完密码重连还是旧的）
+      const sessionPatches: Array<Record<string, unknown>> = [
+        { host: '10.0.0.2' },
+        { port: 2222 },
+        { username: 'root' },
+        { authType: 'privateKey' },
+        { privateKeyPath: '/home/u/.ssh/id_ed25519' },
+        { secret: 'new-pw' },
+        { secret: '' }
+      ]
+      for (const patch of sessionPatches) {
+        dropped.length = 0
+        svc.update(conn.id, patch as never)
+        expect(dropped, `patch=${JSON.stringify(patch)} 必须丢弃池内会话`).toEqual([conn.id])
+      }
+    } finally {
+      t.cleanup()
+    }
+  })
+})
+
+/**
+ * S5：用**已保存的连接**做「连接测试」时也必须走一次性 id。
+ *
+ * 缺陷回顾：以前这条路径用的是 `row.id`，于是探测连接被塞进池里、该连接无声变成
+ * online（而库里 `lastConnectedAt` 并未更新，两端不一致）；更糟的是"不以 `__test__`
+ * 开头就不断开"使这条 `accept-any`、未经指纹校验的会话**留在池里**，
+ * 被后续发布/归档/回滚的 `if (!pool.isOnline(id)) connect(id)` 直接复用。
+ */
+describe('P2 回归：S5（连接测试用一次性 id，不污染池）', () => {
+  function setupFakePool(): {
+    seen: string[]
+    dropped: string[]
+    svc: ReturnType<typeof createConnectionService>
+    t: ReturnType<typeof makeTestDb>
+  } {
+    const t = makeTestDb()
+    const seen: string[] = []
+    const dropped: string[] = []
+    const fakePool = {
+      connect: async (opts: { connectionId: string }) => {
+        seen.push(opts.connectionId)
+        return {
+          capability: {
+            platform: 'linux',
+            homeDir: '/root',
+            hasSha256sum: true,
+            hasShasum: false,
+            hasDf: true
+          },
+          hostKeyFingerprint: 'SHA256:abc',
+          hostKeyType: 'ssh-ed25519'
+        }
+      },
+      disconnect: (id: string) => {
+        dropped.push(id)
+      }
+    } as unknown as SshConnectionPool
+    return { t, seen, dropped, svc: createConnectionService({ repo: t.repo, pool: fakePool }) }
+  }
+
+  it('保存的连接：建连用 __test__ id 并立即丢弃，真实连接从未被碰', async () => {
+    const { t, svc, seen, dropped } = setupFakePool()
+    try {
+      const conn = svc.create({
+        name: 'x',
+        host: '10.0.0.1',
+        username: 'u',
+        authType: 'password',
+        secret: 'pw'
+      })
+
+      const r = await svc.test({ id: conn.id })
+      expect(r.hostKeyStatus).toBe('unknown')
+      expect(seen).toHaveLength(1)
+      // 关键：建连用的**不是**真实连接 id
+      expect(seen[0]).not.toBe(conn.id)
+      expect(seen[0]!.startsWith('__test__')).toBe(true)
+      // 一次性会话被丢弃；真实连接 id 从未出现在断开列表里（说明它根本没进过池）
+      expect(dropped).toEqual([seen[0]])
+      expect(dropped).not.toContain(conn.id)
+    } finally {
+      t.cleanup()
+    }
+  })
+
+  it('草稿参数：同一毫秒内的两条测试用不同 id（L7：不再用 Date.now()）', async () => {
+    const { t, svc, seen } = setupFakePool()
+    try {
+      // 刻意同步连发两次：旧实现用 `Date.now()`，同毫秒会撞同一个 id，
+      // 第二条直接命中第一条已进池的条目（凭据完全不同），拿到的是**第一条**的探测结果
+      const input = {
+        name: '草稿',
+        host: 'h',
+        username: 'u',
+        authType: 'password' as const,
+        secret: 'pw'
+      }
+      await svc.test({ input })
+      await svc.test({ input })
+
+      expect(seen).toHaveLength(2)
+      expect(seen[0]).not.toBe(seen[1])
+    } finally {
+      t.cleanup()
+    }
+  })
+})

@@ -14,7 +14,7 @@
  * 顺带好处是 logger 可注入（单测可传记录型替身）。
  */
 import { createRequire } from 'node:module'
-import { readdirSync, statSync, unlinkSync } from 'node:fs'
+import { readdirSync, rmSync, statSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { is } from '@electron-toolkit/utils'
 import { redact, scrubText } from './log-redact'
@@ -24,6 +24,16 @@ export type LogLevel = 'error' | 'warn' | 'info' | 'verbose' | 'debug' | 'silly'
 
 /** 日志保留天数（T01.1 要求 14 天）。 */
 export const LOG_RETENTION_DAYS = 14
+
+/**
+ * 脚本运行输出的目录名（`<数据目录>/log/script-runs`）。
+ *
+ * 它是日志目录的**子目录**，所以 `pruneOldLogs()` 那句 `endsWith('.log')` 扫不到它
+ * —— 以前这套输出只增不减（单步最大 8 MB，一条 20 步的流水线一次就能产出 20 个文件）。
+ * 名字放在这里、由 `main/index.ts` 与 `pruneOldLogs()` 共用，是为了让"写到哪"
+ * 与"从哪清"只有一个来源（M13）。
+ */
+export const SCRIPT_RUNS_DIR_NAME = 'script-runs'
 
 /** 单文件切割阈值。 */
 export const LOG_MAX_SIZE = 10 * 1024 * 1024
@@ -144,13 +154,14 @@ export function initLogger(opts: InitLoggerOptions = {}): void {
   )
 }
 
-/** 删除超过保留期的日志归档（T01.1）。 */
+/** 删除超过保留期的日志归档（T01.1）与脚本输出目录（M13）。 */
 function pruneOldLogs(): void {
   try {
     const file = getImpl().transports.file.getFile()
     const dir = dirname(file.path)
+    const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000
+
     try {
-      const cutoff = Date.now() - LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000
       for (const name of readdirSync(dir)) {
         if (!name.endsWith('.log')) continue
         const full = join(dir, name)
@@ -158,6 +169,24 @@ function pruneOldLogs(): void {
       }
     } catch {
       /* 清理失败不影响主流程 */
+    }
+
+    /**
+     * M13：脚本运行输出是**子目录**（`script-runs/<runId>/<seq>.log`），上面那句
+     * `endsWith('.log')` 永远扫不到它 —— 这套输出以前只增不减。这里按**目录**的
+     * mtime 判过期并整棵树删掉（一次运行的所有步骤一起清，不留半棵）。
+     *
+     * 单独一层 try/catch：`script-runs` 可能还没建出来（`readdirSync` 抛 ENOENT），
+     * 也可能某个条目正好被并发写 —— 任何一种都不该让日志文件那条清理白做。
+     */
+    try {
+      const runsDir = join(dir, SCRIPT_RUNS_DIR_NAME)
+      for (const name of readdirSync(runsDir)) {
+        const full = join(runsDir, name)
+        if (statSync(full).mtimeMs < cutoff) rmSync(full, { recursive: true, force: true })
+      }
+    } catch {
+      /* 脚本输出目录尚不存在 / 条目正好在写 —— 忽略 */
     }
   } catch {
     /* 日志目录尚不可用时忽略 */

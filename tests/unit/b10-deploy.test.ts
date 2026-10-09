@@ -10,11 +10,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { createDeployService } from '@main/services/deploy'
+import { createDeployService, toModeBits } from '@main/services/deploy'
 import { createArchiveService } from '@main/services/archive'
 import { createRollbackService } from '@main/services/rollback'
+import { createReconcileService } from '@main/services/reconcile'
 import { hashLocalArtifact } from '@main/services/hash'
 import { ErrorCode } from '@main/infra/errors'
+import { assertModeBits } from '@main/infra/remote-exec'
 import { lockPathOf, stagingPayloadOf, stagingRootOf, swapSourceOf } from '@main/infra/deploy-plan'
 import { LOCK_STALE_MS } from '@shared/contracts/deploy'
 import { makeTestDb, seedBasic, type TestDb } from '../helpers/db'
@@ -121,6 +123,10 @@ describe('DeployService（B10 发布主流程）', () => {
     // 4) 台账
     const rel = t.repo.releases.listByTarget(id, 5)[0]
     expect(rel).toMatchObject({ status: 'SUCCESS', action: 'deploy', source: 'local' })
+    // 归档 id 必须落库（S1 回归）：崩溃恢复的「恢复旧版本」靠 releases.archive_id
+    // 找到这一份归档。只写内存的话，崩溃后对账会拿到 undefined，
+    // 进而报出「这次操作没有归档过旧版本」这种与事实相反的理由。
+    expect(rel.archiveId).toBe(archived[0].id)
     expect(t.repo.releaseItems.listByRelease(out.releaseId)).toHaveLength(2)
 
     // 5) 阶段顺序：七阶段的状态迁移都应出现在日志里
@@ -312,6 +318,26 @@ describe('DeployService（B10 发布主流程）', () => {
       expect(row.rollback).toBeNull()
       expect(row.supersededByRollbackAt).toBeNull()
     }
+  })
+
+  it('去重调用本身抛错：不影响发布结果、只记警告并保留两份归档（M4 回归）', async () => {
+    const { targetId: tid } = await setupRolledBack(true)
+    const before = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+    // 制造"去重这一步自己炸了"的现场：内部虽对 rmrf 失败自兜，但
+    // `repo.archives.remove()` / `audit.write()` 在它的 try 之外，仍可能抛。
+    vi.spyOn(archive, 'discardDuplicateArchive').mockRejectedValueOnce(new Error('台账写不进去'))
+
+    const { ctx, text } = makeCtx()
+    const out = await service.run({ targetId: tid, ports: fake.ports(), ctx })
+
+    // 关键：发布依然成功、目标已是新版本 —— 绝不能被拖进补偿而回滚成旧版本
+    expect(out.ok).toBe(true)
+    expect(fake.text('/opt/app/dist/index.html')).toBe('v3')
+    expect(text()).toContain('未能去除重复归档')
+    // 去重没生效 → 多留一份重复（内容不丢）
+    const after = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+    expect(after).toHaveLength(before.length + 1)
+    expect(after).toEqual(expect.arrayContaining(before))
   })
 
   it('回滚时选了不保留来源：现网那份在版本库里没有副本，发布时照常归档', async () => {
@@ -603,6 +629,115 @@ describe('DeployService（B10 发布主流程）', () => {
     expect(text()).toContain('复位到目标路径')
   })
 
+  it('S1 回归：崩在阶段 5 的现场必须自带归档 id —— 对账能认出「恢复旧版本」', async () => {
+    const id = seedDirTarget({ 'index.html': 'v2' })
+    fake.putFile('/opt/app/dist/index.html', 'live')
+    /**
+     * 让**换版与归档复位两次 rename 都失败**，从而留下一个"补偿没做完"的现场：
+     * 目标路径为空、旧版本还在归档目录里、台账行停在 SWAPPING。
+     * 这正是"应用被强杀"之后重启时看到的局面。
+     */
+    fake.renameFailures.set('/opt/app/dist', {
+      err: Object.assign(new Error('Permission denied'), { code: 3 }),
+      remaining: 2
+    })
+
+    const out = await service.run({ targetId: id, ports: fake.ports(), ctx: makeCtx().ctx })
+    expect(out.ok).toBe(false)
+    expect(out.failure?.stage).toBe(5)
+    // 归档复位没成功 ⇒ 归档记录还在、目标路径还是空的
+    expect(t.repo.archives.listByTarget(id)).toHaveLength(1)
+    expect(fake.has('/opt/app/dist')).toBe(false)
+
+    // 关键：台账上带着这次归档的 id
+    const rel = t.repo.releases.get(out.releaseId)!
+    expect(rel.archiveId).toBe(t.repo.archives.listByTarget(id)[0]!.id)
+
+    // 于是重启后的对账能认出它，并给出「恢复旧版本」而不是误导性的理由
+    const reconcile = createReconcileService({ repo: t.repo, archive, now: () => clock })
+    const d = await reconcile.diagnose({
+      targetId: id,
+      releaseId: out.releaseId,
+      ports: fake.rollbackPorts()
+    })
+    expect(d.archive?.archiveId).toBe(rel.archiveId)
+    const opt = d.options.find((o) => o.mode === 'restore-old')!
+    expect(opt.enabled).toBe(true)
+    expect(opt.reason ?? '').not.toContain('没有归档')
+  })
+
+  it('S1 回归：补偿把归档复位成功后，台账上的归档 id 跟着清空（不指向已删行）', async () => {
+    const id = seedDirTarget({ 'index.html': 'v2' })
+    fake.putFile('/opt/app/dist/index.html', 'live')
+    // 只让换版那一次失败；归档复位必须成功 ⇒ 归档行会被 undoArchive 摘掉
+    fake.renameFailures.set('/opt/app/dist', {
+      err: Object.assign(new Error('Permission denied'), { code: 3 }),
+      remaining: 1
+    })
+
+    const out = await service.run({ targetId: id, ports: fake.ports(), ctx: makeCtx().ctx })
+    expect(out.ok).toBe(false)
+    expect(out.failure?.compensations.some((c) => /归档复位/.test(c.action) && c.ok)).toBe(true)
+    expect(t.repo.archives.listByTarget(id)).toHaveLength(0)
+    // 指向已删行的 id 会让对账报「找不到」，比 null 更糟
+    expect(t.repo.releases.get(out.releaseId)!.archiveId).toBeNull()
+  })
+
+  it('放锁失败：补偿清单不谎报成功，改为人工处理指引（M2 回归）', async () => {
+    const id = seedDirTarget({ 'index.html': 'v2' })
+    fake.putFile('/opt/app/dist/index.html', 'live')
+    // 换版那一次失败（remaining:1 → 后面的归档复位仍能成功）
+    fake.renameFailures.set('/opt/app/dist', {
+      err: Object.assign(new Error('Permission denied'), { code: 3 }),
+      remaining: 1
+    })
+    // 放锁也失败：锁文件删不掉（模拟权限不足 / 被占用）
+    fake.removeFileFailures.add(lockPathOf('/opt/app/dist'))
+
+    const { ctx, text } = makeCtx()
+    const out = await service.run({ targetId: id, ports: fake.ports(), ctx })
+    expect(out.ok).toBe(false)
+
+    // 关键：补偿清单如实标 ok:false —— 旧写法会报 ok:true（锁其实还在服务器上）
+    const rel = out.failure!.compensations.find((c) => c.action === '释放远端锁')!
+    expect(rel.ok).toBe(false)
+    expect(rel.detail ?? '').toContain('对账')
+    expect((out.failure!.manualCleanup ?? []).join('\n')).toContain('对账')
+    expect(text()).toContain('远端锁未能自动释放')
+    // 如实反映现实：锁确实还在（不然用户照着"已释放"去重试会一直撞 E_DEPLOY_BLOCKED）
+    expect(fake.has(lockPathOf('/opt/app/dist'))).toBe(true)
+  })
+
+  it('toModeBits 产出合法位宽：权限位不足 3 位要补零（L10 回归）', () => {
+    // 常见形态不受影响（与既有命令/文案一致）
+    expect(toModeBits(0o100644)).toBe('644')
+    expect(toModeBits(0o40755)).toBe('755')
+    // 特殊位保留（setuid 等），本来就是 4 位
+    expect(toModeBits(0o104755)).toBe('4755')
+    // 老代码在这里产出 "40"/"7" → assertModeBits 直接拒收
+    expect(toModeBits(0o40040)).toBe('040')
+    expect(toModeBits(0o40007)).toBe('007')
+    for (const m of [0o40040, 0o40007, 0o100000]) {
+      expect(() => assertModeBits(toModeBits(m))).not.toThrow()
+    }
+  })
+
+  it('原权限位不足 3 位（如 0o40）时发布仍成功、不触发补偿（A1/L10 回归）', async () => {
+    const id = seedDirTarget({ 'index.html': 'v2' })
+    fake.putFile('/opt/app/dist/index.html', 'v1')
+    // 目录权限是"组只读"：权限位 0o40 —— 真实但少见，正是老代码会构造出 "40" 的那种
+    fake.setDirMode('/opt/app/dist', 0o40040)
+
+    const { ctx, text } = makeCtx()
+    const out = await service.run({ targetId: id, ports: fake.ports(), ctx })
+
+    // 关键：权限对齐是"仅告警"的一步，绝不能把已换好的新版本补偿回旧版本
+    expect(out.ok).toBe(true)
+    expect(fake.text('/opt/app/dist/index.html')).toBe('v2')
+    // 报的是补足后的 3 位八进制
+    expect(text()).toContain('已恢复权限 040')
+  })
+
   it('阶段 5 失败（复制中断）→ 先清掉半个新版本，再把旧版本搬回目标路径', async () => {
     const id = seedDirTarget({ 'index.html': 'v2' })
     fake.putFile('/opt/app/dist/index.html', 'live')
@@ -859,6 +994,20 @@ describe('DeployService（B10 发布主流程）', () => {
     expect(report.needConfirm).toBe(false)
   })
 
+  it('L12：挂载点/跨设备项与磁盘余量项**不同 key**（`PrecheckItem.key` 是列表渲染的 key）', async () => {
+    const id = seedDirTarget({ 'index.html': 'hello' })
+    // 目标本身是挂载点 ⇒ 「文件系统（warn）」与「磁盘余量」两项会同时出现
+    fake.dfOverride.set('/opt/app/dist', { filesystem: '/dev/sdb1', mountPoint: '/opt/app/dist' })
+
+    const report = await service.precheck({ targetId: id, ports: fake.ports() })
+
+    const keys = report.items.map((i) => i.key)
+    expect(keys).toContain('filesystem')
+    expect(keys).toContain('disk-space')
+    // 全部 key 互不相同 —— 撞 key 的那天 `v-for` 会报重复、`data-test` 会串行
+    expect(new Set(keys).size).toBe(keys.length)
+  })
+
   it('precheck（full）：磁盘不足 / 远端锁 / 残留都会阻止发布并标 needConfirm', async () => {
     const id = seedDirTarget({ 'index.html': 'x'.repeat(2000) })
     fake.dfAvailableBytes = 100
@@ -867,8 +1016,33 @@ describe('DeployService（B10 发布主流程）', () => {
     const report = await service.precheck({ targetId: id, ports: fake.ports() })
 
     expect(report.items.find((i) => i.key === 'disk-space')?.level).toBe('error')
-    expect(report.items.find((i) => i.key === 'residue')?.level).toBe('error')
+    // 这里的残留只有 `.sfvm-staging-*`（可自动清理）⇒ L11 之后是 warn
+    expect(report.items.find((i) => i.key === 'residue')?.level).toBe('warn')
+    // needConfirm 只看 `level !== 'ok'`，warn 同样要弹确认
     expect(report.needConfirm).toBe(true)
+  })
+
+  it('L11：残留「有手动项」→ error，「全可自动清理」→ warn（原判定写反了）', async () => {
+    const id = seedDirTarget({ 'index.html': 'hello' })
+
+    // ① 只有我们的暂存目录 ⇒ 能替用户清掉 ⇒ warn
+    fake.putFile('/opt/app/.sfvm-staging-old/payload/x', 'half')
+    const onlyAuto = await service.precheck({ targetId: id, ports: fake.ports() })
+    const autoItem = onlyAuto.items.find((i) => i.key === 'residue')
+    expect(autoItem?.level).toBe('warn')
+    expect(autoItem?.detail).toContain('.sfvm-staging-old')
+    // 全部可自动清理 ⇒ 体检整体仍是 ok（发布流程会就地清掉）
+    expect(onlyAuto.ok).toBe(true)
+
+    // ② 混进一个 `.part`（本工具不产生远端 .part ⇒ 很可能是别人的东西）⇒ error
+    fake.putFile('/opt/app/payload.jar.part', 'torn')
+    const withManual = await service.precheck({ targetId: id, ports: fake.ports() })
+    const mixedItem = withManual.items.find((i) => i.key === 'residue')
+    expect(mixedItem?.level).toBe('error')
+    // 手动项必须被点名说清楚"不会被自动删除"
+    expect(mixedItem?.suggestion).toContain('payload.jar.part')
+    expect(mixedItem?.suggestion).toContain('不会被自动删除')
+    expect(withManual.ok).toBe(false)
   })
 
   /* ======================================================== 台账一致性 */

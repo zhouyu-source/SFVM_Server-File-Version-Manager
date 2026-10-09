@@ -21,6 +21,7 @@ import {
 } from '@element-plus/icons-vue'
 import { useWorkspaceStore } from '../stores/workspace'
 import { useConnectionStore } from '../stores/connection'
+import { useJobStore } from '../stores/job'
 import { IpcBusinessError } from '../api'
 import DangerConfirm from './DangerConfirm.vue'
 import { confirmDanger } from '../utils/danger'
@@ -36,6 +37,29 @@ const emit = defineEmits<{
 
 const ws = useWorkspaceStore()
 const conn = useConnectionStore()
+const jobStore = useJobStore()
+
+/**
+ * 「该目标上有任务在跑」的集合（M8）。
+ *
+ * 删除目标 / 环境会连台账一起删掉，而**正在跑的任务不会因此停下** ——
+ * 它收尾时会写下查不到的孤儿记录，还可能因为目标行没了而跳过放锁。
+ * 所以服务端拦一道（`assertTargetIdle`），这里再把按钮禁掉：
+ * 让用户在**点之前**就知道为什么不能删，而不是点了才弹一个错误。
+ */
+const busyTargetIds = computed(
+  () =>
+    new Set(
+      jobStore.activeJobs
+        .map((j) => j.targetId)
+        .filter((x): x is string => typeof x === 'string' && x.length > 0)
+    )
+)
+
+/** 该环境是否有目标在忙（删环境会级联删掉这些目标，同样要拦）。 */
+function envHasBusyTarget(envId: string): boolean {
+  return (ws.targetsByEnv[envId] ?? []).some((t) => busyTargetIds.value.has(t.id))
+}
 
 /** 删除环境确认弹窗状态 */
 const delEnv = ref({
@@ -202,13 +226,22 @@ const noConnection = computed(() => conn.list.length === 0)
                 @click="emit('edit-environment', env)"
               />
             </el-tooltip>
-            <el-tooltip content="删除环境" :enterable="false" placement="top">
+            <el-tooltip
+              :enterable="false"
+              :content="
+                envHasBusyTarget(env.id)
+                  ? '该环境下有目标正在执行任务，等它结束或先取消后再删'
+                  : '删除环境'
+              "
+              placement="top"
+            >
               <el-button
                 link
                 size="small"
                 type="danger"
                 :icon="DeleteFilled"
                 aria-label="删除环境"
+                :disabled="envHasBusyTarget(env.id)"
                 @click="openDeleteEnv(env)"
               />
             </el-tooltip>
@@ -237,7 +270,13 @@ const noConnection = computed(() => conn.list.length === 0)
             <span class="ops" @click.stop>
               <el-tooltip
                 :enterable="false"
-                :content="envOffline(env) ? '连接离线，无法操作' : '删除目标'"
+                :content="
+                  busyTargetIds.has(t.id)
+                    ? '该目标正在执行任务，等它结束或先取消后再删'
+                    : envOffline(env)
+                      ? '连接离线，无法操作'
+                      : '删除目标'
+                "
                 placement="top"
               >
                 <el-button
@@ -246,7 +285,7 @@ const noConnection = computed(() => conn.list.length === 0)
                   type="danger"
                   :icon="DeleteFilled"
                   aria-label="删除目标"
-                  :disabled="envOffline(env)"
+                  :disabled="envOffline(env) || busyTargetIds.has(t.id)"
                   @click="deleteTarget(t.id, t.name, env.id)"
                 />
               </el-tooltip>

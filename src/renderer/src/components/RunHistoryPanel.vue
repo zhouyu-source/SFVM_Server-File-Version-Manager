@@ -58,19 +58,28 @@ const runsError = ref('')
  *
  * `silent = true` 用于轮询：不点亮"刷新"按钮，否则列表每 1.5 秒闪一下，
  * 用户会以为界面出了问题。
+ *
+ * L8：加**竞态守卫**（照抄 `PipelinePanel.vue` 的 `requested` 写法）。轮询与
+ * 切换目标会同时发出请求，先发的慢响应后到时会把**别的目标**的运行记录写进这张表；
+ * 而表格上的"打开日志/复制诊断"都按行的 id 去查库，串了对象就可能对着 A 的记录操作。
+ * 记下发起时的目标、返回时对不上就丢弃。
  */
 async function loadRuns(silent = false): Promise<void> {
+  const requested = props.target.id
   if (!silent) loadingRuns.value = true
   try {
-    runs.value = await api.scripts.runs({
-      targetId: props.target.id,
+    const result = await api.scripts.runs({
+      targetId: requested,
       limit: DEFAULT_SCRIPT_RUN_LIST_LIMIT
     })
+    if (props.target.id !== requested) return
+    runs.value = result
     runsError.value = ''
   } catch (e) {
+    if (props.target.id !== requested) return
     if (!silent) runsError.value = (e as IpcBusinessError).toUserText()
   } finally {
-    if (!silent) loadingRuns.value = false
+    if (!silent && props.target.id === requested) loadingRuns.value = false
   }
 }
 

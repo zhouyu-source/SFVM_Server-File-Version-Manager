@@ -44,6 +44,15 @@ const plan = ref<ArchiveDownloadPlan | null>(null)
 /** 保存位置输入框（可直接粘贴路径，也可以点「选择…」走系统对话框） */
 const saveDirInput = ref('')
 let saveDirTimer: ReturnType<typeof setTimeout> | null = null
+/**
+ * L9：这两个变量一起解决"计划结果把用户正在敲的路径盖掉"。
+ *
+ * - `plannedFor`：在途那次请求是**基于哪个输入值**发起的（`''` = 首次/无参）；
+ * - `pendingInput`：请求在途时用户又改了输入 —— 记下来，等这次返回后按最新输入
+ *   重算（旧实现在 `watch` 里直接 `return`，这次编辑就**被丢掉了**）。
+ */
+let plannedFor = ''
+let pendingInput: string | null = null
 const planning = ref(false)
 const planError = ref('')
 const starting = ref(false)
@@ -98,28 +107,49 @@ const resultPath = computed(() => plan.value?.finalPath ?? '')
 
 async function loadPlan(saveDir?: string | null): Promise<void> {
   if (!props.archive) return
+  const forInput = (saveDir ?? '').trim()
+  plannedFor = forInput
   planning.value = true
   planError.value = ''
   try {
-    plan.value = await api.archives.downloadPlan({
+    const next = await api.archives.downloadPlan({
       archiveId: props.archive.id,
-      ...(saveDir ? { saveDir } : {})
+      ...(forInput ? { saveDir: forInput } : {})
     })
-    // 把算出来的位置回填到输入框（首次打开时的默认值也走这条路）
-    saveDirInput.value = plan.value.saveDir
+    plan.value = next
+    /**
+     * L9：**只在输入框还停在这次请求发起时的值上**才回填。
+     *
+     * 旧实现是无条件 `saveDirInput.value = plan.saveDir`：首次计划还在路上时
+     * 用户已经开始打字，回来的旧结果会把他刚敲的路径盖掉。而用户自己触发的那条
+     * （输入框 / 「选择…」）本来也不需要回填 —— 框里就是那个值。
+     */
+    if (saveDirInput.value.trim() === forInput) saveDirInput.value = next.saveDir
   } catch (e) {
     plan.value = null
     planError.value = (e as IpcBusinessError).toUserText()
   } finally {
     planning.value = false
+    // L9：在途期间被记下来的那次编辑，现在按最新输入重算一次（以前是直接丢）
+    const pending = pendingInput
+    pendingInput = null
+    if (pending !== null && pending !== plannedFor && pending !== plan.value?.saveDir) {
+      void loadPlan(pending)
+    }
   }
 }
 
 /** 手输/粘贴路径后重新算计划（防抖：边打字边算会把主进程刷爆） */
 watch(saveDirInput, (v) => {
-  if (running.value || planning.value) return
   const next = v.trim()
   if (!next || next === plan.value?.saveDir) return
+  // 下载正在跑：计划改了也没有意义（落盘路径已经交给任务了）
+  if (running.value) return
+  if (planning.value) {
+    // L9：不丢这次编辑 —— 等本次返回后按它重算
+    pendingInput = next
+    return
+  }
   if (saveDirTimer) clearTimeout(saveDirTimer)
   saveDirTimer = setTimeout(() => void loadPlan(next), 350)
 })
@@ -136,6 +166,9 @@ async function pickDir(): Promise<void> {
   try {
     const picked = await api.app.pickDirectory({ defaultPath: plan.value?.saveDir ?? null })
     if (!picked) return
+    // 用户明确选的目录：**先落到输入框**再让计划按它重算 —— 这样"回填写入框"
+    // 不再由计划结果代劳（那条路只在"框还停在请求发起值"时才写，见 `loadPlan`）
+    saveDirInput.value = picked.path
     await loadPlan(picked.path)
   } catch (e) {
     ElMessage.error((e as IpcBusinessError).toUserText())
@@ -176,6 +209,23 @@ async function reveal(path: string): Promise<void> {
   if (reason) ElMessage.warning(reason)
 }
 
+/**
+ * 重开一次计划：清掉上一次的输入、在途编辑与待触发的防抖定时器（L9）。
+ *
+ * 定时器也要清：不清的话，上一次打开时按下的一次防抖会在**重新打开之后**才触发，
+ * 拿着一份过期的输入去打一次 IPC。
+ */
+function restartPlan(): void {
+  plan.value = null
+  saveDirInput.value = ''
+  pendingInput = null
+  if (saveDirTimer) {
+    clearTimeout(saveDirTimer)
+    saveDirTimer = null
+  }
+  void loadPlan()
+}
+
 /** 每次打开都是新的一次下载：清掉上一次的状态 */
 watch(
   () => props.modelValue,
@@ -183,8 +233,7 @@ watch(
     if (!v) return
     startedJob.value = null
     failText.value = ''
-    plan.value = null
-    void loadPlan()
+    restartPlan()
   },
   { immediate: true }
 )
@@ -195,7 +244,7 @@ watch(
     if (props.modelValue) {
       startedJob.value = null
       failText.value = ''
-      void loadPlan()
+      restartPlan()
     }
   }
 )

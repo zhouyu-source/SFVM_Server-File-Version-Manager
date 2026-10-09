@@ -199,9 +199,15 @@ export function runLocalScript(input: RunLocalScriptInput): Promise<ScriptExecOu
 
     child.on('close', (code: number | null) => {
       exitCode = code
-      // 先把解码器里压着的尾巴交出去，再判终态 —— 否则最后半个字符（以及
-      // 最后一段没有换行的输出）会丢
-      flushDecoders()
+      /**
+       * 先把解码器里压着的尾巴交出去，再判终态 —— 否则最后半个字符（以及
+       * 最后一段没有换行的输出）会丢。
+       *
+       * 但**只在还没结账时交**（L3）：`forceTimer` 那条兜底路径可能已经
+       * `settle()` 过了，此时 `createOutputSink.write()` 会去 `openSync` 一个新 fd
+       * 而再没有人关它（泄漏），落在这一步上的输出也已无人接收。
+       */
+      if (!settled) flushDecoders()
       if (timedOut) {
         settle(new AppError(ErrorCode.E_SCRIPT_TIMEOUT, { pid: child.pid }))
         return

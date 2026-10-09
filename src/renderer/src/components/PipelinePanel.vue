@@ -386,8 +386,22 @@ const jobStore = useJobStore()
  */
 const deployJobIds = ref<string[]>([])
 
+/*
+ * 只认"本目标 + 本面板发起"的那几个任务。
+ *
+ * 两个条件缺一不可（M12）：
+ * - `deployJobIds` 是**跨目标全局**累积的，换目标时必须清空（见下方 watch），
+ *   否则在 A 目标发起的任务跑到 B 目标页时，会替 B 发出 `deployed`，
+ *   让 `TargetDetail` 去刷新一个根本没发布过的目标。
+ * - `targetId` 再兜一层：`deployJobIds` 里理论上只存本目标的 id，但流水线的
+ *   发布步骤是主进程内部直调 `deploy.run`（没有 UI 侧发起），万一将来有别的
+ *   入口塞进来，也不能把别人家的任务算成自己的。
+ */
 watch(
-  () => jobStore.jobs.filter((j) => deployJobIds.value.includes(j.jobId)),
+  () =>
+    jobStore.jobs.filter(
+      (j) => deployJobIds.value.includes(j.jobId) && j.targetId === props.target.id
+    ),
   (mine) => {
     const done = mine.filter((j) => isTerminalStatus(j.status))
     if (done.length === 0) return
@@ -495,6 +509,9 @@ watch(
   () => {
     list.value = []
     editorOpen.value = false
+    // 上个目标遗留的"待收尾发布任务"一律作废（M12）：它们属于旧目标，
+    // 留着会让新目标的页面对旧目标的任务做出反应。
+    deployJobIds.value = []
     void refresh()
   }
 )

@@ -112,19 +112,28 @@ export async function acquireRemoteLock(input: AcquireRemoteLockInput): Promise<
 }
 
 /**
- * 放锁：**尽力而为**，失败只记日志。
+ * 放锁：**尽力而为**，失败不抛，改用返回值说明结果。
  *
  * 理由：锁本身会因超过 `LOCK_STALE_MS` 而失效，所以"没删掉"不会把目标永久锁死；
  * 而此刻调用方通常正处在收尾阶段（内容已经就位），把一次成功的操作改成失败更糟。
+ *
+ * **但调用方必须看返回值**：返回 `false` 时锁还在服务器上，后续该目标的发布都会被
+ * 这把陈旧锁挡住。以前这里 `return void`，调用方只能"盲目置位 `lockHeld=false`"，
+ * 于是补偿里的重试被跳过、失败也无法记进补偿清单 —— 用户拿到的是一份"一切正常"
+ * 的收尾，服务器上却留着一把锁（M2）。
+ *
+ * @returns 锁文件确已被删除为 `true`；删除失败为 `false`（已记日志）。
  */
 export async function releaseRemoteLock(
   fs: Pick<LockFsPort, 'removeFile'>,
   remotePath: string,
   log?: (text: string, level?: 'info' | 'warn' | 'error') => void
-): Promise<void> {
+): Promise<boolean> {
   try {
     await fs.removeFile(lockPathOf(remotePath))
+    return true
   } catch (err) {
     log?.(`释放远端锁失败：${(err as Error).message}`, 'warn')
+    return false
   }
 }

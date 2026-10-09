@@ -23,9 +23,11 @@ import {
   SMALL_FILE_THRESHOLD,
   createTransfer,
   pipeWithProgress,
+  replaceFile,
+  type ReplaceFsLike,
   type TransferPort
 } from '@main/services/transfer'
-import { ErrorCode } from '@main/infra/errors'
+import { AppError, ErrorCode } from '@main/infra/errors'
 
 const dirs: string[] = []
 function makeTmp(): string {
@@ -372,6 +374,36 @@ describe('upload（T07.9）', () => {
       )
     }
   })
+
+  it('进度不重复计数：文件完成后必须摘掉"在途"（M5 回归）', async () => {
+    const root = makeTmp()
+    const SIZE = 100
+    const files = Array.from({ length: 3 }, (_, i) => {
+      const p = join(root, `f${i}.bin`)
+      writeFileSync(p, 'x'.repeat(SIZE))
+      return { localPath: p, remotePath: `/opt/payload/f${i}.bin` }
+    })
+    const port = new MemoryTransferPort()
+    const t = createTransfer(port, fast)
+
+    const seen: Array<{ transferred: number; filesDone: number }> = []
+    await t.upload(files, {
+      concurrency: 1,
+      // 关掉节流，才能精确看到"某个文件刚完成"的那一刻
+      progressIntervalMs: 0,
+      onProgress: (p) => seen.push({ transferred: p.transferred, filesDone: p.filesDone })
+    })
+
+    /**
+     * 快照是 `doneBytes + Σinflight`。若完成时只加 `doneBytes` 而不把该文件
+     * 从 `inflight` 里摘掉，同一个文件会被算两遍 —— 传完第 1 个文件就会报 200。
+     */
+    const firstDone = seen.find((s) => s.filesDone === 1)
+    expect(firstDone?.transferred).toBe(SIZE)
+    const secondDone = seen.find((s) => s.filesDone === 2)
+    expect(secondDone?.transferred).toBe(SIZE * 2)
+    expect(seen[seen.length - 1]?.transferred).toBe(SIZE * 3)
+  })
 })
 
 describe('download（T07.10）', () => {
@@ -537,6 +569,116 @@ describe('download（T07.10）', () => {
 
     await t.download([{ remotePath: '/opt/a.jar', localPath: target }])
     expect(existsSync(target)).toBe(true)
+  })
+
+  /**
+   * L15：覆盖落盘失败时**保留 `.part`**。
+   *
+   * 这一步走到时 `.part` 已经校验通过，"换不上去"和"没下下来"是两回事：
+   * 把校验通过的成果删掉、又可能连旧文件一起没了，是最亏的收场。
+   */
+  it('L15：覆盖落盘失败 → .part 保留（内容可用）、旧目标不被清空', async () => {
+    const root = makeTmp()
+    const target = join(root, 'order.jar')
+    writeFileSync(target, 'OLD-GOOD')
+    const content = Buffer.from('NEW-CONTENT')
+    const port = new MemoryTransferPort()
+    port.files.set('/opt/archives/v2/payload/order.jar', content)
+    const t = createTransfer(port, {
+      ...fast,
+      replaceFile: () => Promise.reject(new Error('模拟换名失败'))
+    })
+
+    const err = await t
+      .download([
+        {
+          remotePath: '/opt/archives/v2/payload/order.jar',
+          localPath: target,
+          expectedHash: createHash('sha256').update(content).digest('hex')
+        }
+      ])
+      .then(() => null)
+      .catch((e: AppError) => e)
+
+    expect(err?.code).toBe(ErrorCode.E_DOWNLOAD_INTERRUPTED)
+    // 失败详情带上 .part 路径 —— 用户知道去哪儿把这份内容捡回来
+    expect((err?.detail as { partPath?: string })?.partPath).toBe(`${target}.part`)
+    // 旧文件原样还在（真实 replaceFile 会回滚；注入的替身直接失败，正好验"我们没动它"）
+    expect(readFileSync(target).toString()).toBe('OLD-GOOD')
+    // .part 保留，且是**校验通过**的完整内容
+    expect(existsSync(`${target}.part`)).toBe(true)
+    expect(readFileSync(`${target}.part`, 'utf8')).toBe('NEW-CONTENT')
+  })
+})
+
+/* ------------------------------------------------------------------- L15 */
+
+/** `replaceFile` 用的小假 fs：只实现它要的两个动作，可按序号注入失败。 */
+class FakeReplaceFs implements ReplaceFsLike {
+  files = new Map<string, string>()
+  /** 第 N 次 `rename`（1-based）抛这个错 */
+  renameFailAt = new Map<number, Error>()
+  renameCalls: Array<{ from: string; to: string }> = []
+
+  async rename(from: string, to: string): Promise<void> {
+    this.renameCalls.push({ from, to })
+    const scripted = this.renameFailAt.get(this.renameCalls.length)
+    if (scripted) throw scripted
+    // 与 Windows 一致：目标已存在就拒绝覆盖
+    if (this.files.has(to)) {
+      throw Object.assign(new Error(`EEXIST: ${to}`), { code: 'EEXIST' })
+    }
+    const content = this.files.get(from)
+    if (content === undefined) {
+      throw Object.assign(new Error(`ENOENT: ${from}`), { code: 'ENOENT' })
+    }
+    this.files.delete(from)
+    this.files.set(to, content)
+  }
+
+  async rm(path: string): Promise<void> {
+    this.files.delete(path)
+  }
+}
+
+describe('replaceFile（覆盖式落盘，L15）', () => {
+  it('目标已存在：旧的先挪到 .sfvm-old，换成功后备份被删（新内容就位）', async () => {
+    const fs = new FakeReplaceFs()
+    fs.files.set('/d/a.jar.part', 'NEW')
+    fs.files.set('/d/a.jar', 'OLD')
+
+    await replaceFile('/d/a.jar.part', '/d/a.jar', fs)
+
+    expect(fs.files.get('/d/a.jar')).toBe('NEW')
+    expect(fs.files.has('/d/a.jar.part')).toBe(false)
+    // 备份是"这次覆盖前的内容"，成功后就该清掉，别在用户目录里留垃圾
+    expect(fs.files.has('/d/a.jar.sfvm-old')).toBe(false)
+  })
+
+  it('第二次 rename 失败 → 旧文件被搬回原名，.part 内容也还在（两头都不丢）', async () => {
+    const fs = new FakeReplaceFs()
+    fs.files.set('/d/a.jar.part', 'NEW')
+    fs.files.set('/d/a.jar', 'OLD')
+    fs.renameFailAt.set(3, new Error('模拟换名失败'))
+
+    await expect(replaceFile('/d/a.jar.part', '/d/a.jar', fs)).rejects.toThrow('模拟换名失败')
+
+    // 关键断言：目标**不是空的**，还是原来那份旧内容
+    expect(fs.files.get('/d/a.jar')).toBe('OLD')
+    expect(fs.files.get('/d/a.jar.part')).toBe('NEW')
+    expect(fs.files.has('/d/a.jar.sfvm-old')).toBe(false)
+  })
+
+  it('非"目标已存在"类的错误 → 直接抛，不碰任何东西', async () => {
+    const fs = new FakeReplaceFs()
+    fs.files.set('/d/a.jar.part', 'NEW')
+    fs.files.set('/d/a.jar', 'OLD')
+    fs.renameFailAt.set(1, Object.assign(new Error('EIO'), { code: 'EIO' }))
+
+    await expect(replaceFile('/d/a.jar.part', '/d/a.jar', fs)).rejects.toThrow('EIO')
+    expect(fs.renameCalls).toHaveLength(1)
+    expect(fs.files.get('/d/a.jar')).toBe('OLD')
+    expect(fs.files.get('/d/a.jar.part')).toBe('NEW')
   })
 })
 

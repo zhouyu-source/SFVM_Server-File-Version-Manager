@@ -10,7 +10,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { createDemoJobSpec, createJobService, delay, type JobSpec } from '@main/services/job'
-import { ErrorCode } from '@main/infra/errors'
+import { AppError, ErrorCode } from '@main/infra/errors'
 import { isTerminalStatus, MAX_JOB_LOGS, type JobView } from '@shared/contracts/job'
 
 /* -------------------------------------------------------------- 工具 */
@@ -158,6 +158,32 @@ describe('基本生命周期（T08.3）', () => {
     expect(v.percent).toBe(40)
     expect(v.finishedAt).not.toBeNull()
   })
+
+  it('失败详情进 UI 前过脱敏：敏感键被替换、自由文本里的凭据被擦掉（M7 / A2 回归）', async () => {
+    const jobs = createJobService()
+    const job = jobs.start({
+      type: 'demo',
+      title: 'leaky',
+      async run() {
+        throw new AppError(ErrorCode.E_SCRIPT_EXIT, {
+          connectionId: 'c1',
+          // 结构里的敏感键 → redact 按"键名"整段替换
+          password: 'Hunter2!',
+          // 自由文本里的凭据 → redact 不管，得靠 scrubText 擦
+          original: 'connect failed: password=Hunter2! to db',
+          // 嵌套结构也要走到（不能只扫第一层）
+          nested: [{ token: 'abc123' }]
+        })
+      }
+    })
+    await waitStatus(jobs, job.jobId, 'failed')
+
+    const detail = byId(jobs, job.jobId).error?.detail as Record<string, unknown>
+    expect(detail.connectionId).toBe('c1') // 非敏感字段保留，排查不受影响
+    expect(detail.password).toBe('***') // 敏感键 → 整段替换
+    expect(detail.original).toBe('connect failed: password=*** to db') // 自由文本 → 擦除
+    expect((detail.nested as Array<Record<string, unknown>>)[0]!.token).toBe('***')
+  })
 })
 
 describe('同目标串行、不同目标并行（T08.3 验收点）', () => {
@@ -292,6 +318,39 @@ describe('取消：两条路径（T08.7）', () => {
     await waitStatus(jobs, ja.jobId, 'cancelled')
     expect(g.aborted()).toBe(true)
     expect(cleanups).toEqual(['cancel'])
+  })
+
+  it('取消队列中间的任务不会误释放车道：末尾任务仍排队、不启动（S4 回归）', async () => {
+    const jobs = createJobService()
+    const a = gateSpec({ id: 'A', targetId: 'tg1' })
+    const b = gateSpec({ id: 'B', targetId: 'tg1' })
+    const c = gateSpec({ id: 'C', targetId: 'tg1' })
+    const ja = jobs.start(a.spec)
+    const jb = jobs.start(b.spec)
+    const jc = jobs.start(c.spec)
+
+    await waitStatus(jobs, ja.jobId, 'running')
+    expect(byId(jobs, jb.jobId).status).toBe('queued')
+    expect(byId(jobs, jc.jobId).status).toBe('queued')
+
+    // 取消的是排在中间的 B —— 它从未进过 running，不该碰车道
+    expect(jobs.cancel(jb.jobId).cancelled).toBe(true)
+    await waitStatus(jobs, jb.jobId, 'cancelled')
+
+    // A 仍在跑 ⇒ C 必须继续排队，绝不能被拉起来与 A 并发
+    await new Promise((r) => setTimeout(r, 30))
+    expect(byId(jobs, jc.jobId).status).toBe('queued')
+    expect(c.started()).toBe(false)
+    expect(jobs.list({ status: ['running'], targetId: 'tg1' })).toHaveLength(1)
+    expect(byId(jobs, ja.jobId).status).toBe('running')
+
+    // A 结束后才轮到 C
+    a.release()
+    await waitStatus(jobs, ja.jobId, 'succeeded')
+    await waitStatus(jobs, jc.jobId, 'running')
+    expect(c.started()).toBe(true)
+    c.release()
+    await waitStatus(jobs, jc.jobId, 'succeeded')
   })
 
   it('取消后车道被释放，后面的同目标任务正常开跑', async () => {
@@ -454,6 +513,26 @@ describe('cancelAll（退出保护，T08.7）', () => {
     expect(byId(jobs, ja.jobId).status).toBe('cancelled')
     expect(byId(jobs, jb.jobId).status).toBe('cancelled')
     expect(b.started()).toBe(false)
+  })
+
+  it('退出时取消队列中间的任务，末尾任务不会被拉起来（S4 回归）', async () => {
+    const jobs = createJobService()
+    const a = gateSpec({ id: 'A', targetId: 'tg1' })
+    const b = gateSpec({ id: 'B', targetId: 'tg1' })
+    const c = gateSpec({ id: 'C', targetId: 'tg1' })
+    const ja = jobs.start(a.spec)
+    jobs.start(b.spec)
+    const jc = jobs.start(c.spec)
+
+    await waitStatus(jobs, ja.jobId, 'running')
+
+    await jobs.cancelAll('quit', { timeoutMs: 500 })
+
+    // 三个都取消，且 B / C 从未被启动（退出过程中不许再连服务器）
+    expect(b.started()).toBe(false)
+    expect(c.started()).toBe(false)
+    expect(byId(jobs, jc.jobId).status).toBe('cancelled')
+    expect(jobs.activeCount()).toBe(0)
   })
 
   it('清理原因区分 quit 与 cancel（退出路径要能识别出来）', async () => {

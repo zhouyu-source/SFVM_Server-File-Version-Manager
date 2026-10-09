@@ -92,15 +92,18 @@ export interface ArchiveIpcDeps {
    * 只换"端口从哪来"，不换使用端口的逻辑：目录命名、校验顺序、
    * "失败保留产物"这些真正会写错的地方仍被真实执行。
    */
-  openDownloadPorts?: (
-    targetId: string
-  ) => Promise<{ source: DownloadSourcePort; transfer: DownloadTransferPort; connectionId: string }>
+  openDownloadPorts?: (targetId: string) => Promise<{
+    source: DownloadSourcePort
+    transfer: DownloadTransferPort
+    connectionId: string
+    release?: () => void
+  }>
 }
 
 /**
  * 三条链路的 SFTP 方法并集（归档目录操作 / 哈希 / 传输）。
  *
- * 一次 `pool.sftp()` 就够它们共用（SFTP 通道上的请求互相独立），
+ * 一次 `openChannel()` 就够它们共用（SFTP 通道上的请求互相独立），
  * 所以不为了"类型干净"再开几条通道 —— 每多一条通道就多一次握手与一处失败点。
  * 交集写在一起也顺带保证了：只要某条链路要用的方法在这个并集里，
  * 它拿到的一定是同一条通道。
@@ -112,6 +115,8 @@ interface OpenedPorts {
   ports: ArchivePorts
   sftp: ArchiveSftp
   connectionId: string
+  /** 释放这条通道（S2）；单测注入的假端口没有，调用方写 `?.()` */
+  release?: () => void
 }
 
 export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
@@ -139,7 +144,8 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
       throw new AppError(ErrorCode.E_CONN_LOST, { connectionId: connId, reason: 'capability-missing' })
     }
 
-    const sftp = (await pool.sftp(connId)) as unknown as ArchiveSftp
+    const { sftp: rawSftp, release } = await pool.openChannel(connId)
+    const sftp = rawSftp as unknown as ArchiveSftp
     const tmpDir = joinRemote(
       normalizeRemotePath(capability.homeDir?.trim() || '/tmp'),
       '.sfvm-tmp'
@@ -147,12 +153,27 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
 
     const hash: RemoteHashPort = createSftpHashPort({
       sftp,
-      exec: (cmd) => pool.exec(connId, cmd),
+      exec: (cmd, timeoutMs) => pool.exec(connId, cmd, timeoutMs),
       capability,
       tmpDir
     })
 
-    return { ports: { fs: createSftpArchivePort(sftp), hash }, sftp, connectionId: connId }
+    return { ports: { fs: createSftpArchivePort(sftp), hash }, sftp, connectionId: connId, release }
+  }
+
+  /**
+   * S2：把"开一条通道 → 一次服务调用 → 关掉"收成一处。
+   *
+   * 归档的四个 handler（校验 / 保留策略 / 明细 / 删除）形状一致，
+   * 收在一处以后新加 handler 不会忘释放。
+   */
+  async function withPorts<T>(targetId: string, fn: (ports: ArchivePorts) => Promise<T>): Promise<T> {
+    const opened = await openPorts(targetId)
+    try {
+      return await fn(opened.ports)
+    } finally {
+      opened.release?.()
+    }
   }
 
   registerHandler(IPC_CHANNELS.ARCHIVES_LIST, archiveListInputSchema, ({ targetId }) =>
@@ -164,8 +185,9 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
     if (!row) throw new AppError(ErrorCode.E_NOT_FOUND, { archiveId })
     logger.info(`archives.verify: ${row.versionTag} @ ${row.storagePath}`)
 
-    const { ports } = await openPorts(row.targetId)
-    const result = await archive.verifyArchive({ archiveId, ports })
+    const result = await withPorts(row.targetId, (ports) =>
+      archive.verifyArchive({ archiveId, ports })
+    )
 
     repo.audit.write({
       level: result.ok ? 'info' : 'warn',
@@ -186,10 +208,8 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
   registerHandler(
     IPC_CHANNELS.ARCHIVES_APPLY_RETENTION,
     archiveApplyRetentionInputSchema,
-    async ({ targetId }) => {
-      const { ports } = await openPorts(targetId)
-      return archive.applyRetention({ targetId, fs: ports.fs })
-    }
+    async ({ targetId }) =>
+      withPorts(targetId, (ports) => archive.applyRetention({ targetId, fs: ports.fs }))
   )
 
   /* ------------------------------------------------- T12.6 台账占用汇总 */
@@ -204,14 +224,15 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
     const row = repo.archives.get(input.archiveId)
     if (!row) throw new AppError(ErrorCode.E_NOT_FOUND, { archiveId: input.archiveId })
 
-    const { ports } = await openPorts(row.targetId)
     // 只读操作：读不到 manifest 也**不**改台账状态（那是「校验」的职责）
-    return archive.readDetail({
-      archiveId: input.archiveId,
-      offset: input.offset,
-      limit: input.limit,
-      ports
-    })
+    return withPorts(row.targetId, (ports) =>
+      archive.readDetail({
+        archiveId: input.archiveId,
+        offset: input.offset,
+        limit: input.limit,
+        ports
+      })
+    )
   })
 
   /* ------------------------------------------- T12.3 下载（计划 + 执行） */
@@ -234,16 +255,20 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
    * 与归档侧的"目录操作 + 哈希"是两组不同的方法面；共用一个端口对象会让
    * 两边的方法越并越多，最终没人说得清谁真的用了什么。
    */
-  async function openDownloadPorts(
-    targetId: string
-  ): Promise<{ source: DownloadSourcePort; transfer: DownloadTransferPort; connectionId: string }> {
+  async function openDownloadPorts(targetId: string): Promise<{
+    source: DownloadSourcePort
+    transfer: DownloadTransferPort
+    connectionId: string
+    release?: () => void
+  }> {
     if (deps.openDownloadPorts) return deps.openDownloadPorts(targetId)
 
-    const { ports, sftp, connectionId } = await openPorts(targetId)
+    const { ports, sftp, connectionId, release } = await openPorts(targetId)
     return {
       connectionId,
       source: { stat: (p) => ports.fs.stat(p), readTextFile: (p) => ports.fs.readTextFile(p) },
-      transfer: createTransfer(createSftpTransferPort(sftp))
+      transfer: createTransfer(createSftpTransferPort(sftp)),
+      release
     }
   }
 
@@ -285,6 +310,8 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
           })
         } finally {
           pool.setBusy(opened.connectionId, false)
+          // S2：下载用的通道到此为止（cleanup 只删本地暂存目录，不碰远端）
+          opened.release?.()
         }
       },
       /**
@@ -355,8 +382,9 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
       hint: '请等它结束后再删除往期版本。'
     })
 
-    const { ports } = await openPorts(first.targetId)
-    const result = await archive.removeVersions({ archiveIds, fs: ports.fs })
+    const result = await withPorts(first.targetId, (ports) =>
+      archive.removeVersions({ archiveIds, fs: ports.fs })
+    )
     logger.info(
       `archives.remove: 成功 ${result.removed.length} / 失败 ${result.failed.length}，` +
         `释放 ${result.freedBytes} 字节`

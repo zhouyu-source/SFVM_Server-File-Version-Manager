@@ -88,8 +88,11 @@ function okOutcome(releaseId: string): DeployOutcome {
 function fakeDeployPort(opts: {
   precheck?: (targetId: string) => DeployPrecheckReport
   run?: (input: { targetId: string; releaseId: string }) => DeployOutcome
-} = {}): { port: PipelineDeployPort; calls: { precheck: string[]; run: string[] } } {
-  const calls = { precheck: [] as string[], run: [] as string[] }
+} = {}): {
+  port: PipelineDeployPort
+  calls: { precheck: string[]; run: string[]; cleanup: string[] }
+} {
+  const calls = { precheck: [] as string[], run: [] as string[], cleanup: [] as string[] }
   return {
     calls,
     port: {
@@ -100,6 +103,12 @@ function fakeDeployPort(opts: {
       run: ({ targetId, releaseId }) => {
         calls.run.push(releaseId)
         return Promise.resolve(opts.run?.({ targetId, releaseId }) ?? okOutcome(releaseId))
+      },
+      // M6：第二道清理。记一笔就够 —— "有没有被调到、拿到的是不是本次 jobId"
+      // 正是被测行为（真清理逻辑在 services/deploy-residue.ts，由 B10 单测覆盖）
+      cleanupResidue: ({ targetId, jobId }) => {
+        calls.cleanup.push(`${targetId}:${jobId}`)
+        return Promise.resolve()
       }
     }
   }
@@ -622,6 +631,77 @@ describe('B21 发布步骤：直接调 deploy，不新建任务', () => {
       expect(run.status).toBe('failed')
       expect(run.errorMessage).toContain('换版失败')
       expect(t.repo.scriptStepRuns.listByRun(run.id)[0]!.status).toBe('failed')
+    } finally {
+      t.cleanup()
+    }
+  })
+
+  /* --------------------------------------------------- M6：第二道残留清理 */
+
+  /**
+   * M6 回归：含发布步骤的流水线在失败/取消时必须走 `cleanup`，
+   * 并把本次 `jobId` 传下去（清理只删"暂存目录属于本次任务"的那一份，
+   * 以及"锁里 releaseId 正是本次任务"的那把锁）。
+   *
+   * 缺陷回顾：`jobOf()` 里根本没有 `cleanup` —— 而 `job.ts` 的 `runCleanup()`
+   * 首行就是 `if (!rec.spec.cleanup) return`。于是流水线发布失败后，
+   * 服务器上的 `.sfvm-staging-<jobId>` 与发布锁只能等 `LOCK_STALE_MS` 过期
+   * 或人工走对账；直接点发布却没有这个问题（`ipc/deploy.ts` 一直有这道保险）。
+   */
+  it('M6：发布步骤失败 → 走第二道清理，且带上本次 jobId', async () => {
+    const t = makeTestDb()
+    try {
+      const { target } = seedBasic(t.repo)
+      const fake = fakeDeployPort({
+        run: ({ releaseId }) => ({
+          ...okOutcome(releaseId),
+          ok: false,
+          status: 'FAILED',
+          failure: {
+            code: ErrorCode.E_UPLOAD_INTERRUPTED,
+            stage: 2,
+            stageText: '阶段 2 上传暂存',
+            message: '链路断了',
+            compensations: []
+          }
+        })
+      })
+      const { pipelines } = makeService(t, { deploy: fake.port })
+      const p = pipelines.save(draft(target.id, [stepDraft({ kind: 'deploy', name: '发布', script: '' })]))
+
+      const spec = pipelines.runJob({ pipelineId: p.pipelineId }, {})
+      const r = await runSpec(spec, makeCtx('job-clean-1'))
+      expect(r.ok).toBe(false)
+
+      // 任务层只对"失败/取消"调 cleanup（成功不走）—— 这里显式调一次，
+      // 模拟 `job.ts` 的 `runCleanup()`（它的日志/超时不在本文件的职责内）
+      await spec.cleanup?.('failed', {
+        jobId: 'job-clean-1',
+        log: () => undefined
+      })
+
+      expect(fake.calls.cleanup).toEqual([`${target.id}:job-clean-1`])
+    } finally {
+      t.cleanup()
+    }
+  })
+
+  it('M6：不含发布步骤的流水线不去碰远端（没有暂存目录也没有发布锁）', async () => {
+    const t = makeTestDb()
+    try {
+      const { target } = seedBasic(t.repo)
+      const fake = fakeDeployPort()
+      const { pipelines } = makeService(t, { deploy: fake.port })
+      // 纯远端脚本步骤：失败也只跟脚本自己的进程有关
+      const p = pipelines.save(
+        draft(target.id, [stepDraft({ name: '跑脚本', kind: 'remote', script: 'false' })])
+      )
+
+      const spec = pipelines.runJob({ pipelineId: p.pipelineId }, {})
+      await runSpec(spec, makeCtx())
+      await spec.cleanup?.('failed', { jobId: 'job-clean-2', log: () => undefined })
+
+      expect(fake.calls.cleanup).toEqual([])
     } finally {
       t.cleanup()
     }

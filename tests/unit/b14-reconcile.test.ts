@@ -166,6 +166,8 @@ describe('ReconcileService（B14 对账与恢复）', () => {
       rootHash: 'bogus-hash',
       totalBytes: 999,
       fileCount: 42,
+      // 台账上的归档时间也是错的（本地偏移格式），修正时同样要以 manifest 为准并归一成 UTC
+      archivedAt: '2026-09-11T08:00:00+08:00',
       status: 'valid'
     })
 
@@ -174,6 +176,13 @@ describe('ReconcileService（B14 对账与恢复）', () => {
     expect(row.rootHash).toBe(sha256('v1'))
     expect(row.totalBytes).toBe('v1'.length)
     expect(row.fileCount).toBe(1)
+    /**
+     * M1：修正路径的 `archivedAt` 也必须过 `toUtcIso` —— 与"补录"分支同一个坑。
+     * manifest 里是 `2026-09-10T12:00:00+08:00`（本地偏移），落库要统一成
+     * `archived_at` 列约定的 UTC 形态；原样写回会让这一列重新混进两种格式，
+     * 而该列的排序/统计是字符串比较，跨 UTC 日界就会错序。
+     */
+    expect(row.archivedAt).toBe('2026-09-10T04:00:00.000Z')
     expect(r.adopted[0]).toMatchObject({ how: 'updated' })
   })
 

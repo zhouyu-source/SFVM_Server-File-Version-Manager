@@ -8,7 +8,7 @@ import {
   type OpenDialogOptions,
   type BrowserWindow as BW
 } from 'electron'
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { promises as fsp } from 'node:fs'
 import { registerHandler } from '../infra/ipc'
 import { logger } from '../infra/logger'
@@ -43,6 +43,31 @@ export interface AppHandlerDeps {
    * 接线层（`index.ts`）总是会传。
    */
   dataLocation?: DataLocationService
+}
+
+/**
+ * 起完进程后**让出一个 tick**，看它有没有立刻以 `'error'` 结束（L14）。
+ *
+ * `spawn()` 对"命令不存在"（ENOENT）**不抛**，它是异步通过 `'error'` 事件报的。
+ * 不挂监听就是主进程未捕获异常；挂了但不等一个 tick 又会立刻 `return {ok:true}`，
+ * 把一次失败报成成功。所以这里两条都做：挂监听 + 竞一个 tick。
+ *
+ * 监听器**不摘**：之后才发生的 `'error'` 仍由它吸收，不会再冒成未捕获异常。
+ */
+function waitForSpawnOutcome(child: ChildProcess): Promise<Error | null> {
+  return new Promise((resolve) => {
+    let settled = false
+    child.on('error', (err: Error) => {
+      if (settled) return
+      settled = true
+      resolve(err)
+    })
+    setImmediate(() => {
+      if (settled) return
+      settled = true
+      resolve(null)
+    })
+  })
 }
 
 export function registerAppHandlers(deps: AppHandlerDeps = {}): void {
@@ -257,17 +282,38 @@ export function registerAppHandlers(deps: AppHandlerDeps = {}): void {
     const candidates = terminalCandidates(process.platform, path)
     let lastErr = '没有可用的终端程序'
     for (const inv of candidates) {
+      let child: ChildProcess
       try {
         // detached + 不 stdio 继承：终端是新窗口，不该挂在本应用的进程树上
         // （否则应用一退出，用户刚打开的终端会被一起收走）
-        const child = spawnProcess(inv.command, inv.args, { detached: true, stdio: 'ignore' })
-        // `unref` 让父进程不必等它；某些替身/极简实现没有这个方法
-        if (typeof child.unref === 'function') child.unref()
-        logger.info(`openTerminal: ${inv.command} ${JSON.stringify(inv.args)}`)
-        return { ok: true } satisfies OpenShellResult
+        child = spawnProcess(inv.command, inv.args, { detached: true, stdio: 'ignore' })
       } catch (err) {
+        // 少数实现会**同步**抛（我们的单测替身就是这种）
         lastErr = (err as Error).message
+        continue
       }
+
+      /**
+       * L14：`spawn()` 是**同步返回**的，"命令不存在"（ENOENT）这类失败却是
+       * **异步**通过 `'error'` 事件报出来的 —— 它不抛。以前这里既没挂 `'error'`
+       * 监听、又无条件 `return {ok:true}`，于是 Linux 上候选终端全都不存在时：
+       * 主进程冒出未捕获异常（`'error'` 无监听者时 Node 会直接抛），
+       * 而界面那边只看到"点了没反应"。
+       *
+       * 现在起完进程先**让出一个 tick** 等 `'error'`：没等到才算真的起来了；
+       * 等到了就把原因记下、继续试下一个候选。监听器不摘 —— 之后真出别的错
+       * （例如后来才 EACCES）也被这一条兜住，不会再变成未捕获异常。
+       */
+      const failed = await waitForSpawnOutcome(child)
+      if (failed) {
+        lastErr = failed.message
+        continue
+      }
+
+      // `unref` 让父进程不必等它；某些替身/极简实现没有这个方法
+      if (typeof child.unref === 'function') child.unref()
+      logger.info(`openTerminal: ${inv.command} ${JSON.stringify(inv.args)}`)
+      return { ok: true } satisfies OpenShellResult
     }
     return { ok: false, reason: lastErr } satisfies OpenShellResult
   })

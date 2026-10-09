@@ -14,7 +14,7 @@
  * 任务与其返回值都不落库，所以"上次那步成没成、退出码多少、输出尾部是什么"
  * 只能来自 `script_runs` / `script_step_runs` —— 于是这些断言必须存在。
  */
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { makeTestDb, seedBasic } from '../helpers/db'
@@ -498,6 +498,49 @@ describe('B20 输出留档策略', () => {
       expect(ctx.logs).toContain('b')
       // 第一行说明"在哪跑、超时多久"——失败时用户靠它判断环境对不对
       expect(ctx.logs.some((l) => l.includes('超时'))).toBe(true)
+    } finally {
+      t.cleanup()
+    }
+  })
+
+  /**
+   * L3 回归：步骤收尾之后迟到的输出**不能再落盘**。
+   *
+   * 旧实现里 `createOutputSink.write()` 看到 `fd === null` 就 `openSync(path,'a')`
+   * 重新开一个 —— 而 `close()` 早已跑过，这个新 fd **再没有人关**。
+   * 触发路径真实存在：取消/超时把 Promise 结掉之后，流上仍可能再来一块数据
+   * （进程还没死透），落到这里就是稳定的句柄泄漏。
+   *
+   * 用"先解决 Promise、再补一块输出"的假远端通道把这件事**确定性地**复现出来，
+   * 不依赖真起进程的时序。
+   */
+  it('L3：步骤收尾之后迟到的输出被丢弃（不再新开一个永不关闭的 fd）', async () => {
+    const t = makeTestDb()
+    try {
+      const { target } = seedBasic(t.repo)
+      const svc = makeService(t)
+      let lateOutput: (() => void) | null = null
+      const exec: RawExecFn = (_command, opts) => {
+        opts.onStdout(Buffer.from('先到的一块\n', 'utf8'))
+        // 把"迟到的那一块"留到 promise 解决之后再送
+        lateOutput = (): void => opts.onStdout(Buffer.from('迟到的一块\n', 'utf8'))
+        return Promise.resolve({ stdout: '', stderr: '', code: 0, timedOut: false })
+      }
+      const spec = svc.stepJob(runInput({ targetId: target.id, kind: 'remote' }), remoteIo(exec))
+      const r = await runSpec(spec, makeCtx())
+      expect(r.ok).toBe(true)
+
+      const step = (r as { value: ScriptRunView }).value.steps[0]!
+      const sizeBefore = statSync(step.outputPath!).size
+      expect(sizeBefore).toBeGreaterThan(0)
+
+      // 记录已落库、文件已 close —— 此时再来一块输出
+      lateOutput!()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+
+      // 文件不再增长：旧实现会在这里 openSync + writeSync，把内容补进去
+      expect(statSync(step.outputPath!).size).toBe(sizeBefore)
+      expect(readFileSync(step.outputPath!, 'utf8')).not.toContain('迟到')
     } finally {
       t.cleanup()
     }

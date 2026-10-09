@@ -23,6 +23,8 @@ import type { Stats } from 'ssh2'
 class FakeSftp implements SftpLike {
   dirs = new Set<string>(['/'])
   files = new Set<string>()
+  /** 符号链接：path → 指向的路径（`stat` 跟随、`lstat` 不跟随） */
+  links = new Map<string, string>()
 
   putDir(p: string): void {
     this.dirs.add(p)
@@ -32,13 +34,33 @@ class FakeSftp implements SftpLike {
     this.files.add(p)
   }
 
-  exists(p: string): boolean {
-    return this.dirs.has(p) || this.files.has(p)
+  putLink(p: string, target: string): void {
+    this.links.set(p, target)
   }
 
-  private statOf(p: string): Stats {
+  exists(p: string): boolean {
+    return this.dirs.has(p) || this.files.has(p) || this.links.has(p)
+  }
+
+  /** 跟随链接找到真正指向的路径（限 8 层，防御自环）。 */
+  private resolve(p: string): string {
+    let cur = p
+    for (let i = 0; i < 8 && this.links.has(cur); i++) cur = this.links.get(cur) as string
+    return cur
+  }
+
+  private statOf(p: string, follow = true): Stats {
+    if (!follow && this.links.has(p)) {
+      return {
+        isDirectory: (): boolean => false,
+        isSymbolicLink: (): boolean => true,
+        size: 0
+      } as unknown as Stats
+    }
+    const real = this.resolve(p)
     return {
-      isDirectory: (): boolean => this.dirs.has(p),
+      isDirectory: (): boolean => this.dirs.has(real),
+      isSymbolicLink: (): boolean => false,
       size: 0
     } as unknown as Stats
   }
@@ -49,6 +71,14 @@ class FakeSftp implements SftpLike {
       return
     }
     cb(null, this.statOf(path))
+  }
+
+  lstat(path: string, cb: (err: Error | null | undefined, stats: Stats) => void): void {
+    if (!this.exists(path)) {
+      cb(Object.assign(new Error('no such file'), { code: 2 }), this.statOf(path, false))
+      return
+    }
+    cb(null, this.statOf(path, false))
   }
 
   readdir(
@@ -71,6 +101,13 @@ class FakeSftp implements SftpLike {
         out.push({ filename: f.slice(prefix.length), attrs: this.statOf(f) })
       }
     }
+    // 真实服务端（OpenSSH sftp-server）的 readdir 返回的是 lstat 属性 ——
+    // 符号链接不会被说成目录。替身照此实现，里层的链接才会走 unlink 而不是递归。
+    for (const l of this.links.keys()) {
+      if (l.startsWith(prefix) && !l.slice(prefix.length).includes('/')) {
+        out.push({ filename: l.slice(prefix.length), attrs: this.statOf(l, false) })
+      }
+    }
     cb(null, out)
   }
 
@@ -85,6 +122,7 @@ class FakeSftp implements SftpLike {
 
   unlink(path: string, cb: (err?: Error | null) => void): void {
     this.files.delete(path)
+    this.links.delete(path)
     cb()
   }
 
@@ -102,6 +140,64 @@ function makeFs() {
   const fake = new FakeSftp()
   return { fake, fs: createRemoteFs(fake) }
 }
+
+/**
+ * S3 回归：`rmrf` **不得顺着符号链接删东西**。
+ *
+ * 成因是 `stat` 用 SSH_FXP_STAT（跟随链接）：目标被配成
+ * `current -> releases/20261009-xxx`（生产上极常见的"当前版本指针"写法）时，
+ * 三层字符串守卫全都看不见这次空间重定向 —— `stat` 报它是个普通目录，
+ * 递归就顺着链接读进 `releases/xxx` 把内容逐个删掉：链接还在，内容没了。
+ */
+describe('rmrf 符号链接守卫（S3）', () => {
+  it('顶层是符号链接 → 拒绝，且被指向的目录内容完好', async () => {
+    const { fake, fs } = makeFs()
+    fake.putDir('/opt/app/releases/20261009-aaa')
+    fake.putFile('/opt/app/releases/20261009-aaa/index.html')
+    fake.putLink('/opt/app/current', '/opt/app/releases/20261009-aaa')
+
+    // 先钉住"为什么必须 lstat"：stat 会把它说成一个普通目录
+    expect((await fs.stat('/opt/app/current')).isDirectory).toBe(true)
+    expect((await fs.lstat('/opt/app/current')).isSymbolicLink).toBe(true)
+
+    await expect(fs.rmrf('/opt/app/current')).rejects.toMatchObject({
+      code: ErrorCode.E_PATH_UNSAFE
+    })
+    // 被指向的内容一个都不能少
+    expect(fake.exists('/opt/app/releases/20261009-aaa/index.html')).toBe(true)
+    // 链接本身也不替用户删（"要不要删这个指针"只有人判断得了）
+    expect(fake.exists('/opt/app/current')).toBe(true)
+  })
+
+  it('报错文案说清楚是符号链接（用户得知道下一步该看什么）', async () => {
+    const { fake, fs } = makeFs()
+    fake.putDir('/opt/app/releases/20261009-aaa')
+    fake.putLink('/opt/app/current', '/opt/app/releases/20261009-aaa')
+    try {
+      await fs.rmrf('/opt/app/current')
+      expect.unreachable('应当拒绝')
+    } catch (e) {
+      const msg = (e as AppError).message
+      expect(msg).toContain('符号链接')
+      expect(msg).toContain('/opt/app/current')
+      expect((e as AppError).hint).toBeTruthy()
+    }
+  })
+
+  it('里层的符号链接只删链接本身，不递归进被指向的目录', async () => {
+    const { fake, fs } = makeFs()
+    fake.putDir('/opt/app/releases/20261009-bbb')
+    fake.putFile('/opt/app/releases/20261009-bbb/index.html')
+    fake.putDir('/tmp/sfvm-t/dir')
+    fake.putLink('/tmp/sfvm-t/dir/ptr', '/opt/app/releases/20261009-bbb')
+
+    await fs.rmrf('/tmp/sfvm-t/dir')
+
+    expect(fake.exists('/tmp/sfvm-t/dir')).toBe(false)
+    // 链接没了，但被指向的目录与内容都还在
+    expect(fake.exists('/opt/app/releases/20261009-bbb/index.html')).toBe(true)
+  })
+})
 
 describe('rmrf 层级守卫（浅路径）', () => {
   it('拒绝删除 2 层的**外来**路径（守卫仍然有效）', async () => {

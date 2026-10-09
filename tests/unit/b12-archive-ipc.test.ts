@@ -188,32 +188,39 @@ describe('版本库 IPC 接线（T12.3 ~ T12.7）', () => {
       })
     )
 
+    /**
+     * 连接池替身：下载走注入的端口，但 `archives.detail` 走的是真实的
+     * `openPorts` 接线，所以要能给出"一条可用的通道"。
+     * 只实现 detail 会用到的那一个方法（`readFile`）—— 替身越小，
+     * "哪条路径真的被走过"越清楚。
+     *
+     * S2 起 `openPorts` 经 `openChannel` 拿通道（拿到通道 + `release`），
+     * 所以替身也要给出 `openChannel` —— `release` 在这里是空操作，
+     * 因为假通道没有真实 session 可关。
+     */
+    const detailSftp = {
+      readFile: (path: string, cb: (err: Error | null, data: Buffer) => void) => {
+        const buf = remote.files.get(path)
+        if (!buf) {
+          cb(Object.assign(new Error('no such file'), { code: 2 }), Buffer.alloc(0))
+          return
+        }
+        cb(null, buf)
+      }
+    }
+
     registerArchiveHandlers({
       archive: createArchiveService({ repo }),
       download: createArchiveDownloadService({ repo }),
       jobs,
       connections: {} as never,
-      /**
-       * 连接池替身：下载走注入的端口，但 `archives.detail` 走的是真实的
-       * `openPorts` 接线，所以要能给出"一条可用的通道"。
-       * 只实现 detail 会用到的那一个方法（`readFile`）—— 替身越小，
-       * "哪条路径真的被走过"越清楚。
-       */
       pool: {
         setBusy: (connectionId: string, busy: boolean) => busyLog.push({ connectionId, busy }),
         isOnline: () => true,
         capabilityOf: () => ({ homeDir: '/root' }),
         exec: async () => '',
-        sftp: async () => ({
-          readFile: (path: string, cb: (err: Error | null, data: Buffer) => void) => {
-            const buf = remote.files.get(path)
-            if (!buf) {
-              cb(Object.assign(new Error('no such file'), { code: 2 }), Buffer.alloc(0))
-              return
-            }
-            cb(null, buf)
-          }
-        })
+        sftp: async () => detailSftp,
+        openChannel: async () => ({ sftp: detailSftp, release: () => undefined })
       } as never,
       repo,
       defaultSaveDir: () => saveDir,

@@ -19,7 +19,7 @@
  * 成功台账。于是"当前版本 = v2、往期版本 = v1"不是伪造的数据结构，
  * 而是真跑出来的状态 —— 归档目录里有真的 manifest，校验也校验得了。
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { rmSync } from 'node:fs'
 import { createArchiveService } from '@main/services/archive'
 import { createDeployService } from '@main/services/deploy'
@@ -254,6 +254,75 @@ describe('RollbackService（B13 回滚）', () => {
     expect(fake.text(`${REMOTE}/index.html`)).toBe('v1')
   })
 
+  /* --------------------------- M3：阶段 5/6 记账失败不得把成功改成失败 ----- */
+
+  it('M3 回归：阶段 6 的 markDeployed 抛错 → 回滚仍报成功、台账记 SUCCESS', async () => {
+    const a = await setupArchived()
+    const spy = vi.spyOn(t.repo.targets, 'markDeployed').mockImplementation(() => {
+      throw new Error('目标状态写不进去')
+    })
+    try {
+      const { result, text } = run(a.archiveId)
+      const out = await result
+      // 内容已经就位 —— 绝不能因"记账失败"被记成 FAILED（用户看到失败会重试 → 再归档一份）
+      expect(out.ok).toBe(true)
+      expect(t.repo.releases.get('rb-1')!.status).toBe('SUCCESS')
+      expect(fake.text(`${REMOTE}/index.html`)).toBe('v1')
+      expect(text()).toContain('回滚成功，但更新目标状态失败')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('M3 回归：阶段 6 的台账收尾抛错 → 不回滚内容、不改判成功', async () => {
+    const a = await setupArchived()
+    const spy = vi.spyOn(t.repo.releases, 'finish').mockImplementation(() => {
+      throw new Error('台账写不进去')
+    })
+    try {
+      const { result, text } = run(a.archiveId)
+      const out = await result
+      expect(out.ok).toBe(true)
+      // 内容确实换成了所选版本（没被补偿回滚）
+      expect(fake.text(`${REMOTE}/index.html`)).toBe('v1')
+      expect(text()).toContain('回滚成功，但写台账终态失败')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('M3 回归：阶段 5 写逐文件清单抛错 → 回滚仍报成功（明细只是锦上添花）', async () => {
+    const a = await setupArchived()
+    const spy = vi.spyOn(t.repo.releaseItems, 'addMany').mockImplementation(() => {
+      throw new Error('清单写不进去')
+    })
+    try {
+      const { result, text } = run(a.archiveId)
+      const out = await result
+      expect(out.ok).toBe(true)
+      expect(t.repo.releases.get('rb-1')!.status).toBe('SUCCESS')
+      expect(text()).toContain('逐文件清单未能写入台账')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('M3 回归：阶段 5 摘归档台账行抛错（不保留来源）→ 回滚仍报成功', async () => {
+    const a = await setupArchived()
+    const spy = vi.spyOn(t.repo.archives, 'remove').mockImplementation(() => {
+      throw new Error('台账写不进去')
+    })
+    try {
+      const { result, text } = run(a.archiveId, { keepSource: false })
+      const out = await result
+      expect(out.ok).toBe(true)
+      expect(t.repo.releases.get('rb-1')!.status).toBe('SUCCESS')
+      expect(text()).toContain('版本库记录未能摘除')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
   it('台账：写 action=rollback / source=archive / archive_id，并把被取代的那版标成 ROLLED_BACK', async () => {
     const a = await setupArchived()
     await run(a.archiveId).result
@@ -445,6 +514,37 @@ describe('RollbackService（B13 回滚）', () => {
     expect(t.repo.archives.countByTarget(targetId)).toBeGreaterThanOrEqual(1)
     // 锁仍然要放掉：不放会把目标永久锁死
     expect(fake.has(lockPathOf(REMOTE))).toBe(false)
+  })
+
+  /* ------------------------------------------------ L13：失败分支的 moveMode */
+
+  it('L13：失败分支返回的 moveMode 与实际一致（挂载点 + 不保留来源 → copy）', async () => {
+    const a = await setupArchived()
+    // 目标本身是挂载点 ⇒ 换版退化成复制（`canRename === false`）
+    fake.dfOverride.set(REMOTE, { filesystem: '/dev/sdb1', mountPoint: REMOTE })
+    // 阶段 3 的复制失败
+    fake.copyFileFailures.set(`${REMOTE}/index.html`, {
+      err: new Error('模拟复制中断'),
+      remaining: 1
+    })
+
+    const out = await run(a.archiveId, { keepSource: false }).result
+
+    expect(out.ok).toBe(false)
+    // 实际走的是 copy（旧实现在这里返回 rename：`keepSource ? 'copy' : 'rename'`）
+    expect(out.moveMode).toBe('copy')
+    // 日志里也明说了走复制 —— 展示与事实两处对齐
+    expect(out.failure).toBeTruthy()
+  })
+
+  it('L13：成功分支同样按实际路径返回（挂载点 + 不保留来源 → copy）', async () => {
+    const a = await setupArchived()
+    fake.dfOverride.set(REMOTE, { filesystem: '/dev/sdb1', mountPoint: REMOTE })
+
+    const out = await run(a.archiveId, { keepSource: false }).result
+
+    expect(out.ok).toBe(true)
+    expect(out.moveMode).toBe('copy')
   })
 
   /* -------------------------------------------------------- 目标不存在 */

@@ -9,6 +9,7 @@
  * - 私钥只存路径，读取发生在主进程
  */
 import { readFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
 import { verifyHostKey, type TrustedFingerprint } from '../../shared/host-key'
@@ -40,6 +41,35 @@ export type { AuthType, ConnectionInput, ConnectionView, TestResult }
 export interface ConnectionServiceDeps {
   repo: Repositories
   pool: SshConnectionPool
+}
+
+/**
+ * 一旦被改动就要丢弃池内会话的字段（M11）。
+ *
+ * 判据是"会不会进入 `SshConnectOptions` 或它的派生配置"：主机/端口/用户名/认证方式/
+ * 私钥路径/密码密文。`name`、`remark`、`keepaliveMs`、`autoConnect` 都不影响一条
+ * 已建会话能不能继续用，改它们不该把用户在线中的连接踢下线。
+ */
+const CONNECTION_SESSION_FIELDS = [
+  'host',
+  'port',
+  'username',
+  'authType',
+  'privateKeyPath',
+  'secretCipher'
+] as const
+
+/**
+ * 「连接测试」用的一次性连接 id 前缀。
+ *
+ * `__test__` 是**跨层约定**：`ssh-client` 不认识它，但 `test()` 用它来判定
+ * "这条探测连接必须被丢弃"。用 `randomUUID()` 而不是时间戳：同一毫秒内的两条
+ * 草稿测试会撞同一个 id，第二条会直接命中第一条已进池的条目（L7）。
+ */
+const TEST_CONNECTION_ID_PREFIX = '__test__'
+
+function testConnectionId(): string {
+  return `${TEST_CONNECTION_ID_PREFIX}${randomUUID()}`
 }
 
 /* -------------------------------------------------------------------- 服务 */
@@ -76,12 +106,18 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
       .map((k) => ({ keyType: k.keyType, fingerprint: k.fingerprint }))
   }
 
-  /** 组装 ssh2 建连参数（含解密凭据）。仅在主进程内使用。 */
+  /**
+   * 组装 ssh2 建连参数（含解密凭据）。仅在主进程内使用。
+   *
+   * `idOverride` 给「连接测试」用（S5）：测试必须是**一次性**的，不能占用真实 id ——
+   * 否则探测连接会进池、该连接无声变成 online，而库里 `lastConnectedAt` 又没更新。
+   */
   function buildConnectOptions(
     row: ConnectionRow,
     policy: 'accept-any' | 'strict',
     expectedFingerprint?: string,
-    overrideSecret?: string
+    overrideSecret?: string,
+    idOverride?: string
   ): SshConnectOptions {
     let secret = overrideSecret
     if (secret === undefined && hasStoredSecret(row.secretCipher)) {
@@ -97,7 +133,7 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
     }
 
     return {
-      connectionId: row.id,
+      connectionId: idOverride ?? row.id,
       host: row.host,
       port: row.port,
       username: row.username,
@@ -183,6 +219,24 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
       }
 
       const row = repo.connections.update(id, patch)!
+
+      /**
+       * M11：连接参数/凭据变了，就必须把池里那条会话丢掉。
+       *
+       * 池里存的是**建连那一刻**的 options 快照 —— 含已解密的 `secret` 与已读盘的
+       * `privateKey` Buffer（见 `SshConnectOptions`），而 `ssh-client.ts` 的退避重连
+       * 正是原样重放这份快照。不主动断开的话：运维改完密码，下一次自动重连仍用旧凭据，
+       * 5 次退避全部以「认证失败」告终 → 落到 offline，只能重启应用；而且报错与
+       * "用了旧凭据"毫无关联，排障方向被带偏。
+       *
+       * 断开是安全的：`pool.disconnect()` 是"用户主动"语义（不触发重连），
+       * 界面上的「连接」按钮可以立刻用新凭据重建。**必须放在 DB 更新之后** ——
+       * 反过来的话，重连窗口里读到的仍是旧行。
+       */
+      if (CONNECTION_SESSION_FIELDS.some((f) => f in patch)) {
+        pool.disconnect(id)
+        logger.info(`connection ${id} 的连接参数已变更，已丢弃池内会话（重连才会生效）`)
+      }
       return toView(row)
     },
 
@@ -201,8 +255,9 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
     /**
      * 连接测试（T03.3/T03.4/T03.7）。
      *
-     * 用临时连接：探测完立即断开，不进入池，因此不会影响"在线状态"。
+     * 用临时连接：探测完立即断开，**不进入池**，因此不会影响"在线状态"。
      * 支持两种来源：已保存的连接（传 id），或表单里还没保存的参数（传 input + secret）。
+     * 两条来源都用 `__test__` 前缀的一次性 id（S5 之前只有后者是）。
      */
     async test(params: { id?: string; input?: ConnectionInput }): Promise<TestResult> {
       const started = Date.now()
@@ -222,14 +277,24 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
         port = row.port
         trusted = trustedFingerprints(host, port)
         // 先用宽松策略拿指纹，再按 known_hosts 判定是否一致
-        options = buildConnectOptions(row, 'accept-any')
+        //
+        // S5：**必须换成一次性 id**。以前这里用的是 `row.id`，于是 `pool.connect`
+        // 建出来的会话会被塞进池里、该连接无声变成 online（而库里 `lastConnectedAt`
+        // 并未更新，两端不一致）；更糟的是下面那句"不以 `__test__` 开头就不断开"
+        // 使这条 `accept-any` 的、未经指纹校验的会话**留在池里**，被后续发布/归档/
+        // 回滚的 `if (!pool.isOnline(id)) connect(id)` 直接复用 —— `verifyHostKey`
+        // 算出来的 `mismatch` 沦为一句没有执行力的返回值。
+        options = buildConnectOptions(row, 'accept-any', undefined, undefined, testConnectionId())
       } else if (params.input) {
         const i = params.input
         host = i.host
         port = i.port ?? 22
         trusted = trustedFingerprints(host, port)
         options = {
-          connectionId: `__test__${Date.now()}`,
+          // 一次性 id 用 randomUUID：旧实现是 `Date.now()`，同一毫秒内的两条草稿
+          // 会共用同一个 id，第二条直接命中第一条已进池的条目（凭据完全不同），
+          // 返回的是**第一条**的 capability 与指纹（L7）。
+          connectionId: testConnectionId(),
           host,
           port,
           username: i.username,
@@ -252,8 +317,17 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
         // T03.4：用纯逻辑判定指纹（match / unknown / mismatch）
         const verdict = verifyHostKey(result.hostKeyFingerprint, trusted, result.hostKeyType)
 
-        // 探测用的临时连接不进池、随后断开
-        if (options.connectionId.startsWith('__test__')) {
+        /**
+         * 探测连接**一律**丢弃：上面两条来源现在都用 `__test__` 前缀的一次性 id。
+         *
+         * `mismatch` 是无条件判据（S5）：指纹与已知记录不符 = 疑似中间人，
+         * 那条会话绝不能留在池里被复用。正常情况下它本就被 `__test__` 覆盖，
+         * 这里显式写出来是为了"即便将来有人改成复用真实 id 也守得住"。
+         */
+        if (
+          verdict.status === 'mismatch' ||
+          options.connectionId.startsWith(TEST_CONNECTION_ID_PREFIX)
+        ) {
           pool.disconnect(options.connectionId)
         }
 
@@ -265,8 +339,10 @@ export function createConnectionService(deps: ConnectionServiceDeps) {
           hostKeyStatus: verdict.status
         }
       } catch (err) {
-        // 确保测试连接不留下池中残留
-        if (options.connectionId.startsWith('__test__')) pool.disconnect(options.connectionId)
+        // 确保测试连接不留下池中残留（失败路径同样只在 `__test__` 一次性 id 上发生）
+        if (options.connectionId.startsWith(TEST_CONNECTION_ID_PREFIX)) {
+          pool.disconnect(options.connectionId)
+        }
         throw err instanceof AppError ? err : mapConnectError(err as Error)
       }
     },

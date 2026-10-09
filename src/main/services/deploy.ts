@@ -153,8 +153,16 @@ export interface DeployPorts {
   archiveFs: ArchiveFsPort
   hash: RemoteHashPort
   transfer: TransferPort
-  /** 执行白名单命令（`test -w` / `df` / `chmod` / `chown`） */
-  exec(command: string): Promise<{ stdout: string; stderr: string; code: number | null }>
+  /**
+   * 执行白名单命令（`test -w` / `df` / `chmod` / `chown`）。
+   *
+   * `timeoutMs` 只在"耗时随数据量增长"的命令上传（远端清单校验，见 L2）；
+   * 其余命令省略，用连接层的默认值。
+   */
+  exec(
+    command: string,
+    timeoutMs?: number
+  ): Promise<{ stdout: string; stderr: string; code: number | null }>
   capability: Pick<ConnectionCapability, 'hasSha256sum' | 'hasShasum' | 'platform' | 'homeDir'>
   /** 写进锁文件，便于用户判断"是谁在发布" */
   hostname: string
@@ -257,7 +265,7 @@ export function createSftpDeployPort(sftp: DeploySftpLike): DeployFsPort {
 }
 
 /**
- * 一次性把 `pool.sftp()` 得到的通道包成发布需要的全部端口。
+ * 一次性把 `openChannel()` 得到的通道包成发布需要的全部端口。
  *
  * 四次 `sftp(...)` 调用**共用同一条 SFTP 通道**：通道上的请求互相独立，
  * 多开一条通道就多一次握手、多一个失败点，没有收益。
@@ -424,9 +432,21 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortError()
 }
 
-/** 把 SFTP `Stats.mode`（含文件类型位）转成 `chmod` 要的八进制字符串。 */
+/**
+ * 把 SFTP `Stats.mode`（含文件类型位）转成 `chmod` 要的八进制字符串。
+ *
+ * **必须补足到 3 位**（L10）：`(mode & 0o7777).toString(8)` 在权限位不足 3 位时
+ * 会产出 `"40"` / `"7"` 这类字符串，而 `assertModeBits` 只接受 3~4 位
+ * （`/^[0-7]{3,4}$/`）—— 于是 `chmod` 命令根本构造不出来。而且这个异常发生在
+ * **调用方**的 try 之外（见 `alignOwnership` 里的说明），后果不是"权限没恢复"
+ * 而是整次发布被判失败并触发补偿（把刚换上去的新版本删掉）。
+ *
+ * 补到 3 位而不是 4 位：`755` / `644` 是这套代码与界面里既有的写法，
+ * 4 位写法（`0755`）会改掉所有正常路径上的命令与提示文案，收益为零。
+ * 带特殊位的形态（`4755`）本来就是 4 位，`padStart` 不会动它。
+ */
 export function toModeBits(mode: number): string {
-  return (mode & 0o7777).toString(8)
+  return (mode & 0o7777).toString(8).padStart(3, '0')
 }
 
 export function fmtBytes(n: number): string {
@@ -749,7 +769,10 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     const mountInfo = detectMountPoint({ remotePath, targetDf, parentDf })
     if (mountInfo.isMountPoint || mountInfo.crossDevice) {
       items.push({
-        key: 'disk-space',
+        // L12：以前这里与「磁盘余量」共用 `'disk-space'`。`PrecheckItem.key`
+        // 同时是列表渲染的 key（`PublishPanel.vue` 的 `v-for`），full 模式下
+        // 两项会同时出现 ⇒ Vue 报重复 key、`data-test` 也串在一行上。
+        key: 'filesystem',
         label: '文件系统',
         level: 'warn',
         detail: `${mountInfo.reason ?? '目标与暂存不在同一文件系统'}，将使用复制模式（耗时较长）`,
@@ -807,7 +830,19 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       items.push({
         key: 'residue',
         label: '远端残留',
-        level: manual.length > 0 ? 'warn' : 'error',
+        /**
+         * 「有手动项」才是更严重的那一侧（L11，原判定写反了）。
+         *
+         * 判据来自 `isAutoCleanable` 自己的注释：只有 `.sfvm-staging-*` 敢自动删，
+         * `*.part` 一律不删 —— 因为本工具的上传中断形态是暂存目录、并不产生远端
+         * `.part`，所以那更可能是**别的进程或别人留下的东西**，工具无权替人做主。
+         * 需要人来做决定的事，理应是 `error` 而不是 `warn`；反过来，全部都能自动
+         * 清理（只是自己上次留下的暂存目录）时流程会就地清掉，`warn` 足够。
+         *
+         * 这一项不影响是否拦发布：`:900` 的 `needConfirm` 只看 `level !== 'ok'`，
+         * `PublishPanel` 的 `blocked` 又把 `key === 'residue'` 整个排除在外。
+         */
+        level: manual.length > 0 ? 'error' : 'warn',
         detail:
           `发现 ${residue.length} 项上次发布留下的东西：` +
           residue.map((r) => `${r.name}（${describeResidue(r.kind)}）`).join('、'),
@@ -924,11 +959,21 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     state.lockHeld = true
   }
 
-  /** 放锁：尽力而为，失败只记日志（锁本身会因陈旧而失效）。 */
-  async function releaseLock(ports: DeployPorts, state: StageState): Promise<void> {
-    if (!state.lockHeld) return
-    state.lockHeld = false
-    await releaseRemoteLock(ports.fs, state.remotePath, (t) => logger.warn(t))
+  /**
+   * 放锁：尽力而为，失败只记日志（锁本身会因陈旧而失效）。
+   *
+   * **先按返回值判断、再决定要不要清 `lockHeld`**（M2）：旧写法是"先把
+   * `lockHeld = false` 再等放锁结果"，而 `releaseRemoteLock` 不抛错，
+   * 于是放锁失败也被记成"已释放" —— 补偿里的 `if (state.lockHeld)` 直接跳过重试，
+   * 锁留在服务器上，之后该目标的所有发布都会被这把陈旧锁挡住。
+   *
+   * @returns 锁确已释放为 `true`；仍持有（失败）为 `false`。
+   */
+  async function releaseLock(ports: DeployPorts, state: StageState): Promise<boolean> {
+    if (!state.lockHeld) return true
+    const released = await releaseRemoteLock(ports.fs, state.remotePath, (t) => logger.warn(t))
+    if (released) state.lockHeld = false
+    return released
   }
 
   /* ------------------------- 上一次发布的清单与版本号（提速 + 号数对齐） */
@@ -1118,8 +1163,19 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       })
       state.mountInfo = pre.mountInfo
 
+      /**
+       * 把非 ok 的体检项转述到任务日志里。
+       *
+       * 日志级别**跟随体检项自己的 level**（L11 配套）：原先的
+       * `level === 'warn' ? 'warn' : 'info'` 会把 `error` 记成 `info`，而残留项按
+       * 上面的新判据"有手动项 ⇒ error"之后，最该被看见的那一类反而只剩 info。
+       * 抛错分支（锁 / 残留 / 其余 error）本来就会再抛一次 `AppError`，多一行
+       * 同级别的上下文不冲突。
+       */
       for (const i of pre.report.items) {
-        if (i.level !== 'ok') ctx.log(`${i.label}：${i.detail}`, i.level === 'warn' ? 'warn' : 'info')
+        if (i.level !== 'ok') {
+          ctx.log(`${i.label}：${i.detail}`, i.level === 'error' ? 'error' : 'warn')
+        }
       }
 
       // 锁：陈旧锁可以在用户确认后清掉；被占用必须等
@@ -1481,6 +1537,10 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         : null
       if (archived) {
         state.archiveId = archived.archive.id
+        // 落库：崩溃恢复的「恢复旧版本」依赖 releases.archive_id 找到这一份归档。
+        // 只在内存里记（历史 bug）的话，崩溃后对账会拿到 undefined，
+        // 进而给出「这次操作没有归档过旧版本」的误导性理由，甚至抛 E_NOT_FOUND。
+        release = repo.releases.update(release.id, { archiveId: archived.archive.id })!
         ctx.log(
           `已归档当前版本为 ${archived.archive.versionTag}` +
             (rollbackRestored
@@ -1552,16 +1612,34 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
        */
       let dedupeKeptTag: string | null = null
       if (archived && prev?.action === 'rollback' && prev.archiveId) {
-        // 为什么没去重的各种情形由 archive 自己按严重程度说明（info/warn）
-        const deduped = await archive.discardDuplicateArchive({
-          archiveId: archived.archive.id,
-          keepArchiveId: prev.archiveId,
-          fs: ports.archiveFs,
-          log: (text, level) => ctx.log(text, level)
-        })
-        if (deduped.discarded) {
-          // 台账里"本次归档的版本"已经不在了；对用户有意义的是**保留下来**的那份
-          dedupeKeptTag = deduped.keptVersionTag
+        try {
+          // 为什么没去重的各种情形由 archive 自己按严重程度说明（info/warn）
+          const deduped = await archive.discardDuplicateArchive({
+            archiveId: archived.archive.id,
+            keepArchiveId: prev.archiveId,
+            fs: ports.archiveFs,
+            log: (text, level) => ctx.log(text, level)
+          })
+          if (deduped.discarded) {
+            // 台账里"本次归档的版本"已经不在了；对用户有意义的是**保留下来**的那份
+            dedupeKeptTag = deduped.keptVersionTag
+          }
+        } catch (err) {
+          /**
+           * M4：去重是"成功之后的锦上添花"，**绝不能**因为它的失败把已经成功的
+           * 发布拖进补偿 —— 这段代码仍在 `run()` 的大 try 里，一旦异常穿透，
+           * `catch` 会按当前 `stage` 走补偿链，把刚换上去的新版本删掉、旧版本搬回来
+           * （用户看到的是"发布成功了几秒后又变回旧版本"）。
+           *
+           * `discardDuplicateArchive` 内部已尽量自兜（`rmrf` 失败只记 warn），
+           * 但 `repo.archives.remove()` 与 `audit.write()` 仍在它的 try 之外，仍可能抛。
+           * 这里再兜一层：失败只上报，结果等同于"没去成重"（多留一份重复，不丢内容）。
+           */
+          logger.warn(`去除重复归档失败（不影响发布结果）：${(err as Error).message}`)
+          ctx.log(
+            `警告：未能去除重复归档（${(err as Error).message}），往期版本里可能多出一份重复`,
+            'warn'
+          )
         }
       }
 
@@ -1611,7 +1689,15 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       }
     } catch (err) {
       /* ================= 失败：补偿 ================= */
-      const failure = await compensate(err, stage, state, ports, ctx, compensations)
+      const failure = await compensate(
+        err,
+        stage,
+        state,
+        ports,
+        ctx,
+        compensations,
+        release.id
+      )
       try {
         repo.releases.finish(release.id, 'FAILED', `${failure.code}: ${failure.message}`)
         if (err instanceof AppError && err.code === ErrorCode.E_JOB_CANCELLED) {
@@ -1701,14 +1787,24 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
      * 原本 755 的脚本会被改成 644 而失去可执行位。而"恢复归档前的 mode"
      * 本身只能表达一个值，表达不了"目录 755 / 文件 644 / 脚本 755"这组事实。
      * 目标目录自身的权限才是 nginx 遍历时真正需要的（DoD 也是这么写的）。
+     *
+     * ## 命令构造必须发生在 try **里面**（A1）
+     *
+     * `buildChmodCommand` / `buildChownCommand` 会先过参数校验
+     * （`assertModeBits` / `assertIdNumber`），校验不过就抛。老写法把
+     * `buildChmodCommand({...})` 当**普通实参**传给 `tryRun` —— 它在进入 try
+     * 之前就被求值了，异常会直接穿出 `alignOwnership`，落到 `run()` 的 catch，
+     * 按当前 `stage` 走补偿：把**刚换上去的新版本删掉、旧版本搬回来**
+     * （用户看到的是"发布成功了几秒后又变回旧版本"）。
+     * 权限对齐本是"仅告警"的一步，它的失败绝不该有这种后果 —— 所以传 thunk。
      */
     const tryRun = async (
       action: 'chmod' | 'chown',
-      cmd: string,
-      okText: string,
+      build: () => { cmd: string; okText: string },
       failText: string
     ): Promise<void> => {
       try {
+        const { cmd, okText } = build()
         const r = await ports.exec(cmd)
         const ok = r.code === 0
         out.push({
@@ -1725,14 +1821,21 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
 
     await tryRun(
       'chmod',
-      buildChmodCommand({ mode: toModeBits(mode), path: state.remotePath }),
-      `已恢复权限 ${toModeBits(mode)}`,
+      () => {
+        const bits = toModeBits(mode)
+        return {
+          cmd: buildChmodCommand({ mode: bits, path: state.remotePath }),
+          okText: `已恢复权限 ${bits}`
+        }
+      },
       '恢复权限失败（仅告警）'
     )
     await tryRun(
       'chown',
-      buildChownCommand({ uid, gid, path: state.remotePath }),
-      `已恢复属主 ${uid}:${gid}`,
+      () => ({
+        cmd: buildChownCommand({ uid, gid, path: state.remotePath }),
+        okText: `已恢复属主 ${uid}:${gid}`
+      }),
       '恢复属主失败（仅告警；非 root 账号下属正常）'
     )
     return out
@@ -1753,7 +1856,12 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       logger.warn(`清理暂存目录失败：${(err as Error).message}`)
       ctx.log(`警告：暂存目录 ${state.stagingRoot} 未能删除，请手工清理`, 'warn')
     }
-    await releaseLock(ports, state)
+    const released = await releaseLock(ports, state)
+    if (!released) {
+      // 内容已经就位，不把成功的发布改成失败；但这把锁必须让用户知道去哪儿清 ——
+      // 否则该目标后续发布全部会被 E_DEPLOY_BLOCKED 挡住（M2）。
+      ctx.log('警告：远端锁未能自动释放，请到「往期版本 → 对账」清理该目标的锁', 'warn')
+    }
   }
 
   /* ------------------------------------------------------ 失败补偿 */
@@ -1764,7 +1872,8 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     state: StageState,
     ports: DeployPorts,
     ctx: DeployContext,
-    out: Array<{ action: string; ok: boolean; detail?: string }>
+    out: Array<{ action: string; ok: boolean; detail?: string }>,
+    releaseId: string
   ): Promise<DeployFailure> {
     const appErr = err instanceof AppError ? err : null
     const code = appErr?.code ?? ErrorCode.E_UNKNOWN
@@ -1805,6 +1914,13 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
             log
           })
           out.push({ action: '归档复位', ok: true, detail: '已把旧版本搬回目标路径' })
+          // 归档行已经被 undoArchive 摘掉了，台账上的 archive_id 必须跟着清空 ——
+          // 否则崩溃恢复会拿着一个指向已删行的 id 去找归档，报出「找不到」的假象。
+          try {
+            repo.releases.update(releaseId, { archiveId: null })
+          } catch (e) {
+            logger.error(`清空台账归档 id 失败：${(e as Error).message}`)
+          }
         } catch (e) {
           const detail = (e as Error).message
           out.push({ action: '归档复位', ok: false, detail })
@@ -1828,8 +1944,17 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       }
       if (state.lockHeld) {
         try {
-          await releaseLock(ports, state)
-          out.push({ action: '释放远端锁', ok: true })
+          const released = await releaseLock(ports, state)
+          out.push({
+            action: '释放远端锁',
+            ok: released,
+            ...(released
+              ? {}
+              : { detail: '远端锁未能自动释放，请到「往期版本 → 对账」清理该目标的锁' })
+          })
+          if (!released) {
+            log('警告：远端锁未能自动释放，请到「往期版本 → 对账」清理该目标的锁', 'warn')
+          }
         } catch (e) {
           out.push({ action: '释放远端锁', ok: false, detail: (e as Error).message })
         }

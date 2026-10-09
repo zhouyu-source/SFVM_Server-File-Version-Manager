@@ -242,7 +242,7 @@ function createProgressReporter(
   intervalMs = DEFAULT_PROGRESS_INTERVAL_MS
 ): {
   setInflight: (key: string, bytes: number) => void
-  finishFile: (bytes: number) => void
+  completeFile: (key: string, bytes: number) => void
   dropInflight: (key: string) => void
   flush: (force?: boolean) => void
 } {
@@ -279,7 +279,17 @@ function createProgressReporter(
       currentFile = key
       flush(false)
     },
-    finishFile(bytes) {
+    completeFile(key, bytes) {
+      /**
+       * M5：**先把该文件从"在途"里摘掉，再计入已完成**。
+       *
+       * `inflight` 存的是"这个文件已传了多少字节"，而快照是
+       * `doneBytes + Σinflight`。如果完成时只加 `doneBytes` 却不摘 key，
+       * 同一个文件的字节会被算两遍 —— 传完约一半文件时 `transferred` 就到 2×，
+       * 被 `Math.min(transferred, total)` 夹到 100%，用户看到「进度 100% 但还在跑」。
+       * 所以"在途"与"已完成"必须互斥。
+       */
+      inflight.delete(key)
       doneBytes += bytes
       filesDone++
       flush(true)
@@ -354,22 +364,51 @@ async function withRetry<T>(
   }
 }
 
+/** `replaceFile` 用到的两个 fs 动作（抽出来是为了单测能注入失败）。 */
+export interface ReplaceFsLike {
+  rename(from: string, to: string): Promise<void>
+  rm(path: string, opts: { force: boolean }): Promise<void>
+}
+
 /**
  * 覆盖式 rename。
  *
  * POSIX 的 `rename(2)` 本来就允许覆盖；Windows 上目标存在会报 EEXIST/EPERM，
- * 于是退化成"先删再改名"。这一步只在**校验通过后**执行，
- * 因此"删了旧的、新的没改名成功"这个窗口极短，且失败会抛出原始错误。
+ * 于是退化成"先把旧的挪走，再把新的改名进来"。
+ *
+ * ## L15：为什么是"挪走"而不是"删掉"
+ *
+ * 旧实现第二步是 `rm(to)` —— 一旦紧跟的 `rename(from,to)` 再失败，**目标就空了**，
+ * 用户的东西没了（与文件头"失败后本地不留下半截文件"的承诺恰好相反）。
+ * 现在改成先把旧文件改名到 `<to>.sfvm-old`：第二次 rename 失败就把旧的搬回原名，
+ * 第二次成功再删掉备份。任何时刻磁盘上都至少有一份完整内容。
  */
-async function replaceFile(from: string, to: string): Promise<void> {
+export async function replaceFile(
+  from: string,
+  to: string,
+  fs: ReplaceFsLike = fsp
+): Promise<void> {
   try {
-    await fsp.rename(from, to)
+    await fs.rename(from, to)
+    return
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code
     if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'EACCES') throw err
-    await fsp.rm(to, { force: true })
-    await fsp.rename(from, to)
   }
+
+  const backup = `${to}.sfvm-old`
+  // 上一次失败可能留下同名备份（内容不确定）：先清掉再改名
+  await fs.rm(backup, { force: true }).catch(() => undefined)
+  await fs.rename(to, backup)
+  try {
+    await fs.rename(from, to)
+  } catch (err) {
+    // 新文件没就位：把旧的搬回去 —— 失败也要抛，但至少别让目标空着
+    await fs.rename(backup, to).catch(() => undefined)
+    throw err
+  }
+  // 成功：备份是这次覆盖前的内容，删掉它（删不掉不影响结果）
+  await fs.rm(backup, { force: true }).catch(() => undefined)
 }
 
 export interface TransferDeps {
@@ -377,11 +416,14 @@ export interface TransferDeps {
   hashFile?: (absPath: string, signal?: AbortSignal) => Promise<string>
   /** 覆盖重试退避（默认 `infra/backoff` 的 1s→2s→5s；单测传 1ms 以免拖慢用例） */
   retryDelay?: (attempt: number) => number
+  /** 覆盖落盘的覆盖式改名（单测可注入失败，验 L15 的"保留 .part"） */
+  replaceFile?: (from: string, to: string) => Promise<void>
 }
 
 export function createTransfer(port: TransferPort, deps: TransferDeps = {}) {
   const hashFile = deps.hashFile ?? hashLocalFile
   const retryDelay = deps.retryDelay ?? backoffDelay
+  const replace = deps.replaceFile ?? replaceFile
 
   function normalizeOptions(
     o: TransferOptions = {}
@@ -514,7 +556,7 @@ export function createTransfer(port: TransferPort, deps: TransferDeps = {}) {
         `上传字节数与探测到的大小不一致：${f.localPath} 实际 ${lastBytes} vs 期望 ${f.size}`
       )
     }
-    reporter.finishFile(f.size)
+    reporter.completeFile(key, f.size)
   }
 
   /** 下载（T07.10）：写 `.part` → 校验 → rename。 */
@@ -630,9 +672,6 @@ export function createTransfer(port: TransferPort, deps: TransferDeps = {}) {
           })
         }
       }
-
-      // 校验（或大小核对）通过，才让正式文件名出现
-      await replaceFile(partPath, f.localPath)
     } catch (err) {
       reporter.dropInflight(key)
       // 关键不变量：失败/取消后本地不留下半截正式文件
@@ -645,12 +684,32 @@ export function createTransfer(port: TransferPort, deps: TransferDeps = {}) {
       })
     }
 
+    /**
+     * 覆盖落盘**单独一段**（L15）。
+     *
+     * 走到这里 `.part` 已经是**校验通过**的完整内容，"换不上去"与"没下下来"
+     * 是两回事：这一步失败时**保留 `.part`** 并把路径写进错误 —— 用户自己
+     * 改个名就能用上；旧实现把它当成普通失败一起删了，而目标又可能被前一步的
+     * `rm(to)` 清空，两头落空。
+     */
+    try {
+      await replace(partPath, f.localPath)
+    } catch (err) {
+      reporter.dropInflight(key)
+      throw new AppError(ErrorCode.E_DOWNLOAD_INTERRUPTED, {
+        remotePath: f.remotePath,
+        bytes: lastBytes,
+        partPath,
+        original: (err as Error)?.message
+      })
+    }
+
     if (lastBytes > 0 && lastBytes !== f.size) {
       logger.warn(
         `下载字节数与探测到的大小不一致：${f.remotePath} 实际 ${lastBytes} vs 期望 ${f.size}`
       )
     }
-    reporter.finishFile(f.size)
+    reporter.completeFile(key, f.size)
   }
 
   return { upload, download }

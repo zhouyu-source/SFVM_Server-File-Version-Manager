@@ -93,7 +93,6 @@ import type {
   ScriptCapabilities,
   ScriptRunDetailInput,
   ScriptRunListInput,
-  ScriptRunStepInput,
   ScriptRunView
 } from '../../../shared/contracts/script'
 import type {
@@ -420,10 +419,6 @@ export const api = {
   scripts: {
     capabilities: (): Promise<ScriptCapabilities> =>
       call('scripts.capabilities', () => window.sfvm.scripts.capabilities()),
-
-    /** 跑一条脚本：立刻返回任务视图，进度与日志走 jobs.onProgress / onLog */
-    runStep: (input: ScriptRunStepInput): Promise<JobView> =>
-      call('scripts.runStep', () => window.sfvm.scripts.runStep(input)),
 
     runs: (input: ScriptRunListInput): Promise<ScriptRunView[]> =>
       call('scripts.runs', () => window.sfvm.scripts.runs(input)),
