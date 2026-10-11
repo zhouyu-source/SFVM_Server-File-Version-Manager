@@ -70,8 +70,20 @@ import {
   type RollbackPreviewInput,
   type RollbackSide
 } from '../../shared/contracts/rollback'
-import { artifactPathOf, type ArchiveFsPort, type ArchivePorts, type ArchiveService } from './archive'
-import type { RemoteHashPort } from './hash'
+import type { ArchiveRecoveryDescriptor } from '../infra/archive-recovery'
+import {
+  ArchiveOperationError,
+  artifactPathOf,
+  type ArchiveFsPort,
+  type ArchivePorts,
+  type ArchiveService
+} from './archive'
+import {
+  assertCopyVerificationAvailable,
+  hashRemoteArtifact,
+  verifyCopiedArtifact,
+  type RemoteHashPort
+} from './hash'
 import type { Repositories } from '../db/repositories'
 import type { ConnectionCapability } from '../infra/capability'
 
@@ -124,6 +136,7 @@ interface FinalizeResult {
 export function createRollbackService(deps: {
   repo: Repositories
   archive: ArchiveService
+  hashCompat?: () => boolean
   /**
    * 当前时间。默认取真实时间。
    *
@@ -170,13 +183,13 @@ export function createRollbackService(deps: {
     if (status === 'missing') {
       warnings.push('这个版本的归档目录已经不在服务器上了，回滚会失败（可先执行「校验」确认）。')
     } else if (status === 'corrupt') {
-      warnings.push('上次校验发现这个版本的内容与清单不一致，回滚会把它原样换上线。建议先执行「校验」看差异。')
+      warnings.push(
+        '上次校验发现这个版本的内容与清单不一致，回滚会把它原样换上线。建议先执行「校验」看差异。'
+      )
     }
 
     // 当前线上版本 = 台账里最近一次成功的操作（发布或回滚）
-    const prev = repo.releases
-      .listByTarget(input.targetId, 20)
-      .find((r) => r.status === 'SUCCESS')
+    const prev = repo.releases.listByTarget(input.targetId, 20).find((r) => r.status === 'SUCCESS')
     const current: RollbackSide | null = prev
       ? {
           versionTag: prev.versionTag,
@@ -252,8 +265,12 @@ export function createRollbackService(deps: {
     let moveMode: 'rename' | 'copy'
     let useRename = false
     /** 阶段 2 归档出来的那条记录（阶段 3 失败时用它把当前版本搬回来） */
-    let archivedByThisRun: { archiveId: string; versionTag: string; moveMode: 'rename' | 'copy' } | null =
-      null
+    let archivedByThisRun: {
+      archiveId: string
+      versionTag: string
+      moveMode: 'rename' | 'copy'
+      recovery: ArchiveRecoveryDescriptor
+    } | null = null
     const compensations: Array<{ action: string; ok: boolean; detail?: string }> = []
 
     const target = repo.targets.get(input.targetId)
@@ -288,10 +305,14 @@ export function createRollbackService(deps: {
       detail: Record<string, unknown>,
       text: { message: string; hint?: string }
     ): AppError =>
-      new AppError(code, { ...detail, compensations }, {
-        message: text.message,
-        ...(text.hint ? { hint: text.hint } : {})
-      })
+      new AppError(
+        code,
+        { ...detail, compensations },
+        {
+          message: text.message,
+          ...(text.hint ? { hint: text.hint } : {})
+        }
+      )
 
     try {
       /* =============== 阶段 0：前置校验 =============== */
@@ -354,6 +375,12 @@ export function createRollbackService(deps: {
 
       /* 换版/归档能否用原子 rename：目标是挂载点或跨设备时不能 */
       const mountInfo = await detectMountInfo(input.ports, remotePath)
+      if (mountInfo.isMountPoint)
+        throw new AppError(
+          ErrorCode.E_DEPLOY_BLOCKED,
+          {},
+          { message: '目标本身是挂载点，需人工处理；已停止以避免部分删除' }
+        )
       const canRename = !(mountInfo.isMountPoint || mountInfo.crossDevice)
       if (!canRename) {
         log(`换版将使用复制模式：${mountInfo.reason ?? '目标位于挂载点/跨设备'}`, 'warn')
@@ -433,11 +460,27 @@ export function createRollbackService(deps: {
           kind
         })
         if (!artifactItems) {
-          log('所选版本的清单形状与目标对不上，本次不落逐文件清单（下次发布会现场计算远端指纹）', 'warn')
+          log(
+            '所选版本的清单形状与目标对不上，本次不落逐文件清单（下次发布会现场计算远端指纹）',
+            'warn'
+          )
         }
       } catch (err) {
         log(`读取所选版本的清单失败，本次不落逐文件清单：${(err as Error).message}`, 'warn')
       }
+
+      if (keepSource || moveMode === 'copy')
+        assertCopyVerificationAvailable(input.ports.hash, deps.hashCompat?.() ?? true)
+      const copyExpected =
+        artifactItems ??
+        (
+          await hashRemoteArtifact({
+            port: input.ports.hash,
+            remotePath: artifactAt,
+            kind,
+            signal: input.ctx.signal
+          })
+        ).items
 
       /* =============== 阶段 2：归档当前版本 =============== */
       stage = 2
@@ -461,6 +504,7 @@ export function createRollbackService(deps: {
         archivedByThisRun = {
           archiveId: archived.archive.id,
           versionTag: archived.archive.versionTag,
+          recovery: archived.recovery,
           moveMode
         }
         log(`已把回滚前的版本归档为 ${archived.archive.versionTag}，目标路径现在为空`)
@@ -488,6 +532,23 @@ export function createRollbackService(deps: {
           onFile: (done, total) =>
             progressAt(3, total > 0 ? done / total : 1, `恢复 ${done}/${total}`)
         })
+      }
+      if (!useRename)
+        await verifyCopiedArtifact({
+          port: input.ports.hash,
+          remotePath,
+          kind,
+          expected: copyExpected,
+          operationId: input.rollbackId,
+          allowStreamFallback: deps.hashCompat?.() ?? true,
+          signal: input.ctx.signal
+        })
+      if (archivedByThisRun) {
+        try {
+          await archive.completeRecovery(archivedByThisRun.recovery, input.ports.fs)
+        } catch (err) {
+          log(`回滚完成但恢复标记清理失败：${String(err)}`, 'warn')
+        }
       }
       log(
         `已恢复版本 ${row.versionTag} 到 ${remotePath}` +
@@ -552,11 +613,16 @@ export function createRollbackService(deps: {
                 mtime: i.mtime ?? null
               }))
             )
-            log(`已把所选版本的逐文件清单记入台账（${artifactItems.length} 条），下次发布可比对差异`)
+            log(
+              `已把所选版本的逐文件清单记入台账（${artifactItems.length} 条），下次发布可比对差异`
+            )
           } catch (err) {
             // 明细是"锦上添花"：没有它只是下次发布要多算一次远端哈希，不该让回滚失败
             logger.error(`回滚已成功但写入逐文件清单失败：${(err as Error).message}`)
-            log(`警告：逐文件清单未能写入台账（${(err as Error).message}），下次发布会现场计算`, 'warn')
+            log(
+              `警告：逐文件清单未能写入台账（${(err as Error).message}），下次发布会现场计算`,
+              'warn'
+            )
           }
         } else {
           log(
@@ -632,6 +698,13 @@ export function createRollbackService(deps: {
       }
     } catch (err) {
       /* ================= 失败：补偿 ================= */
+      if (err instanceof ArchiveOperationError)
+        archivedByThisRun = {
+          archiveId: err.recovery.archiveId ?? '',
+          versionTag: err.recovery.versionTag,
+          moveMode: err.recovery.archiveMoveMode,
+          recovery: err.recovery
+        }
       const failure = await compensate({
         err,
         stage,
@@ -645,6 +718,14 @@ export function createRollbackService(deps: {
       })
       try {
         repo.releases.finish(input.rollbackId, 'FAILED', `${failure.code}: ${failure.message}`)
+        const recoveryRequired = compensations.some((c) => !c.ok)
+        repo.releases.update(input.rollbackId, {
+          recoveryRequired,
+          recoveryInfo:
+            recoveryRequired && archivedByThisRun
+              ? JSON.stringify(archivedByThisRun.recovery)
+              : null
+        })
         if (err instanceof AppError && err.code === ErrorCode.E_JOB_CANCELLED) {
           repo.releases.update(input.rollbackId, { currentStep: 'cancelled' })
         }
@@ -700,7 +781,9 @@ export function createRollbackService(deps: {
     try {
       repo.archives.remove(inputFn.row.id)
     } catch (err) {
-      logger.error(`回滚后摘除归档台账行失败（archiveId=${inputFn.row.id}）：${(err as Error).message}`)
+      logger.error(
+        `回滚后摘除归档台账行失败（archiveId=${inputFn.row.id}）：${(err as Error).message}`
+      )
       inputFn.log(`警告：版本库记录未能摘除，请执行「对账」修正：${(err as Error).message}`, 'warn')
     }
     return { sourceRemoved: true }
@@ -715,7 +798,12 @@ export function createRollbackService(deps: {
     remotePath: string
     kind: 'dir' | 'file'
     lockHeld: boolean
-    archivedByThisRun: { archiveId: string; versionTag: string; moveMode: 'rename' | 'copy' } | null
+    archivedByThisRun: {
+      archiveId: string
+      versionTag: string
+      moveMode: 'rename' | 'copy'
+      recovery: ArchiveRecoveryDescriptor
+    } | null
     compensations: Array<{ action: string; ok: boolean; detail?: string }>
     log: (text: string, level?: RollbackLogLevel) => void
   }): Promise<RollbackFailure> {
@@ -731,7 +819,7 @@ export function createRollbackService(deps: {
      * 必须把阶段 2 归档的当前版本搬回来，否则用户点一次回滚就把线上版本弄没了。
      * 与发布阶段 5 失败时的补偿是同一个动作、同一个理由。
      */
-    if (stage === 3 && args.archivedByThisRun) {
+    if (stage === 3 || (stage === 2 && args.archivedByThisRun)) {
       const a = args.archivedByThisRun
 
       /**
@@ -746,7 +834,7 @@ export function createRollbackService(deps: {
        * 与发布侧 `compensate()` 的补偿顺序一致（那里也是"由外到内"）。
        */
       try {
-        if ((await args.input.ports.fs.stat(remotePath)).exists) {
+        if (stage === 3 && (await args.input.ports.fs.stat(remotePath)).exists) {
           await args.input.ports.fs.rmrf(remotePath)
           args.compensations.push({
             action: '清理换版残留',
@@ -764,33 +852,48 @@ export function createRollbackService(deps: {
         args.log(`清除目标残留失败：${(e as Error).message}`, 'warn')
       }
 
-      try {
-        await archive.undoArchive({
-          archiveId: a.archiveId,
-          ports: { fs: args.input.ports.fs, hash: args.input.ports.hash },
-          // 去程是什么就按什么搬回来：去程 rename 过，归档里的内容已经不在原位
-          moveMode: a.moveMode,
-          log: args.log
-        })
-        args.compensations.push({
-          action: 'undo-archive',
-          ok: true,
-          detail: `已把回滚前的版本 ${a.versionTag} 搬回 ${remotePath}`
-        })
-        args.log(`补偿成功：回滚前的版本 ${a.versionTag} 已恢复到目标路径`, 'warn')
-      } catch (e) {
-        args.compensations.push({
-          action: 'undo-archive',
-          ok: false,
-          detail: (e as Error).message
-        })
-        logger.error(`回滚补偿失败：${(e as Error).message}`)
-        args.log(
-          `补偿失败：无法把 ${a.versionTag} 搬回 ${remotePath}。` +
-            '内容仍在版本库里，可用「回滚」或从服务器上手工恢复。',
-          'error'
-        )
-      }
+      if (a)
+        try {
+          await archive.restoreRecovery({
+            recovery: a.recovery,
+            ports: { fs: args.input.ports.fs, hash: args.input.ports.hash },
+            log: args.log
+          })
+          try {
+            repo.releases.update(args.input.rollbackId, {
+              recoveryRequired: false,
+              recoveryInfo: null
+            })
+          } catch {
+            /* content is already restored */
+          }
+          args.compensations.push({
+            action: 'undo-archive',
+            ok: true,
+            detail: `已把回滚前的版本 ${a.versionTag} 搬回 ${remotePath}`
+          })
+          args.log(`补偿成功：回滚前的版本 ${a.versionTag} 已恢复到目标路径`, 'warn')
+        } catch (e) {
+          args.compensations.push({
+            action: 'undo-archive',
+            ok: false,
+            detail: (e as Error).message
+          })
+          try {
+            repo.releases.update(args.input.rollbackId, {
+              recoveryRequired: true,
+              recoveryInfo: JSON.stringify(a.recovery)
+            })
+          } catch {
+            /* remote recovery.json survives */
+          }
+          logger.error(`回滚补偿失败：${(e as Error).message}`)
+          args.log(
+            `补偿失败：无法把 ${a.versionTag} 搬回 ${remotePath}。` +
+              '内容仍在版本库里，可用「回滚」或从服务器上手工恢复。',
+            'error'
+          )
+        }
     }
 
     if (lockHeld) {
@@ -808,10 +911,7 @@ export function createRollbackService(deps: {
           ok: false,
           detail: '远端锁未能自动释放'
         })
-        args.log(
-          '补偿失败：远端锁未能释放。请到「往期版本 → 对账」清理该目标的锁。',
-          'error'
-        )
+        args.log('补偿失败：远端锁未能释放。请到「往期版本 → 对账」清理该目标的锁。', 'error')
       }
     }
 
@@ -859,7 +959,10 @@ async function detectMountInfo(
       return null
     }
   }
-  const [targetDf, parentDf] = await Promise.all([probe(remotePath), probe(parentDirOf(remotePath))])
+  const [targetDf, parentDf] = await Promise.all([
+    probe(remotePath),
+    probe(parentDirOf(remotePath))
+  ])
   return detectMountPoint({ remotePath, targetDf, parentDf })
 }
 
@@ -895,7 +998,11 @@ async function alignTargetOwnership(
      */
     const r = await ports.exec(buildChmodCommand({ mode: '755', path: remotePath }))
     const ok = r.code === 0
-    out.push({ action: 'chmod', ok, ...(ok ? {} : { detail: r.stderr.trim() || `退出码 ${r.code}` }) })
+    out.push({
+      action: 'chmod',
+      ok,
+      ...(ok ? {} : { detail: r.stderr.trim() || `退出码 ${r.code}` })
+    })
     log(ok ? '已把目标目录权限设为 755' : '设置权限失败（仅告警）', ok ? 'info' : 'warn')
   } catch (err) {
     out.push({ action: 'chmod', ok: false, detail: (err as Error).message })

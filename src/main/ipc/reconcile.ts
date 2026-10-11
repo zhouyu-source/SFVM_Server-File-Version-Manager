@@ -1,22 +1,7 @@
-/**
- * 对账与崩溃恢复的 IPC 接线（B14 / T14.1 ~ T14.6）。
- *
- * ## 为什么这些**不是任务**
- *
- * 发布/回滚/下载都走 `JobService`（可取消、有进度），因为它们都是"跑很久且中途该能停"
- * 的动作。对账和恢复不是：
- *
- * - **对账要逐条返回结论**（补录了哪几条、哪几条标了 missing），
- *   而任务框架**不保存 `run()` 的返回值**（B11 的教训）—— 塞进 `error.detail`
- *   或者写进日志让界面去解析，都是把结构化数据降级成字符串；
- * - 它是一次**诊断**，不是一次"操作"：跑起来就该等到结论，
- *   中途停下的对账报告（"扫了一半"）对用户没有价值。
- *
- * 先例：`deploy.precheck` 同样是"连服务器 + 可能做全量哈希"的同步通道。
- * 唯一的代价是深度校验期间没有进度 —— 所以界面在按钮上给了明确的 loading
- * 与"深度校验很慢"的说明（T14.3）。
- */
+/** 对账返回结构化报告；恢复与显式删锁进入任务车道，并等待任务收尾后返回结果。 */
 import { registerHandler } from '../infra/ipc'
+import { assertTargetIdle } from './target-busy'
+import type { JobService } from '../services/job'
 import { logger } from '../infra/logger'
 import { AppError, ErrorCode } from '../infra/errors'
 import { IPC_CHANNELS } from '../../shared/channels'
@@ -30,10 +15,7 @@ import {
   remoteLockInputSchema,
   removeRemoteLockInputSchema
 } from '../../shared/contracts/reconcile'
-import {
-  createSftpDeployPorts,
-  type DeploySftpLike
-} from '../services/deploy'
+import { createSftpDeployPorts, type DeploySftpLike } from '../services/deploy'
 import type { ReconcilePorts, ReconcileService } from '../services/reconcile'
 import type { ConnectionService } from '../services/connection'
 import type { SshConnectionPool } from '../services/ssh-client'
@@ -43,6 +25,7 @@ import type { Repositories } from '../db/repositories'
 const emptyInputSchema = z.object({})
 
 export interface ReconcileIpcDeps {
+  jobs: JobService
   reconcile: ReconcileService
   connections: ConnectionService
   pool: SshConnectionPool
@@ -129,9 +112,18 @@ export function registerReconcileHandlers(deps: ReconcileIpcDeps): void {
   )
 
   /** 按选定方式收场（T14.5）。动作逐条返回（哪个成功、哪个要人工）。 */
-  registerHandler(IPC_CHANNELS.RECONCILE_RECOVER, recoverInputSchema, (input) =>
-    withPorts(input.targetId, (ports) => reconcile.recover({ ...input, ports, log }))
-  )
+  registerHandler(IPC_CHANNELS.RECONCILE_RECOVER, recoverInputSchema, (input) => {
+    assertTargetIdle(deps.jobs, input.targetId, { action: '恢复目标' })
+    return deps.jobs.runAndWait({
+      type: 'reconcile',
+      title: '崩溃恢复',
+      targetId: input.targetId,
+      run: (ctx) =>
+        withPorts(input.targetId, (ports) =>
+          reconcile.recover({ ...input, ports, log: ctx.log, signal: ctx.signal })
+        )
+    })
+  })
 
   /** 看一眼远端锁（T14.6）：先给用户看是谁的锁、什么时候的，再决定删不删。 */
   registerHandler(IPC_CHANNELS.RECONCILE_LOCK_INFO, remoteLockInputSchema, (input) =>
@@ -139,9 +131,13 @@ export function registerReconcileHandlers(deps: ReconcileIpcDeps): void {
   )
 
   /** 人工确认后删锁（T14.6）。契约层要求 `confirmed: true`，不是随手能调的。 */
-  registerHandler(
-    IPC_CHANNELS.RECONCILE_REMOVE_LOCK,
-    removeRemoteLockInputSchema,
-    (input) => withPorts(input.targetId, (ports) => reconcile.removeLock(input, ports, log))
-  )
+  registerHandler(IPC_CHANNELS.RECONCILE_REMOVE_LOCK, removeRemoteLockInputSchema, (input) => {
+    assertTargetIdle(deps.jobs, input.targetId, { action: '清理远端锁' })
+    return deps.jobs.runAndWait({
+      type: 'reconcile',
+      title: '清理远端锁',
+      targetId: input.targetId,
+      run: () => withPorts(input.targetId, (ports) => reconcile.removeLock(input, ports, log))
+    })
+  })
 }

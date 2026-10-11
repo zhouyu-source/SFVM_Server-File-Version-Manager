@@ -236,7 +236,10 @@ describe('ReconcileService（B14 对账与恢复）', () => {
     seedArchive('20260910-120000_0270da4', 'v1')
     // 先把台账建出来（轻量对账），再改坏内容
     await run()
-    fake.putFile(`${ARCHIVE}/20260910-120000_0270da4/${PAYLOAD_DIR_NAME}/dist/index.html`, 'tampered')
+    fake.putFile(
+      `${ARCHIVE}/20260910-120000_0270da4/${PAYLOAD_DIR_NAME}/dist/index.html`,
+      'tampered'
+    )
 
     const light = await run()
     expect(light.counts.corrupt).toBe(0) // 结构对账发现不了 —— 这是刻意的
@@ -274,12 +277,12 @@ describe('ReconcileService（B14 对账与恢复）', () => {
         now: new Date(CLOCK.getTime() - 40 * 60 * 1000)
       })
     )
-    fake.putDir('/opt/app/.sfvm-staging-job-1')
+    fake.putDir('/opt/app/.sfvm-staging-rel-crashed')
 
     const r = await run()
     expect(r.lock?.releaseId).toBe('rel-x')
     expect(r.lock?.stale).toBe(true)
-    expect(r.stagingResidue).toEqual(['/opt/app/.sfvm-staging-job-1'])
+    expect(r.stagingResidue).toEqual(['/opt/app/.sfvm-staging-rel-crashed'])
   })
 
   /* --------------------------------------------------- 启动扫描（纯本地） */
@@ -327,7 +330,11 @@ describe('ReconcileService（B14 对账与恢复）', () => {
 
   describe('diagnose / recover', () => {
     /** 造出"发布崩在换版之前"的现场：目标空、旧版本已归档。 */
-    async function seedCrashed(): Promise<{ releaseId: string; archiveId: string; versionTag: string }> {
+    async function seedCrashed(): Promise<{
+      releaseId: string
+      archiveId: string
+      versionTag: string
+    }> {
       // 先有内容 → 归档走 → 目标被搬空（模拟阶段 4 成功、阶段 5 还没跑）
       fake.putFile(`${REMOTE}/index.html`, 'live')
       const archive = createArchiveService({ repo: t.repo, now: () => CLOCK })
@@ -402,7 +409,7 @@ describe('ReconcileService（B14 对账与恢复）', () => {
 
     it('recover(abandon)：不动目标路径，只清残留与收尾', async () => {
       const c = await seedCrashed()
-      fake.putDir('/opt/app/.sfvm-staging-job-1')
+      fake.putDir('/opt/app/.sfvm-staging-rel-crashed')
       const r = await reconcile.recover({
         targetId,
         releaseId: c.releaseId,
@@ -415,7 +422,7 @@ describe('ReconcileService（B14 对账与恢复）', () => {
       // 目标路径仍然不存在（没有"恢复"这个动作）
       expect(fake.has(REMOTE)).toBe(false)
       // 暂存清掉了
-      expect(fake.has('/opt/app/.sfvm-staging-job-1')).toBe(false)
+      expect(fake.has('/opt/app/.sfvm-staging-rel-crashed')).toBe(false)
       expect(t.repo.releases.get(c.releaseId)!.status).toBe('FAILED')
     })
 
@@ -451,15 +458,17 @@ describe('ReconcileService（B14 对账与恢复）', () => {
           now: new Date(CLOCK.getTime())
         })
       )
-      const r = await reconcile.recover({
-        targetId,
-        releaseId: c.releaseId,
-        mode: 'abandon',
-        cleanResidue: true,
-        ports: fake.rollbackPorts()
-      })
+      await expect(
+        reconcile.recover({
+          targetId,
+          releaseId: c.releaseId,
+          mode: 'abandon',
+          cleanResidue: true,
+          ports: fake.rollbackPorts()
+        })
+      ).rejects.toMatchObject({ code: ErrorCode.E_TARGET_BUSY })
       expect(fake.has(lockPathOf(REMOTE))).toBe(true)
-      expect(r.actions.some((a) => (a.detail ?? '').includes('保留未动'))).toBe(true)
+      expect(t.repo.releases.get(c.releaseId)?.status).toBe('SWAPPING')
     })
   })
 
@@ -478,7 +487,12 @@ describe('ReconcileService（B14 对账与恢复）', () => {
       )
       const v = await reconcile.readLock({ targetId }, fake.rollbackPorts())
       expect(v.exists).toBe(true)
-      expect(v).toMatchObject({ releaseId: 'rel-lock', hostname: 'builder.local', pid: 77, stale: false })
+      expect(v).toMatchObject({
+        releaseId: 'rel-lock',
+        hostname: 'builder.local',
+        pid: 77,
+        stale: false
+      })
     })
 
     it('没有锁时 exists=false（而不是报错）', async () => {
@@ -497,10 +511,7 @@ describe('ReconcileService（B14 对账与恢复）', () => {
           now: new Date(CLOCK.getTime())
         })
       )
-      const r = await reconcile.removeLock(
-        { targetId, confirmed: true },
-        fake.rollbackPorts()
-      )
+      const r = await reconcile.removeLock({ targetId, confirmed: true }, fake.rollbackPorts())
       expect(r.removed).toBe(true)
       expect(fake.has(lockPathOf(REMOTE))).toBe(false)
     })
@@ -508,16 +519,18 @@ describe('ReconcileService（B14 对账与恢复）', () => {
     it('契约要求 confirmed:true —— 不确认就调不动这个入口', async () => {
       const { removeRemoteLockInputSchema } = await import('@shared/contracts/reconcile')
       expect(removeRemoteLockInputSchema.safeParse({ targetId }).success).toBe(false)
-      expect(
-        removeRemoteLockInputSchema.safeParse({ targetId, confirmed: false }).success
-      ).toBe(false)
-      expect(removeRemoteLockInputSchema.safeParse({ targetId, confirmed: true }).success).toBe(true)
+      expect(removeRemoteLockInputSchema.safeParse({ targetId, confirmed: false }).success).toBe(
+        false
+      )
+      expect(removeRemoteLockInputSchema.safeParse({ targetId, confirmed: true }).success).toBe(
+        true
+      )
     })
 
     it('目标不存在时抛 E_NOT_FOUND（不静默成功）', async () => {
-      await expect(reconcile.readLock({ targetId: 'nope' }, fake.rollbackPorts())).rejects.toBeInstanceOf(
-        AppError
-      )
+      await expect(
+        reconcile.readLock({ targetId: 'nope' }, fake.rollbackPorts())
+      ).rejects.toBeInstanceOf(AppError)
     })
   })
 })

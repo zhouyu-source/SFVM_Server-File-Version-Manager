@@ -7,7 +7,7 @@
  *
  * 所有仓储只做数据读写，**不含业务规则**（业务在 services/，B03 起）。
  */
-import { and, desc, eq, inArray, notInArray, sql } from 'drizzle-orm'
+import { and, desc, eq, inArray, notInArray, or, sql } from 'drizzle-orm'
 import type { Db } from './client'
 import { newId } from './id'
 import {
@@ -315,7 +315,12 @@ export function createRepositories(db: Db) {
       db
         .select()
         .from(releases)
-        .where(notInArray(releases.status, TERMINAL_RELEASE_STATUSES))
+        .where(
+          or(
+            notInArray(releases.status, TERMINAL_RELEASE_STATUSES),
+            eq(releases.recoveryRequired, true)
+          )
+        )
         .orderBy(desc(releases.startedAt))
         .all(),
 
@@ -327,7 +332,10 @@ export function createRepositories(db: Db) {
         .where(
           and(
             eq(releases.targetId, targetId),
-            notInArray(releases.status, TERMINAL_RELEASE_STATUSES)
+            or(
+              notInArray(releases.status, TERMINAL_RELEASE_STATUSES),
+              eq(releases.recoveryRequired, true)
+            )
           )
         )
         .all(),
@@ -706,7 +714,9 @@ export function createRepositories(db: Db) {
       db.transaction((tx) => {
         tx.delete(pipelineSteps).where(eq(pipelineSteps.pipelineId, pipelineId)).run()
         for (const s of steps) {
-          tx.insert(pipelineSteps).values({ ...s, id: newId(), pipelineId }).run()
+          tx.insert(pipelineSteps)
+            .values({ ...s, id: newId(), pipelineId })
+            .run()
         }
       })
     }
@@ -751,13 +761,16 @@ export function createRepositories(db: Db) {
       // 步骤整组替换（理由见 pipelineStepsRepo.replaceAll 的注释）
       tx.delete(pipelineSteps).where(eq(pipelineSteps.pipelineId, pipelineId)).run()
       for (const s of input.steps) {
-        tx.insert(pipelineSteps).values({ ...s, id: newId(), pipelineId }).run()
+        tx.insert(pipelineSteps)
+          .values({ ...s, id: newId(), pipelineId })
+          .run()
       }
     })
     return pipelineId
   }
 
   return {
+    atomic: <T>(fn: () => T): T => db.transaction(() => fn()),
     connections: connectionsRepo,
     knownHosts: knownHostsRepo,
     environments: environmentsRepo,

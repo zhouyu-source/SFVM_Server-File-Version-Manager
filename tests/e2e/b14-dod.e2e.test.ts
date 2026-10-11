@@ -213,7 +213,8 @@ describeIf('B14 DoD：对账与崩溃恢复（真窗口 + 真服务器）', () =
         releaseId: null,
         note: null,
         status: 'valid',
-        archivedAt: v.archivedAt
+        // SQLite 时间字段统一为 UTC；远端 manifest 继续保留带偏移的原始时间。
+        archivedAt: new Date(v.archivedAt).toISOString()
       })
     }
 

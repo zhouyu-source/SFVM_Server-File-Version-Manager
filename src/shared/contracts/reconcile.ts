@@ -46,6 +46,7 @@ export const unfinishedReleaseSchema = z.object({
   action: z.string(),
   /** PENDING / UPLOADING / VERIFYING / ARCHIVING / SWAPPING */
   status: z.string(),
+  recoveryRequired: z.boolean().optional(),
   versionTag: z.string(),
   startedAt: z.string(),
   /** 走到哪一步了（`cancelled` 表示用户主动取消、但没跑完收尾） */
@@ -209,7 +210,13 @@ export const recoveryDiagnosisSchema = z.object({
     .nullable(),
   staging: z.array(z.string()),
   /** 用户可以选的动作（服务端判定，界面据此决定按钮可用性） */
-  options: z.array(z.object({ mode: z.enum(['restore-old', 'abandon', 'retry']), enabled: z.boolean(), reason: z.string() })),
+  options: z.array(
+    z.object({
+      mode: z.enum(['restore-old', 'abandon', 'retry']),
+      enabled: z.boolean(),
+      reason: z.string()
+    })
+  ),
   /** 一句话概括现场（界面直接展示） */
   summary: z.string()
 })

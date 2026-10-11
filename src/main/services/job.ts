@@ -112,6 +112,7 @@ export interface CancelAllResult {
 
 export interface JobService {
   start(spec: JobSpec): JobView
+  runAndWait<T>(spec: Omit<JobSpec, 'run'> & { run(ctx: JobContext): Promise<T> }): Promise<T>
   list(filter?: { status?: JobStatus[]; targetId?: string }): JobView[]
   get(jobId: string): JobView | undefined
   activeForTarget(targetId: string): JobView[]
@@ -423,7 +424,10 @@ export function createJobService(options: JobServiceOptions = {}): JobService {
     rec.cleanupDone = true
     if (!rec.spec.cleanup) return
 
-    appendLog(rec, reason === 'cancel' ? '正在清理由此任务产生的远端残留…' : '失败，正在清理远端残留…')
+    appendLog(
+      rec,
+      reason === 'cancel' ? '正在清理由此任务产生的远端残留…' : '失败，正在清理远端残留…'
+    )
     emitState(rec)
     try {
       const r = await withTimeout(
@@ -434,7 +438,11 @@ export function createJobService(options: JobServiceOptions = {}): JobService {
         cleanupTimeoutMs
       )
       if (r === 'timeout') {
-        appendLog(rec, `清理超过 ${Math.round(cleanupTimeoutMs / 1000)} 秒未完成，已放弃等待`, 'warn')
+        appendLog(
+          rec,
+          `清理超过 ${Math.round(cleanupTimeoutMs / 1000)} 秒未完成，已放弃等待`,
+          'warn'
+        )
       } else {
         appendLog(rec, '远端清理完成')
       }
@@ -555,6 +563,28 @@ export function createJobService(options: JobServiceOptions = {}): JobService {
     return toView(rec)
   }
 
+  async function runAndWait<T>(
+    spec: Omit<JobSpec, 'run'> & { run(ctx: JobContext): Promise<T> }
+  ): Promise<T> {
+    let result: T | undefined
+    let failure: unknown
+    const view = start({
+      ...spec,
+      run: async (ctx) => {
+        try {
+          result = await spec.run(ctx)
+        } catch (err) {
+          failure = err
+          throw err
+        }
+      }
+    })
+    const record = records.get(view.jobId)!
+    await record.settled
+    if (record.status !== 'succeeded') throw failure ?? cancelledError(view.jobId)
+    return result as T
+  }
+
   function list(filter?: { status?: JobStatus[]; targetId?: string }): JobView[] {
     let out = [...records.values()]
     if (filter?.status && filter.status.length > 0) {
@@ -657,7 +687,11 @@ export function createJobService(options: JobServiceOptions = {}): JobService {
       for (const rec of active) {
         if (isTerminalStatus(rec.status)) continue
         forced++
-        appendLog(rec, `任务未在 ${Math.round(timeoutMs / 1000)} 秒内停下来，已强制标记为取消`, 'warn')
+        appendLog(
+          rec,
+          `任务未在 ${Math.round(timeoutMs / 1000)} 秒内停下来，已强制标记为取消`,
+          'warn'
+        )
         finish(rec, cancelledError(rec.jobId))
       }
     }
@@ -678,6 +712,7 @@ export function createJobService(options: JobServiceOptions = {}): JobService {
 
   return {
     start,
+    runAndWait,
     list,
     get,
     activeForTarget,

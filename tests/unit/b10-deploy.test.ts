@@ -30,7 +30,6 @@ import {
   sha256
 } from '../helpers/fake-remote'
 
-
 describe('DeployService（B10 发布主流程）', () => {
   let t: TestDb
   let fake: FakeRemote
@@ -264,6 +263,7 @@ describe('DeployService（B10 发布主流程）', () => {
       releaseId: 'rel-seed',
       moveMode: 'rename'
     })
+    await archive.completeRecovery(a1.recovery, fake.asArchiveFsPort())
     fake.putFile('/opt/app/dist/index.html', 'v2')
     t.repo.releases.create({
       id: 'rel-v2',
@@ -295,7 +295,10 @@ describe('DeployService（B10 发布主流程）', () => {
 
   it('回滚到旧版之后再发布：内容与版本库里那份一致，不再重复归档', async () => {
     const { targetId: tid, sourceArchiveId } = await setupRolledBack(true)
-    const before = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+    const before = t.repo.archives
+      .listByTarget(tid)
+      .map((a) => a.id)
+      .sort()
     expect(before).toHaveLength(2)
 
     const { ctx, text } = makeCtx()
@@ -322,7 +325,10 @@ describe('DeployService（B10 发布主流程）', () => {
 
   it('去重调用本身抛错：不影响发布结果、只记警告并保留两份归档（M4 回归）', async () => {
     const { targetId: tid } = await setupRolledBack(true)
-    const before = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+    const before = t.repo.archives
+      .listByTarget(tid)
+      .map((a) => a.id)
+      .sort()
     // 制造"去重这一步自己炸了"的现场：内部虽对 rmrf 失败自兜，但
     // `repo.archives.remove()` / `audit.write()` 在它的 try 之外，仍可能抛。
     vi.spyOn(archive, 'discardDuplicateArchive').mockRejectedValueOnce(new Error('台账写不进去'))
@@ -335,7 +341,10 @@ describe('DeployService（B10 发布主流程）', () => {
     expect(fake.text('/opt/app/dist/index.html')).toBe('v3')
     expect(text()).toContain('未能去除重复归档')
     // 去重没生效 → 多留一份重复（内容不丢）
-    const after = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+    const after = t.repo.archives
+      .listByTarget(tid)
+      .map((a) => a.id)
+      .sort()
     expect(after).toHaveLength(before.length + 1)
     expect(after).toEqual(expect.arrayContaining(before))
   })
@@ -362,7 +371,10 @@ describe('DeployService（B10 发布主流程）', () => {
     // 'v1' → 'v9'：字节数没变，"路径 + 大小"核对发现不了 —— 这正是"回滚恢复后
     // 这次归档要现算指纹"的原因。指纹对不上就不许当作重复删掉。
     fake.putFile('/opt/app/dist/index.html', 'v9')
-    const before = t.repo.archives.listByTarget(tid).map((a) => a.id).sort()
+    const before = t.repo.archives
+      .listByTarget(tid)
+      .map((a) => a.id)
+      .sort()
 
     const { ctx, text } = makeCtx()
     const out = await service.run({ targetId: tid, ports: fake.ports(), ctx })
@@ -742,7 +754,7 @@ describe('DeployService（B10 发布主流程）', () => {
     const id = seedDirTarget({ 'index.html': 'v2' })
     fake.putFile('/opt/app/dist/index.html', 'live')
     // 目标自己是挂载点 → 归档与换版都只能走复制（rename 必然 EXDEV）
-    fake.dfOverride.set('/opt/app/dist', { filesystem: '/dev/vdb1', mountPoint: '/opt/app/dist' })
+    t.repo.targets.update(id, { deployStrategy: 'copy' })
     // 只让"换版那一次"的复制失败；补偿里的复制必须能成功
     fake.copyFileFailures.set('/opt/app/dist/index.html', {
       err: new Error('模拟复制中断'),
@@ -785,7 +797,7 @@ describe('DeployService（B10 发布主流程）', () => {
     expect(text()).toContain('换版改用 copy')
   })
 
-  it('阶段 5：目标本身是挂载点 → 连 rename 都不尝试，直接用复制模式', async () => {
+  it('目标本身是挂载点 → 提前拒绝，当前内容与归档均不改动', async () => {
     const id = seedDirTarget({ 'index.html': 'v2' })
     fake.putFile('/opt/app/dist/index.html', 'v1')
     fake.dfOverride.set('/opt/app/dist', {
@@ -795,16 +807,11 @@ describe('DeployService（B10 发布主流程）', () => {
 
     const out = await service.run({ targetId: id, ports: fake.ports(), ctx: makeCtx().ctx })
 
-    expect(out.ok).toBe(true)
-    // 挂载点场景下归档也必须走 copy（归档目录在父目录，跨设备）
-    expect(out.strategyFallback?.to).toBe('copy')
-    expect(out.strategyFallback?.reason).toContain('挂载点')
-    expect(fake.text('/opt/app/dist/index.html')).toBe('v2')
-    // 没有任何一次 rename 落在目标路径上（renameLog 里只有归档/协作用的搬动）
+    expect(out.ok).toBe(false)
+    expect(out.failure?.code).toBe(ErrorCode.E_DEPLOY_BLOCKED)
+    expect(fake.text('/opt/app/dist/index.html')).toBe('v1')
     expect(fake.renameLog.some((r) => r.to === '/opt/app/dist')).toBe(false)
-    const archived = t.repo.archives.listByTarget(id)
-    expect(archived).toHaveLength(1)
-    expect(fake.text(`${archived[0].payloadPath}/dist/index.html`)).toBe('v1')
+    expect(t.repo.archives.listByTarget(id)).toHaveLength(0)
   })
 
   it('阶段 5：目标配置成 copy 策略 → 全程复制，且不算"回退"（没有 fallback 记录）', async () => {

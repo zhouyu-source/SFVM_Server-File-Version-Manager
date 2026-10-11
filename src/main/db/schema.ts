@@ -133,6 +133,8 @@ export const releases = sqliteTable(
      *   「恢复旧版本」靠它找到可复位的内容；补偿里的 `undoArchive` 摘掉归档行后清空。
      */
     archiveId: text('archive_id'),
+    recoveryRequired: integer('recovery_required', { mode: 'boolean' }).notNull().default(false),
+    recoveryInfo: text('recovery_info'),
     /** 目录指纹 / 文件哈希 */
     rootHash: text('root_hash'),
     totalBytes: integer('total_bytes').notNull().default(0),

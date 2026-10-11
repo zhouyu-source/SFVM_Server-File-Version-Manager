@@ -31,6 +31,8 @@
  */
 import { promises as fsp } from 'node:fs'
 import { join as joinLocal } from 'node:path'
+import { withTargetRemoteLock, type LockFsPort } from '../infra/deploy-lock'
+import { createSftpDeployPort, type DeploySftpLike } from '../services/deploy'
 import { registerHandler } from '../infra/ipc'
 import { assertTargetIdle } from './target-busy'
 import { logger } from '../infra/logger'
@@ -49,23 +51,14 @@ import {
   archiveSummaryInputSchema,
   archiveVerifyInputSchema
 } from '../../shared/contracts/archive'
-import {
-  createSftpArchivePort,
-  type ArchiveService,
-  type ArchiveSftpLike,
-  type ArchivePorts
-} from '../services/archive'
+import { type ArchiveService, type ArchiveSftpLike, type ArchivePorts } from '../services/archive'
 import type {
   ArchiveDownloadService,
   DownloadSourcePort,
   DownloadTransferPort
 } from '../services/archive-download'
 import { createSftpHashPort, type HashSftpLike, type RemoteHashPort } from '../services/hash'
-import {
-  createSftpTransferPort,
-  createTransfer,
-  type TransferSftpLike
-} from '../services/transfer'
+import { createSftpTransferPort, createTransfer, type TransferSftpLike } from '../services/transfer'
 import type { JobService, JobSpec } from '../services/job'
 import type { ConnectionService } from '../services/connection'
 import type { SshConnectionPool } from '../services/ssh-client'
@@ -112,7 +105,7 @@ type ArchiveSftp = ArchiveSftpLike & HashSftpLike & TransferSftpLike
 
 /** 打开端口的结果：端口本身 + 通道 + 它绑定的连接（下载要标 busy）。 */
 interface OpenedPorts {
-  ports: ArchivePorts
+  ports: ArchivePorts & { fs: LockFsPort }
   sftp: ArchiveSftp
   connectionId: string
   /** 释放这条通道（S2）；单测注入的假端口没有，调用方写 `?.()` */
@@ -141,7 +134,10 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
     const capability = pool.capabilityOf(connId)
     if (!capability) {
       // 刚连上就拿不到能力探测结果，说明连接池状态不一致 —— 明确报错，别猜
-      throw new AppError(ErrorCode.E_CONN_LOST, { connectionId: connId, reason: 'capability-missing' })
+      throw new AppError(ErrorCode.E_CONN_LOST, {
+        connectionId: connId,
+        reason: 'capability-missing'
+      })
     }
 
     const { sftp: rawSftp, release } = await pool.openChannel(connId)
@@ -158,7 +154,12 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
       tmpDir
     })
 
-    return { ports: { fs: createSftpArchivePort(sftp), hash }, sftp, connectionId: connId, release }
+    return {
+      ports: { fs: createSftpDeployPort(sftp as unknown as DeploySftpLike), hash },
+      sftp,
+      connectionId: connId,
+      release
+    }
   }
 
   /**
@@ -167,13 +168,37 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
    * 归档的四个 handler（校验 / 保留策略 / 明细 / 删除）形状一致，
    * 收在一处以后新加 handler 不会忘释放。
    */
-  async function withPorts<T>(targetId: string, fn: (ports: ArchivePorts) => Promise<T>): Promise<T> {
+  async function withPorts<T>(
+    targetId: string,
+    fn: (ports: ArchivePorts & { fs: LockFsPort }) => Promise<T>
+  ): Promise<T> {
     const opened = await openPorts(targetId)
     try {
       return await fn(opened.ports)
     } finally {
       opened.release?.()
     }
+  }
+
+  function maintenance<T>(
+    targetId: string,
+    title: string,
+    run: (ports: ArchivePorts, signal: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    assertTargetIdle(jobs, targetId, { action: title })
+    return jobs.runAndWait({
+      type: 'reconcile',
+      title,
+      targetId,
+      run: (ctx) =>
+        withPorts(targetId, (ports) =>
+          withTargetRemoteLock(
+            ports.fs,
+            normalizeRemotePath(repo.targets.get(targetId)!.remotePath),
+            () => run(ports, ctx.signal)
+          )
+        )
+    })
   }
 
   registerHandler(IPC_CHANNELS.ARCHIVES_LIST, archiveListInputSchema, ({ targetId }) =>
@@ -208,8 +233,10 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
   registerHandler(
     IPC_CHANNELS.ARCHIVES_APPLY_RETENTION,
     archiveApplyRetentionInputSchema,
-    async ({ targetId }) =>
-      withPorts(targetId, (ports) => archive.applyRetention({ targetId, fs: ports.fs }))
+    ({ targetId }) =>
+      maintenance(targetId, '清理往期版本', (ports, signal) =>
+        archive.applyRetention({ targetId, fs: ports.fs, signal })
+      )
   )
 
   /* ------------------------------------------------- T12.6 台账占用汇总 */
@@ -351,46 +378,50 @@ export function registerArchiveHandlers(deps: ArchiveIpcDeps): void {
 
   /* --------------------------------------------------- T12.5 删除版本 */
 
-  registerHandler(IPC_CHANNELS.ARCHIVES_REMOVE, archiveRemoveInputSchema, async ({ archiveIds }) => {
-    const rows = archiveIds.map((id) => repo.archives.get(id))
-    const first = rows[0]
-    if (!first) throw new AppError(ErrorCode.E_NOT_FOUND, { archiveIds })
+  registerHandler(
+    IPC_CHANNELS.ARCHIVES_REMOVE,
+    archiveRemoveInputSchema,
+    async ({ archiveIds }) => {
+      const rows = archiveIds.map((id) => repo.archives.get(id))
+      const first = rows[0]
+      if (!first) throw new AppError(ErrorCode.E_NOT_FOUND, { archiveIds })
 
-    /**
-     * 只允许删**同一个目标**下的版本。
-     *
-     * 跨目标批量删需要连多台服务器，而"删到一半发现自己连不上第二台"
-     * 会让用户面对一个说不清的状态；界面上的勾选也天然是单目标的。
-     * 真需要跨目标清理时，多操作几次比一个含糊的批量接口安全。
-     */
-    const otherTarget = rows.find((r) => r && r.targetId !== first.targetId)
-    if (otherTarget) {
-      throw new AppError(
-        ErrorCode.E_PARAM,
-        { targetId: first.targetId, otherTargetId: otherTarget.targetId },
-        {
-          message: '一次只能删除同一个目标的往期版本',
-          hint: '请在目标之间分别操作。'
-        }
+      /**
+       * 只允许删**同一个目标**下的版本。
+       *
+       * 跨目标批量删需要连多台服务器，而"删到一半发现自己连不上第二台"
+       * 会让用户面对一个说不清的状态；界面上的勾选也天然是单目标的。
+       * 真需要跨目标清理时，多操作几次比一个含糊的批量接口安全。
+       */
+      const otherTarget = rows.find((r) => r && r.targetId !== first.targetId)
+      if (otherTarget) {
+        throw new AppError(
+          ErrorCode.E_PARAM,
+          { targetId: first.targetId, otherTargetId: otherTarget.targetId },
+          {
+            message: '一次只能删除同一个目标的往期版本',
+            hint: '请在目标之间分别操作。'
+          }
+        )
+      }
+
+      // 该目标上有任务在跑时不让删：发布/回滚正在用归档目录，
+      // 而"这一版刚好是正在发布的那一版"是真实存在的场景
+      assertTargetIdle(jobs, first.targetId, {
+        action: '删除往期版本',
+        hint: '请等它结束后再删除往期版本。'
+      })
+
+      const result = await maintenance(first.targetId, '删除往期版本', (ports) =>
+        archive.removeVersions({ archiveIds, fs: ports.fs })
       )
+      logger.info(
+        `archives.remove: 成功 ${result.removed.length} / 失败 ${result.failed.length}，` +
+          `释放 ${result.freedBytes} 字节`
+      )
+      return result
     }
-
-    // 该目标上有任务在跑时不让删：发布/回滚正在用归档目录，
-    // 而"这一版刚好是正在发布的那一版"是真实存在的场景
-    assertTargetIdle(jobs, first.targetId, {
-      action: '删除往期版本',
-      hint: '请等它结束后再删除往期版本。'
-    })
-
-    const result = await withPorts(first.targetId, (ports) =>
-      archive.removeVersions({ archiveIds, fs: ports.fs })
-    )
-    logger.info(
-      `archives.remove: 成功 ${result.removed.length} / 失败 ${result.failed.length}，` +
-        `释放 ${result.freedBytes} 字节`
-    )
-    return result
-  })
+  )
 }
 
 /** 删除一个本地目录（不存在视为成功）；返回它原本是否存在。 */

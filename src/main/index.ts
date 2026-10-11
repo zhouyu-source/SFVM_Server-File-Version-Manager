@@ -2,13 +2,7 @@ import { app, BrowserWindow, dialog, shell } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
-import {
-  initLogger,
-  logFilePath,
-  logger,
-  SCRIPT_RUNS_DIR_NAME,
-  setLogLevel
-} from './infra/logger'
+import { initLogger, logFilePath, logger, SCRIPT_RUNS_DIR_NAME, setLogLevel } from './infra/logger'
 import {
   cleanupAbandonedDataDir,
   clearDataLocation,
@@ -32,7 +26,13 @@ import { registerRollbackHandlers } from './ipc/rollback'
 import { registerReconcileHandlers } from './ipc/reconcile'
 import { registerScriptHandlers } from './ipc/script'
 import { registerPipelineHandlers, createPipelineDeployPort } from './ipc/pipeline'
-import { closeAppDatabase, getRepositories, openAppDatabase, openedDataDir, backupDatabaseTo } from './db'
+import {
+  closeAppDatabase,
+  getRepositories,
+  openAppDatabase,
+  openedDataDir,
+  backupDatabaseTo
+} from './db'
 import { DB_FILENAME } from './db/client'
 import { SshConnectionPool } from './services/ssh-client'
 import { createConnectionService } from './services/connection'
@@ -45,12 +45,7 @@ import { createRollbackService } from './services/rollback'
 import { createReconcileService } from './services/reconcile'
 import { createScriptService } from './services/script'
 import { createPipelineService } from './services/pipeline'
-import {
-  attachJobEventPush,
-  createJobGuard,
-  registerJobHandlers,
-  type JobGuard
-} from './ipc/job'
+import { attachJobEventPush, createJobGuard, registerJobHandlers, type JobGuard } from './ipc/job'
 import { IPC_CHANNELS } from '../shared/channels'
 import { DEFAULT_DOWNLOAD_DIR_NAME } from '../shared/contracts/archive'
 
@@ -426,7 +421,8 @@ if (!gotLock) {
       userDataDir: () => openedDataDir() ?? app.getPath('userData'),
       send: (command) => {
         const win = commandTargetWindow()
-        if (win && !win.isDestroyed()) win.webContents.send(IPC_CHANNELS.EVT_MENU_COMMAND, { command })
+        if (win && !win.isDestroyed())
+          win.webContents.send(IPC_CHANNELS.EVT_MENU_COMMAND, { command })
       }
     })
 
@@ -482,7 +478,8 @@ if (!gotLock) {
       // 默认下载位置：设置里填过就用它，否则"系统下载目录/sfvm-downloads"（T12.3/T15.1）。
       // 取的是**当前值**而不是启动时的快照 —— 用户改完设置不必重启。
       defaultSaveDir: () =>
-        settingsService.current().downloadDir ?? join(app.getPath('downloads'), DEFAULT_DOWNLOAD_DIR_NAME)
+        settingsService.current().downloadDir ??
+        join(app.getPath('downloads'), DEFAULT_DOWNLOAD_DIR_NAME)
     })
 
     // B14：对账与崩溃恢复（远端是真相来源）
@@ -490,6 +487,7 @@ if (!gotLock) {
     const reconcileService = createReconcileService({ repo, archive: archiveService })
     registerReconcileHandlers({
       reconcile: reconcileService,
+      jobs: jobService,
       connections: connectionService,
       pool,
       repo
@@ -522,7 +520,11 @@ if (!gotLock) {
     // B13：回滚（把一个往期版本恢复为当前版本，当前版本先归档、不丢）。
     // 与发布共用归档服务与**同一把远端锁**（infra/deploy-lock.ts），
     // 所以它同样以任务形式跑：进度、取消、日志全走 B08 已有那一套。
-    const rollbackService = createRollbackService({ repo, archive: archiveService })
+    const rollbackService = createRollbackService({
+      repo,
+      archive: archiveService,
+      hashCompat: () => settingsService.current().hashCompatMode
+    })
     registerRollbackHandlers({
       rollback: rollbackService,
       jobs: jobService,

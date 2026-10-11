@@ -274,6 +274,7 @@ export type PrecheckKey =
   | 'residue'
   | 'lock'
   | 'active-release'
+  | 'recovery-required'
 
 export interface PrecheckItem {
   key: PrecheckKey

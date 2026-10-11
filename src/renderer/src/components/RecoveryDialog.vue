@@ -119,8 +119,8 @@ async function act(item: UnfinishedRelease, mode: 'restore-old' | 'abandon'): Pr
     remoteEffect: 'files',
     remoteDetail:
       mode === 'restore-old'
-        ? `目标路径 ${d?.remotePath} 上的内容会被替换成归档里的那一版。`
-        : `会删除目标路径父目录下的暂存目录（.sfvm-staging-*）与发布锁 .sfvm.lock；目标路径本身不动。`,
+        ? `仅向空的目标路径 ${d?.remotePath} 恢复旧版本；目标已有内容时会拒绝覆盖。`
+        : '仅清理这条记录对应的暂存目录；其他操作的暂存目录与锁会保留。目标路径本身不动。',
     confirmText: mode === 'restore-old' ? '恢复' : '清理'
   })
   if (!ok) return
@@ -143,7 +143,7 @@ async function act(item: UnfinishedRelease, mode: 'restore-old' | 'abandon'): Pr
      */
     scan.value = await api.reconcile.startupScan()
     const rest = { ...diagnoses.value }
-    delete rest[item.releaseId]
+    if (r.status === 'success') delete rest[item.releaseId]
     diagnoses.value = rest
     emit('done')
   } catch (e) {
@@ -158,7 +158,10 @@ function retry(item: UnfinishedRelease): void {
   open.value = false
 }
 
-function optionOf(d: RecoveryDiagnosis | undefined, mode: string): { enabled: boolean; reason: string } {
+function optionOf(
+  d: RecoveryDiagnosis | undefined,
+  mode: string
+): { enabled: boolean; reason: string } {
   const o = d?.options.find((x) => x.mode === mode)
   return { enabled: o?.enabled ?? false, reason: o?.reason ?? '' }
 }
@@ -203,9 +206,18 @@ watch(
         data-test="recovery-error"
       />
 
-      <el-empty v-if="!loading && items.length === 0" description="没有未完成的操作" :image-size="70" />
+      <el-empty
+        v-if="!loading && items.length === 0"
+        description="没有未完成的操作"
+        :image-size="70"
+      />
 
-      <div v-for="item in items" :key="item.releaseId" class="rv-item" :data-test="`recovery-item-${item.releaseId}`">
+      <div
+        v-for="item in items"
+        :key="item.releaseId"
+        class="rv-item"
+        :data-test="`recovery-item-${item.releaseId}`"
+      >
         <div class="rv-head">
           <el-tag size="small" :type="item.action === 'rollback' ? 'warning' : 'primary'">
             {{ item.action === 'rollback' ? '回滚' : '发布' }}
@@ -229,14 +241,22 @@ watch(
         </div>
 
         <!-- 现场勘察结果 -->
-        <div v-if="diagnoses[item.releaseId]" class="rv-scene" :data-test="`recovery-scene-${item.releaseId}`">
+        <div
+          v-if="diagnoses[item.releaseId]"
+          class="rv-scene"
+          :data-test="`recovery-scene-${item.releaseId}`"
+        >
           <div class="rv-summary">{{ diagnoses[item.releaseId]!.summary }}</div>
           <div class="rv-detail muted">
-            <div>目标路径：<span class="mono">{{ diagnoses[item.releaseId]!.remotePath }}</span></div>
+            <div>
+              目标路径：<span class="mono">{{ diagnoses[item.releaseId]!.remotePath }}</span>
+            </div>
             <div v-if="diagnoses[item.releaseId]!.archive">
               这次归档的旧版本：
               <span class="mono">{{ diagnoses[item.releaseId]!.archive!.versionTag }}</span>
-              <template v-if="!diagnoses[item.releaseId]!.archive!.storageExists">（归档目录已不存在）</template>
+              <template v-if="!diagnoses[item.releaseId]!.archive!.storageExists"
+                >（归档内容已不存在）</template
+              >
             </div>
             <div v-if="diagnoses[item.releaseId]!.staging.length">
               暂存残留 {{ diagnoses[item.releaseId]!.staging.length }} 个：
@@ -246,6 +266,7 @@ watch(
               远端锁：
               <span class="mono">{{ diagnoses[item.releaseId]!.lock!.path }}</span>
               <template v-if="diagnoses[item.releaseId]!.lock!.stale">（已陈旧）</template>
+              <div>确认没有其他操作后，请先到「往期版本 → 对账」清理旧锁，再查看现场。</div>
             </div>
           </div>
 
@@ -268,6 +289,7 @@ watch(
               </span>
             </el-tooltip>
             <el-button
+              :disabled="!optionOf(diagnoses[item.releaseId], 'abandon').enabled"
               :loading="busyId === item.releaseId"
               :data-test="`recovery-abandon-${item.releaseId}`"
               @click="act(item, 'abandon')"
@@ -283,14 +305,28 @@ watch(
             </el-button>
           </div>
 
-          <div v-if="!optionOf(diagnoses[item.releaseId], 'restore-old').enabled" class="rv-hint muted">
-            「恢复旧版本」当前不可用：{{ optionOf(diagnoses[item.releaseId], 'restore-old').reason }}
+          <div
+            v-if="!optionOf(diagnoses[item.releaseId], 'restore-old').enabled"
+            class="rv-hint muted"
+          >
+            「恢复旧版本」当前不可用：{{
+              optionOf(diagnoses[item.releaseId], 'restore-old').reason
+            }}
           </div>
 
           <!-- 执行结果：逐条如实展示 -->
-          <div v-if="results[item.releaseId]" class="rv-result" :data-test="`recovery-result-${item.releaseId}`">
-            <div v-for="(a, i) in results[item.releaseId]!.actions" :key="i" :class="{ bad: !a.ok }">
-              {{ a.ok ? '✓' : '✗' }} {{ a.action }}<template v-if="a.detail">：{{ a.detail }}</template>
+          <div
+            v-if="results[item.releaseId]"
+            class="rv-result"
+            :data-test="`recovery-result-${item.releaseId}`"
+          >
+            <div
+              v-for="(a, i) in results[item.releaseId]!.actions"
+              :key="i"
+              :class="{ bad: !a.ok }"
+            >
+              {{ a.ok ? '✓' : '✗' }} {{ a.action
+              }}<template v-if="a.detail">：{{ a.detail }}</template>
             </div>
             <div v-if="results[item.releaseId]!.manualCleanup.length" class="bad">
               需要人工处理：{{ results[item.releaseId]!.manualCleanup.join('；') }}

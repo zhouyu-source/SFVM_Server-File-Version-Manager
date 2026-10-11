@@ -67,6 +67,7 @@ export default tseslint.config(
       'dist/**',
       'node_modules/**',
       '.tools/**',
+      '.logs/**', // 本地故障探针与验证输出
       'coverage/**',
       'src/renderer/src/types/**', // Element Plus 自动生成的声明
       'src/main/db/migrations/**', // drizzle-kit 生成的 SQL/元数据

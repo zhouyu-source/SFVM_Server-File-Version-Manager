@@ -72,6 +72,13 @@ import {
   stagingRootOf,
   swapSourceOf
 } from '../infra/deploy-plan'
+import { ArchiveOperationError } from './archive'
+import type { ArchiveRecoveryDescriptor } from '../infra/archive-recovery'
+import {
+  RECOVERY_FILE,
+  RECOVERY_CLOSED_FILE,
+  recoveryDescriptorSchema
+} from '../infra/archive-recovery'
 import { copyArtifactInto } from '../infra/copy-tree'
 import { MAX_RELEASE_ITEMS_PERSIST } from '../../shared/contracts/archive'
 import type { DeployCurrentVersion, DeployCurrentVersionInput } from '../../shared/contracts/deploy'
@@ -90,6 +97,8 @@ import {
   createSftpHashPort,
   hashLocalArtifact,
   verifyRemote,
+  verifyCopiedArtifact,
+  assertCopyVerificationAvailable,
   type RemoteHashPort
 } from './hash'
 import {
@@ -122,8 +131,6 @@ import {
   type RemoteLockInfo,
   type ReleaseStatus
 } from '../../shared/contracts/deploy'
-
-
 
 /* ------------------------------------------------------------ 远端端口 */
 
@@ -390,7 +397,7 @@ export interface DeployService {
   cleanResidue(input: DeployResidueCleanInput): Promise<DeployResidueCleanResult>
   /** 当前被本地互斥占住的目标（UI/测试可观测） */
   busyTargets(): string[]
-  /** 等待后台任务（发布成功后异步执行的保留策略）结束 */
+  /** 兼容旧调用方；维护操作已在 run() 返回前完成。 */
   whenIdle(): Promise<void>
 }
 
@@ -406,6 +413,9 @@ interface StageState {
   stagingPayload: string
   strategy: DeployStrategy
   moveMode: 'rename' | 'copy'
+  recovery: ArchiveRecoveryDescriptor | null
+  swapStarted: boolean
+  contentCommitted: boolean
   mountInfo: { isMountPoint: boolean; crossDevice: boolean; reason?: string }
   local: {
     localPath: string
@@ -481,6 +491,7 @@ function stagePrecheckCode(key: string): ErrorCodeValue {
     case 'remote-target':
       return ErrorCode.E_TARGET_MISSING
     case 'active-release':
+    case 'recovery-required':
       return ErrorCode.E_DEPLOY_BLOCKED
     default:
       return ErrorCode.E_PARAM
@@ -496,12 +507,6 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
 
   /** 本地互斥：同一 target 同时只能有一次发布（JobService 的车道是第二道保险） */
   const localBusy = new Set<string>()
-  const background = new Set<Promise<void>>()
-
-  function trackBackground(p: Promise<void>): void {
-    background.add(p)
-    void p.finally(() => background.delete(p))
-  }
 
   function resolvePaths(targetId: string): {
     remotePath: string
@@ -532,10 +537,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     }
   }
 
-  async function dfOf(
-    ports: DeployPorts,
-    p: string
-  ): Promise<ReturnType<typeof parseDfOutput>> {
+  async function dfOf(ports: DeployPorts, p: string): Promise<ReturnType<typeof parseDfOutput>> {
     try {
       const r = await ports.exec(buildDfCommand(p))
       return parseDfOutput(r.stdout)
@@ -588,6 +590,56 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     }
 
     const items: PrecheckItem[] = []
+
+    // SQLite 写入失败时，远端恢复信息仍要阻止后续发布覆盖现场。
+    if ((await ports.fs.stat(archiveDir)).exists) {
+      for (const entry of await ports.fs.readdir(archiveDir)) {
+        if (!entry.isDirectory) continue
+        const marker = joinRemote(joinRemote(archiveDir, entry.name), RECOVERY_FILE)
+        if (!(await ports.fs.stat(marker)).exists) continue
+        try {
+          const d = recoveryDescriptorSchema.parse(JSON.parse(await ports.fs.readTextFile(marker)))
+          const receipt = joinRemote(joinRemote(archiveDir, entry.name), RECOVERY_CLOSED_FILE)
+          if ((await ports.fs.stat(receipt)).exists) {
+            const closed = recoveryDescriptorSchema.parse(
+              JSON.parse(await ports.fs.readTextFile(receipt))
+            )
+            if (
+              closed.phase &&
+              closed.phase !== 'pending' &&
+              closed.operationId === d.operationId &&
+              closed.rootHash === d.rootHash &&
+              closed.storagePath === d.storagePath
+            )
+              continue
+          }
+          if (
+            (!d.phase || d.phase === 'pending') &&
+            d.targetId === target.id &&
+            d.originalPath === remotePath &&
+            d.operationId !== input.ignoreReleaseId
+          ) {
+            items.push({
+              key: 'recovery-required',
+              label: '远端恢复信息',
+              level: 'error',
+              detail: `存在未完成的恢复：${marker}`,
+              suggestion: '请先执行对账并恢复或放弃该记录。'
+            })
+            break
+          }
+        } catch {
+          items.push({
+            key: 'recovery-required',
+            label: '远端恢复信息',
+            level: 'error',
+            detail: `恢复信息无法读取：${marker}`,
+            suggestion: '请先人工检查恢复信息。'
+          })
+          break
+        }
+      }
+    }
 
     /* 1) 连接：能走到这里说明连接已就绪（IPC 层保证），仍显式呈现 */
     items.push({
@@ -774,9 +826,13 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         // 两项会同时出现 ⇒ Vue 报重复 key、`data-test` 也串在一行上。
         key: 'filesystem',
         label: '文件系统',
-        level: 'warn',
-        detail: `${mountInfo.reason ?? '目标与暂存不在同一文件系统'}，将使用复制模式（耗时较长）`,
-        suggestion: '复制模式会在服务器上多占一份产物的空间，请确认磁盘余量。'
+        level: mountInfo.isMountPoint ? 'error' : 'warn',
+        detail: mountInfo.isMountPoint
+          ? '目标本身是挂载点，已停止以避免部分删除'
+          : `${mountInfo.reason ?? '目标与暂存不在同一文件系统'}，将使用复制模式（耗时较长）`,
+        suggestion: mountInfo.isMountPoint
+          ? '请由运维在挂载点内人工部署，或将目标改为挂载点下的普通子目录。'
+          : '复制模式会在服务器上多占一份产物的空间，请确认磁盘余量。'
       })
     }
 
@@ -1098,6 +1154,9 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       stagingPayload: stagingPayloadOf(remotePath, releaseId),
       strategy,
       moveMode: strategy === 'copy' ? 'copy' : 'rename',
+      recovery: null,
+      swapStarted: false,
+      contentCommitted: false,
       mountInfo: { isMountPoint: false, crossDevice: false },
       local: null,
       originalMode: null,
@@ -1162,6 +1221,12 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         ignoreReleaseId: release.id
       })
       state.mountInfo = pre.mountInfo
+      if (state.mountInfo.isMountPoint)
+        throw new AppError(
+          ErrorCode.E_DEPLOY_BLOCKED,
+          {},
+          { message: '目标本身是挂载点，需人工部署；已停止以避免部分删除' }
+        )
 
       /**
        * 把非 ok 的体检项转述到任务日志里。
@@ -1184,7 +1249,10 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         throw new AppError(
           pre.lock?.stale ? ErrorCode.E_LOCK_STALE : ErrorCode.E_TARGET_BUSY,
           { lockPath: lockPathOf(remotePath), lock: pre.lock },
-          { message: lockItem.detail, ...(lockItem.suggestion ? { hint: lockItem.suggestion } : {}) }
+          {
+            message: lockItem.detail,
+            ...(lockItem.suggestion ? { hint: lockItem.suggestion } : {})
+          }
         )
       }
       if (lockItem && pre.lockUnreadable) {
@@ -1376,12 +1444,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       }
       if (space.unknown) ctx.log('无法探测服务器剩余空间（df 未给出结果），继续发布', 'warn')
 
-      await acquireLock(
-        ports,
-        state,
-        (t, l) => ctx.log(t, l),
-        input.cleanStaleLock === true
-      )
+      await acquireLock(ports, state, (t, l) => ctx.log(t, l), input.cleanStaleLock === true)
       ctx.log(`已获取远端发布锁（releaseId=${releaseId}）`)
 
       await ports.fs.mkdirp(state.stagingPayload)
@@ -1443,7 +1506,8 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         // 算法兼容模式关闭时，遇到没有 hash 工具的服务器直接报错（不静默降级）
         allowStreamFallback: deps.hashCompat?.() ?? true,
         signal: ctx.signal,
-        onProgress: (done, total) => progressAt(3, total > 0 ? done / total : 1, `校验 ${done}/${total}`)
+        onProgress: (done, total) =>
+          progressAt(3, total > 0 ? done / total : 1, `校验 ${done}/${total}`)
       })
       if (verify.mode === 'disabled') {
         ctx.log('该目标关闭了发布后远端校验，跳过（台账的 rootHash 来源为本地）', 'warn')
@@ -1536,6 +1600,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           })
         : null
       if (archived) {
+        state.recovery = archived.recovery
         state.archiveId = archived.archive.id
         // 落库：崩溃恢复的「恢复旧版本」依赖 releases.archive_id 找到这一份归档。
         // 只在内存里记（历史 bug）的话，崩溃后对账会拿到 undefined，
@@ -1558,19 +1623,31 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       goto('SWAPPING', 5)
       progressAt(5, 0, '换版')
       throwIfAborted(ctx.signal)
-      await swapIn(ports, state, (done, total, what) =>
+      state.swapStarted = true
+      await swapIn(ports, state, ctx.signal, (done, total, what) =>
         progressAt(5, total > 0 ? done / total : 1, what)
       )
       if (state.swapFallbackReason) {
         // 用户配的是 rename 却走了 copy —— 必须说出来，否则"为什么这次这么慢"无从解释
         ctx.log(`换版改用 copy：${state.swapFallbackReason}`, 'warn')
       }
+      state.contentCommitted = true
       const align = await alignOwnership(ports, state, ctx, input.alignOwnership !== false)
 
       /* =============== 阶段 6：收尾（不允许抛错） =============== */
-      goto('SUCCESS', 6)
+      try {
+        goto('SUCCESS', 6)
+      } catch (err) {
+        ctx.log(`发布完成但状态写入失败：${String(err)}`, 'warn')
+      }
       progressAt(6, 0, '收尾')
-      await cleanupAfterSuccess(ports, state, ctx)
+      if (state.recovery) {
+        try {
+          await archive.completeRecovery(state.recovery, ports.archiveFs)
+        } catch (err) {
+          ctx.log(`发布完成但恢复标记清理失败：${String(err)}`, 'warn')
+        }
+      }
       // P0-1：这两条是**成功后的记账**，任何一条抛错都不能进补偿 —— 补偿会把
       // 目标路径上刚发成功的新版本删掉。记账失败只留错误日志，台账与事实的
       // 偏差交给 B14 对账修正（服务器上的内容才是事实）。
@@ -1643,22 +1720,19 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         }
       }
 
-      // 保留策略：发布成功后异步执行（方案书 §6.7），不阻塞成功信号
-      trackBackground(
-        (async () => {
-          try {
-            const r = await archive.applyRetention({
-              targetId: target.id,
-              fs: ports.archiveFs,
-              log: (text, level) => ctx.log(`[保留策略] ${text}`, level)
-            })
-            ctx.log(`保留策略执行完毕：${r.policyText}`)
-          } catch (err) {
-            logger.warn(`保留策略执行失败（不影响发布结果）：${(err as Error).message}`)
-            ctx.log(`保留策略执行失败（不影响发布结果）：${(err as Error).message}`, 'warn')
-          }
-        })()
-      )
+      // The task owns its channel and remote lock through maintenance completion.
+      try {
+        const r = await archive.applyRetention({
+          targetId: target.id,
+          fs: ports.archiveFs,
+          signal: ctx.signal,
+          log: (text, level) => ctx.log(`[保留策略] ${text}`, level)
+        })
+        ctx.log(`保留策略执行完毕：${r.policyText}`)
+      } catch (err) {
+        ctx.log(`保留策略执行失败（不影响发布结果）：${String(err)}`, 'warn')
+      }
+      await cleanupAfterSuccess(ports, state, ctx)
 
       return {
         ok: true,
@@ -1668,9 +1742,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         status: 'SUCCESS',
         // 首次发布没有归档这一步，这里就不该有版本号（不要让 UI 显示一个不存在的往期版本）；
         // 去重之后那份归档已被摘除，报的是**保留下来**的那份
-        ...(archived
-          ? { archivedVersionTag: dedupeKeptTag ?? archived.archive.versionTag }
-          : {}),
+        ...(archived ? { archivedVersionTag: dedupeKeptTag ?? archived.archive.versionTag } : {}),
         strategy,
         ...(state.swapFallbackReason
           ? {
@@ -1689,17 +1761,14 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       }
     } catch (err) {
       /* ================= 失败：补偿 ================= */
-      const failure = await compensate(
-        err,
-        stage,
-        state,
-        ports,
-        ctx,
-        compensations,
-        release.id
-      )
+      const failure = await compensate(err, stage, state, ports, ctx, compensations, release.id)
       try {
         repo.releases.finish(release.id, 'FAILED', `${failure.code}: ${failure.message}`)
+        const recoveryRequired = compensations.some((c) => !c.ok)
+        repo.releases.update(release.id, {
+          recoveryRequired,
+          recoveryInfo: recoveryRequired && state.recovery ? JSON.stringify(state.recovery) : null
+        })
         if (err instanceof AppError && err.code === ErrorCode.E_JOB_CANCELLED) {
           // 取消不是"失败"：用 current_step 区分开，UI 给的建议完全不同
           repo.releases.update(release.id, { currentStep: 'cancelled' })
@@ -1730,6 +1799,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
   async function swapIn(
     ports: DeployPorts,
     state: StageState,
+    signal: AbortSignal,
     onCopyFile: (done: number, total: number, what: string) => void
   ): Promise<void> {
     const src = swapSourceOf(state.remotePath, state.releaseId, state.kind)
@@ -1760,12 +1830,23 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     }
 
     state.moveMode = 'copy'
+    assertCopyVerificationAvailable(ports.hash, deps.hashCompat?.() ?? true)
     await copyArtifactInto({
       fs: ports.fs,
       src,
       dst: state.remotePath,
       kind: state.kind,
+      signal,
       onFile: (done, total, rel) => onCopyFile(done, total, `复制 ${rel}`)
+    })
+    await verifyCopiedArtifact({
+      port: ports.hash,
+      remotePath: state.remotePath,
+      kind: state.kind,
+      expected: state.local!.items,
+      operationId: state.releaseId,
+      allowStreamFallback: deps.hashCompat?.() ?? true,
+      signal
     })
   }
 
@@ -1888,13 +1969,13 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
      * 再把旧版本放回目标路径，最后才清暂存、放锁。
      * 反过来会出现"目标路径已被别的内容占着，旧版本搬不回来"的死局。
      *
-     * 条件是 `=== 5` 而不是 `>= 5`（P0-1）：只有**换版本身没完成**才允许碰目标路径。
-     * `goto('SUCCESS', 6)` 之后，目标路径上就是刚交付的新版本——阶段 6 的任何失败
-     * 都无权把它删掉（那等于"失败处理比原故障更破坏"）。
+     * 按物理事实判断：换版未提交时才清残片；有恢复描述时就复位旧版。
+     * 阶段编号和数据库写入是否成功，都不能替代这个提交边界。
      */
-    if (stage === 5) {
+    if (err instanceof ArchiveOperationError) state.recovery = err.recovery
+    if (!state.contentCommitted && (state.swapStarted || state.recovery)) {
       try {
-        if ((await ports.fs.stat(state.remotePath)).exists) {
+        if (state.swapStarted && (await ports.fs.stat(state.remotePath)).exists) {
           await ports.fs.rmrf(state.remotePath)
           out.push({
             action: '清理换版残留',
@@ -1905,25 +1986,36 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       } catch (e) {
         out.push({ action: '清理换版残留', ok: false, detail: (e as Error).message })
       }
-      if (state.archiveId) {
+      if (state.recovery) {
         try {
-          await archive.undoArchive({
-            archiveId: state.archiveId,
+          await archive.restoreRecovery({
+            recovery: state.recovery,
             ports: { fs: ports.archiveFs, hash: ports.hash },
-            moveMode: state.moveMode,
             log
           })
           out.push({ action: '归档复位', ok: true, detail: '已把旧版本搬回目标路径' })
           // 归档行已经被 undoArchive 摘掉了，台账上的 archive_id 必须跟着清空 ——
           // 否则崩溃恢复会拿着一个指向已删行的 id 去找归档，报出「找不到」的假象。
           try {
-            repo.releases.update(releaseId, { archiveId: null })
+            repo.releases.update(releaseId, {
+              archiveId: null,
+              recoveryRequired: false,
+              recoveryInfo: null
+            })
           } catch (e) {
             logger.error(`清空台账归档 id 失败：${(e as Error).message}`)
           }
         } catch (e) {
           const detail = (e as Error).message
           out.push({ action: '归档复位', ok: false, detail })
+          try {
+            repo.releases.update(releaseId, {
+              recoveryRequired: true,
+              recoveryInfo: JSON.stringify(state.recovery)
+            })
+          } catch (dbError) {
+            log(`恢复状态写入失败：${String(dbError)}；远端 recovery.json 已保留`, 'error')
+          }
           log(`归档复位失败：${detail}`, 'error')
         }
       }
@@ -1987,7 +2079,9 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       targetBase: base,
       entries: await input.fs.readdir(parentDir)
     })
-    const removable = new Set(known.filter(isAutoCleanable).map((r) => joinRemote(parentDir, r.name)))
+    const removable = new Set(
+      known.filter(isAutoCleanable).map((r) => joinRemote(parentDir, r.name))
+    )
 
     const removed: string[] = []
     const failed: Array<{ path: string; reason: string }> = []
@@ -2165,7 +2259,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     cleanResidue,
     busyTargets: () => [...localBusy],
     whenIdle: async () => {
-      while (background.size > 0) await Promise.all([...background])
+      // Compatibility hook: maintenance now finishes inside run().
     }
   }
 }

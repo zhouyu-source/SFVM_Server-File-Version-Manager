@@ -18,6 +18,8 @@
  * 真机集成测试只负责验证 ssh2 语义差异（错误码、流行为）。
  */
 import { createHash } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
+import { posix } from 'node:path'
 import { createReadStream, promises as fsp } from 'node:fs'
 import { basename, join } from 'node:path'
 import { AppError, ErrorCode } from '../infra/errors'
@@ -456,6 +458,67 @@ export async function verifyRemote(input: VerifyRemoteInput): Promise<RemoteVeri
   return verifyViaCommand({ ...input, payloadDir: payload, mode })
 }
 
+/** 复制是提交边界：始终校验内容与文件集合，不受可选 staging 校验开关影响。 */
+export function assertCopyVerificationAvailable(
+  port: RemoteHashPort,
+  allowStreamFallback: boolean
+): void {
+  if (!allowStreamFallback && pickVerifyMode(port.capability, true) === 'sftp-stream') {
+    throw new AppError(ErrorCode.E_NO_REMOTE_HASH_TOOL, { reason: 'required-copy-verification' })
+  }
+}
+
+export async function verifyCopiedArtifact(input: {
+  port: RemoteHashPort
+  remotePath: string
+  kind: 'dir' | 'file'
+  expected: readonly ReleaseItem[]
+  operationId: string
+  allowStreamFallback?: boolean
+  signal?: AbortSignal
+}): Promise<void> {
+  assertCopyVerificationAvailable(input.port, input.allowStreamFallback !== false)
+  const root = normalizeRemotePath(input.remotePath)
+  const name = posix.basename(root)
+  const expected =
+    input.kind === 'file'
+      ? input.expected.map((it) => ({ ...it, relPath: name }))
+      : [...input.expected]
+  const fileSize = input.kind === 'file' ? await input.port.statSize(root) : null
+  const files =
+    input.kind === 'file'
+      ? fileSize === null
+        ? []
+        : [{ relPath: name, size: fileSize }]
+      : await input.port.listFiles(root)
+  const sizes = new Map(files.map((it) => [it.relPath, it.size]))
+  if (sizes.size !== expected.length || expected.some((it) => sizes.get(it.relPath) !== it.size)) {
+    throw new AppError(ErrorCode.E_VERIFY_MISMATCH, { path: root, reason: 'copied-file-set' })
+  }
+  const port =
+    input.kind === 'file'
+      ? {
+          ...input.port,
+          listFiles: async () => {
+            const size = await input.port.statSize(root)
+            return size === null ? [] : [{ relPath: name, size }]
+          }
+        }
+      : input.port
+  const result = await verifyRemote({
+    port,
+    payloadDir: input.kind === 'file' ? posix.dirname(root) : root,
+    expected,
+    releaseId: `${input.operationId}-copy-${randomUUID()}`,
+    verifyRemoteEnabled: true,
+    allowStreamFallback: input.allowStreamFallback,
+    ...(input.signal ? { signal: input.signal } : {})
+  })
+  if (!result.diff.ok) {
+    throw new AppError(ErrorCode.E_VERIFY_MISMATCH, { path: root, diff: result.diff })
+  }
+}
+
 /** 命令分支：上传清单 → `<tool> -c` → 解析 → 删除清单。 */
 async function verifyViaCommand(
   input: VerifyRemoteInput & { payloadDir: string; mode: 'sha256sum' | 'shasum' }
@@ -672,7 +735,10 @@ export async function hashRemoteArtifact(
           reason: 'file-too-large'
         })
       }
-      const hash = await hashReadable(input.port.readStream(joinRemote(root, f.relPath)), input.signal)
+      const hash = await hashReadable(
+        input.port.readStream(joinRemote(root, f.relPath)),
+        input.signal
+      )
       items.push({
         relPath: withPrefix(f.relPath),
         hash,

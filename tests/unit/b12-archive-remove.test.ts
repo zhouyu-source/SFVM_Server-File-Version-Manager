@@ -64,11 +64,9 @@ function seedArchive(
   }
 }
 
-/** 只有 rmrf 会被删除用到的"远端"。 */
-function rmrfPort(
-  impl: (path: string) => Promise<void>
-): ArchiveFsPort {
-  return { rmrf: impl } as unknown as ArchiveFsPort
+/** 删除前检查恢复标记；这里没有待恢复内容。 */
+function rmrfPort(impl: (path: string) => Promise<void>): ArchiveFsPort {
+  return { rmrf: impl, stat: async () => ({ exists: false }) } as unknown as ArchiveFsPort
 }
 
 /* =============================================================== 删除 */
@@ -166,7 +164,10 @@ describe('B12 台账占用汇总（T12.6）', () => {
   it('条数 / 总字节 / 状态分布 / 时间跨度都来自台账，且不连服务器', () => {
     const t = makeDb()
     const { target } = seedBasic(t.repo, { kind: 'dir', remotePath: '/opt/app/dist' })
-    seedArchive(t, target.id, '20260901-120000_aaaaaaa', { bytes: 100, archivedAt: '2026-09-01T10:00:00.000Z' })
+    seedArchive(t, target.id, '20260901-120000_aaaaaaa', {
+      bytes: 100,
+      archivedAt: '2026-09-01T10:00:00.000Z'
+    })
     seedArchive(t, target.id, '20260902-120000_bbbbbbb', {
       bytes: 200,
       status: 'missing',

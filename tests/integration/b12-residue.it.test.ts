@@ -16,7 +16,14 @@
  * - 浅路径（父目录 = /tmp）：发布后**不应**有残留；即便有，`cleanResidue` 必须成功；
  * - 常规路径：对照组（本就不该有残留）。
  */
-import { existsSync, mkdtempSync, readFileSync as readKey, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync as readKey,
+  rmSync,
+  writeFileSync,
+  mkdirSync
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -59,7 +66,9 @@ function localArtifact(content: Record<string, string>): string {
   dirs.push(root)
   for (const [rel, c] of Object.entries(content)) {
     const p = join(root, rel)
-    mkdirSync(join(root, rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''), { recursive: true })
+    mkdirSync(join(root, rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''), {
+      recursive: true
+    })
     writeFileSync(p, c)
   }
   return root
@@ -76,7 +85,10 @@ function makeCtx() {
   return { ctx, logs }
 }
 
-async function publish(targetId: string, releaseId: string): Promise<{ ok: boolean; logs: string[] }> {
+async function publish(
+  targetId: string,
+  releaseId: string
+): Promise<{ ok: boolean; logs: string[] }> {
   const { ctx, logs } = makeCtx()
   const sftp = (await pool.sftp(connId)) as unknown as DeploySftpLike
   const capability = pool.capabilityOf(connId)!
@@ -99,7 +111,10 @@ async function publish(targetId: string, releaseId: string): Promise<{ ok: boole
  * 临时根只有 2 层 —— 它本来就该被删掉，只是不该通过守卫那条路删。
  * 测试自己建的东西自己负责清干净（项目约定：跑完 `/tmp` 下 `sfvm-*` 必须为零）。
  */
-async function rmRemoteRecursive(sftp: Awaited<ReturnType<typeof pool.sftp>>, path: string): Promise<void> {
+async function rmRemoteRecursive(
+  sftp: Awaited<ReturnType<typeof pool.sftp>>,
+  path: string
+): Promise<void> {
   const isDir = (): Promise<boolean> =>
     new Promise((resolve) => {
       sftp.stat(path, (err, st) => resolve(!err && Boolean(st && st.isDirectory())))
@@ -107,12 +122,15 @@ async function rmRemoteRecursive(sftp: Awaited<ReturnType<typeof pool.sftp>>, pa
   const children = (): Promise<string[]> =>
     new Promise((resolve) => {
       sftp.readdir(path, (err, list) =>
-        resolve(err || !list ? [] : list.map((e) => e.filename).filter((n) => n !== '.' && n !== '..'))
+        resolve(
+          err || !list ? [] : list.map((e) => e.filename).filter((n) => n !== '.' && n !== '..')
+        )
       )
     })
   const unlink = (p: string): Promise<void> =>
     new Promise((resolve) => sftp.unlink(p, () => resolve()))
-  const rmdir = (p: string): Promise<void> => new Promise((resolve) => sftp.rmdir(p, () => resolve()))
+  const rmdir = (p: string): Promise<void> =>
+    new Promise((resolve) => sftp.rmdir(p, () => resolve()))
 
   if (!(await isDir())) {
     await unlink(path)
@@ -149,10 +167,7 @@ beforeAll(async () => {
   })
   connId = conn.id
   const keyBlob = readKey(KEY_PATH!)
-  const { fingerprintOf } = await import('@main/services/ssh-client')
-  const fp = fingerprintOf(keyBlob)
-  repo.knownHosts.trust(HOST!, PORT, fp.keyType, fp.fingerprint)
-  await pool.connect({
+  const connected = await pool.connect({
     connectionId: connId,
     host: HOST!,
     port: PORT,
@@ -161,6 +176,8 @@ beforeAll(async () => {
     privateKey: keyBlob,
     hostKeyPolicy: 'accept-any'
   })
+  // Pin the server key observed in the handshake, not the client's authentication key.
+  repo.knownHosts.trust(HOST!, PORT, connected.hostKeyType, connected.hostKeyFingerprint)
 }, 120000)
 
 afterAll(async () => {
@@ -188,8 +205,13 @@ describeIf('残留探针', () => {
     { name: '常规路径', remotePath: `${REMOTE_ROOT_PARENT}/${rand()}/web/dist`, parent: '' }
   ]) {
     it(`${scenario.name}：发布 → 列目录 → 清理残留`, async () => {
-      const parent = scenario.parent || scenario.remotePath.slice(0, scenario.remotePath.lastIndexOf('/'))
-      const env = repo.environments.create({ name: `probe-${rand()}`, envType: 'test', connectionId: connId })
+      const parent =
+        scenario.parent || scenario.remotePath.slice(0, scenario.remotePath.lastIndexOf('/'))
+      const env = repo.environments.create({
+        name: `probe-${rand()}`,
+        envType: 'test',
+        connectionId: connId
+      })
       const local = localArtifact({ 'index.html': 'v1' })
       const target = repo.targets.create({
         environmentId: env.id,
@@ -246,7 +268,9 @@ describeIf('残留探针', () => {
         })
         console.log('cleanResidue removed =', JSON.stringify(cleaned.removed))
         console.log('cleanResidue failed  =', JSON.stringify(cleaned.failed, null, 2))
-        expect(cleaned.failed, `清理应当成功，实际失败：${JSON.stringify(cleaned.failed)}`).toEqual([])
+        expect(cleaned.failed, `清理应当成功，实际失败：${JSON.stringify(cleaned.failed)}`).toEqual(
+          []
+        )
       }
 
       // 收尾

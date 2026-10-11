@@ -136,12 +136,15 @@ async function rmRemoteRecursive(sftp: SFTPWrapper, path: string): Promise<void>
   const children = (): Promise<string[]> =>
     new Promise((resolve) => {
       sftp.readdir(path, (err, list) =>
-        resolve(err || !list ? [] : list.map((e) => e.filename).filter((n) => n !== '.' && n !== '..'))
+        resolve(
+          err || !list ? [] : list.map((e) => e.filename).filter((n) => n !== '.' && n !== '..')
+        )
       )
     })
   const unlink = (p: string): Promise<void> =>
     new Promise((resolve) => sftp.unlink(p, () => resolve()))
-  const rmdir = (p: string): Promise<void> => new Promise((resolve) => sftp.rmdir(p, () => resolve()))
+  const rmdir = (p: string): Promise<void> =>
+    new Promise((resolve) => sftp.rmdir(p, () => resolve()))
 
   if (!(await isDir())) {
     await unlink(path)
@@ -156,9 +159,7 @@ async function rmRemoteRecursive(sftp: SFTPWrapper, path: string): Promise<void>
 /** 读远端文本（不存在返回 null —— 用来断言"文件真的没被创建"）。 */
 async function readRemote(path: string): Promise<string | null> {
   return new Promise((resolve) => {
-    sftpHandle.readFile(path, (err, data) =>
-      resolve(err || !data ? null : data.toString('utf8'))
-    )
+    sftpHandle.readFile(path, (err, data) => resolve(err || !data ? null : data.toString('utf8')))
   })
 }
 
@@ -186,10 +187,7 @@ beforeAll(async () => {
   })
   connId = conn.id
   const keyBlob = readKey(KEY_PATH!)
-  const { fingerprintOf } = await import('@main/services/ssh-client')
-  const fp = fingerprintOf(keyBlob)
-  repo.knownHosts.trust(HOST!, PORT, fp.keyType, fp.fingerprint)
-  await pool.connect({
+  const connected = await pool.connect({
     connectionId: connId,
     host: HOST!,
     port: PORT,
@@ -198,6 +196,8 @@ beforeAll(async () => {
     privateKey: keyBlob,
     hostKeyPolicy: 'accept-any'
   })
+  // Pin the server key observed in the handshake, not the client's authentication key.
+  repo.knownHosts.trust(HOST!, PORT, connected.hostKeyType, connected.hostKeyFingerprint)
   sftpHandle = (await pool.sftp(connId)) as unknown as SFTPWrapper
 }, 120000)
 
@@ -302,7 +302,10 @@ describeIf('文件型目标：本地产物名 ≠ 服务器端文件名', () => 
 
     // 3) 归档里的旧版本也是配置的文件名，且**立刻能自校验通过**
     const archived = repo.archives.listByTarget(target.id)
-    console.log('归档：', JSON.stringify(archived.map((a) => ({ tag: a.versionTag, payload: a.payloadPath }))))
+    console.log(
+      '归档：',
+      JSON.stringify(archived.map((a) => ({ tag: a.versionTag, payload: a.payloadPath })))
+    )
     expect(archived).toHaveLength(1)
     expect(await readRemote(`${archived[0].payloadPath}/order.jar`)).toBe('B17-v2')
     // 归档目录按 `<目标名>.versions` 建（目录条目带 `/` 后缀，见 listDir）

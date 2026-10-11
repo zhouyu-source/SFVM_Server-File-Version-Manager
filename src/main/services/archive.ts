@@ -35,11 +35,23 @@
  * 注入，因此单测可以用内存实现把失败与回滚路径都真实跑一遍。
  */
 import { posix } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import {
+  RECOVERY_FILE,
+  RECOVERY_CLOSED_FILE,
+  type ArchiveRecoveryDescriptor
+} from '../infra/archive-recovery'
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
 import { resolveArchiveDir, posixBasename } from '../infra/archive-dir'
 import { normalizeRemotePath } from '../infra/remote-path'
-import { compareRelPathUtf8, computeRootHash, joinRemote, sortByRelPathUtf8, sumBytes } from '../infra/hash-core'
+import {
+  compareRelPathUtf8,
+  computeRootHash,
+  joinRemote,
+  sortByRelPathUtf8,
+  sumBytes
+} from '../infra/hash-core'
 import {
   MANIFEST_CHUNK_BYTES,
   MANIFEST_FILE_NAME,
@@ -58,6 +70,8 @@ import { copyArtifactInto } from '../infra/copy-tree'
 import { createRemoteFs, type RemoteStat, type SftpLike } from './remote-fs'
 import {
   hashRemoteArtifact,
+  assertCopyVerificationAvailable,
+  verifyCopiedArtifact,
   verifyRemote,
   type HashProgressFn,
   type RemoteHashPort
@@ -161,9 +175,10 @@ export function createSftpArchivePort(sftp: ArchiveSftpLike): ArchiveFsPort {
     rename: (from, to) => remoteFs.rename(from, to),
     removeFile: (path) => remoteFs.unlinkFile(path),
     rmrf: (path) => remoteFs.rmrf(path),
-    listFiles: (root) => remoteFs.listAllFiles(root).then((list) =>
-      list.map((e) => ({ relPath: e.relPath, size: e.size, mtime: e.mtime }))
-    ),
+    listFiles: (root) =>
+      remoteFs
+        .listAllFiles(root)
+        .then((list) => list.map((e) => ({ relPath: e.relPath, size: e.size, mtime: e.mtime }))),
     readTextFile(path) {
       const p = normalizeRemotePath(path)
       return new Promise<string>((resolve, reject) => {
@@ -348,6 +363,7 @@ export interface ArchiveVersionInput {
 
 export interface ArchiveVersionResult {
   archive: ArchiveView
+  recovery: ArchiveRecoveryDescriptor
   /** 版本号冲突次数（0 = 一次命中，> 0 说明同一秒内归档了多次） */
   tagConflicts: number
   /** 是否现场计算了远端指纹（用于在 UI/日志里解释"为什么慢"） */
@@ -365,6 +381,7 @@ export interface VerifyArchiveInput {
 export interface ApplyRetentionInput {
   targetId: string
   fs: ArchiveFsPort
+  signal?: AbortSignal
   log?: ArchiveLogFn
 }
 
@@ -391,7 +408,7 @@ export interface ReadDetailInput {
  * 若不复位，用户就只剩"归档目录里那一份"，目标永久为空。
  *
  * 放在这里而不是 B10 里，是因为"搬回去"与"搬过来"必须**用同一种方式**
- * （去程是 copy 回程也只能 copy，见 `rollbackMove` 的注释）；
+ * （去程是 copy 回程也只能 copy，见 `restoreRecovery` 的实现）；
  * 分两处实现迟早会出现"搬过去能成、搬回来不成"的不对称 bug。
  */
 export interface UndoArchiveInput {
@@ -402,13 +419,31 @@ export interface UndoArchiveInput {
   log?: ArchiveLogFn
 }
 
+export class ArchiveOperationError extends AppError {
+  constructor(
+    public readonly recovery: ArchiveRecoveryDescriptor,
+    cause: unknown
+  ) {
+    super(
+      ErrorCode.E_ARCHIVE_FAILED,
+      { recovery, original: String(cause) },
+      {
+        message: `归档补偿未完成，内容仍在 ${recovery.artifactPath}，请执行恢复`
+      }
+    )
+  }
+}
+
 function toArchiveStatus(raw: string): ArchiveStatus {
   return raw === 'missing' || raw === 'corrupt' ? raw : 'valid'
 }
 
 /** 截断过长的文件名列表，避免错误详情把日志刷爆。 */
 function previewList(names: readonly string[], max = 5): string {
-  const head = names.slice(0, max).map((n) => JSON.stringify(n)).join('、')
+  const head = names
+    .slice(0, max)
+    .map((n) => JSON.stringify(n))
+    .join('、')
   return names.length > max ? `${head} 等 ${names.length} 个` : head
 }
 
@@ -643,7 +678,8 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
           { unsafeRelPaths: computed.unsafeRelPaths.slice(0, 20) },
           {
             message: '目标中存在文件名含换行或空字符的文件，无法归档',
-            hint: `请先重命名这些文件：${previewList(computed.unsafeRelPaths)}。` +
+            hint:
+              `请先重命名这些文件：${previewList(computed.unsafeRelPaths)}。` +
               '这类文件名无法进入行式校验清单，强行归档会造成往期版本无法校验。'
           }
         )
@@ -691,126 +727,209 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
      * - `rename`（默认）：同文件系统内原子完成，毫秒级。
      * - `copy`：目标本身是挂载点时，源与归档目录必然不在同一文件系统上，
      *   `rename` 报 `EXDEV`；此时只能逐个文件复制。
-     *   注意 `copyArtifactInto` 会**先确认副本完整**才返回，
-     *   所以我们随后才敢删除目标 —— 见 `infra/copy-tree.ts` 文件头。 */
+     *   `copyArtifactInto` 校验路径与大小；随后强制校验 SHA-256，
+     *   两层校验均通过才允许删除目标。 */
     const moveMode: 'rename' | 'copy' = input.moveMode === 'copy' ? 'copy' : 'rename'
-    await input.ports.fs.mkdirp(payloadPath)
-    try {
-      if (moveMode === 'copy') {
-        log('目标不支持原子 rename（挂载点或跨设备），改用复制方式归档，耗时更长…', 'warn')
-        await copyArtifactInto({
-          fs: input.ports.fs,
-          src: remotePath,
-          dst: artifactAt,
-          kind,
-          ...(input.signal ? { signal: input.signal } : {})
-        })
-      } else {
-        await input.ports.fs.rename(remotePath, artifactAt)
-      }
-    } catch (err) {
-      // 目标原封不动（复制模式下半成品都在归档目录里），直接失败即可
-      throw new AppError(
-        ErrorCode.E_ARCHIVE_FAILED,
-        { remotePath, storagePath, moveMode, original: (err as Error).message },
-        {
-          message:
-            moveMode === 'copy'
-              ? '归档当前版本失败（复制未完成，目标未被改动）'
-              : '归档当前版本失败（目标未被改动）'
-        }
-      )
+    if (moveMode === 'copy')
+      assertCopyVerificationAvailable(input.ports.hash, deps.hashCompat?.() ?? true)
+    const recovery: ArchiveRecoveryDescriptor = {
+      operationId: input.releaseId ?? randomUUID(),
+      targetId: target.id,
+      originalPath: remotePath,
+      storagePath,
+      payloadPath,
+      artifactPath: artifactAt,
+      kind,
+      archiveMoveMode: moveMode,
+      versionTag,
+      rootHash
     }
-
-    /**
-     * 复制模式下"清空目标"是**独立的一步、独立的失败语义**。
-     *
-     * 走到这里归档副本已经完整落在归档目录里（`copyArtifactInto` 逐条核对过），
-     * 与上一步"复制没做完"是两回事：若仍报"复制未完成"，用户会去重发一遍，
-     * 而真正该做的是先对账清掉那份无清单的残留副本。目标本身没被改动。
-     */
-    if (moveMode === 'copy') {
+    await input.ports.fs.mkdirp(payloadPath)
+    let relocated = false
+    try {
       try {
-        await input.ports.fs.rmrf(remotePath)
+        if (moveMode === 'copy') {
+          log('目标不支持原子 rename（挂载点或跨设备），改用复制方式归档，耗时更长…', 'warn')
+          if (input.ports.hash.capability.hasSha256sum || input.ports.hash.capability.hasShasum) {
+            await input.ports.fs.mkdirp(input.ports.hash.tmpDir)
+          }
+          await copyArtifactInto({
+            fs: input.ports.fs,
+            src: remotePath,
+            dst: artifactAt,
+            kind,
+            ...(input.signal ? { signal: input.signal } : {})
+          })
+          await verifyCopiedArtifact({
+            port: input.ports.hash,
+            remotePath: artifactAt,
+            kind,
+            expected: sourceItems,
+            operationId: recovery.operationId,
+            allowStreamFallback: deps.hashCompat?.() ?? true,
+            ...(input.signal ? { signal: input.signal } : {})
+          })
+        }
       } catch (err) {
+        // 目标原封不动（复制模式下半成品都在归档目录里），直接失败即可
         throw new AppError(
           ErrorCode.E_ARCHIVE_FAILED,
-          { remotePath, storagePath, moveMode, stage: 'clear-target', original: (err as Error).message },
+          { remotePath, storagePath, moveMode, original: (err as Error).message },
           {
             message:
-              '归档副本已完成，但清空目标失败（目标未被改动）。' +
-              '归档目录里残留一份无清单副本，请勿重复发布，先到「往期版本 → 对账」处理。'
+              moveMode === 'copy'
+                ? '归档当前版本失败（复制未完成，目标未被改动）'
+                : '归档当前版本失败（目标未被改动）'
           }
         )
       }
-    }
 
-    /* ---- 5) 写 manifest（先 .tmp 再 rename，绝不产生半截文件） ----
-     *
-     * 走到这里目标路径已经是空的（内容在 artifactAt）。所以这个 try 里的任何失败
-     * 都必须回滚，否则"归档失败"会连带把现网版本弄没。 */
-    const manifestHeader = buildManifestHeader({
-      targetName: target.name,
-      originalPath: remotePath,
-      kind,
-      versionTag,
-      archivedAt: toLocalIso(now()),
-      rootHash,
-      totalBytes,
-      fileCount: files.length,
-      operator: input.operator ?? null,
-      note: input.note ?? null,
-      sourceReleaseId: input.releaseId ?? null
-    })
+      /**
+       * 复制模式下"清空目标"是**独立的一步、独立的失败语义**。
+       *
+       * 副本已经通过 SHA-256 校验。清源可能只完成一部分便报错，因此先保存
+       * 恢复描述，再进入删除步骤；清源失败时使用已校验的副本恢复原内容。
+       */
+      await writeRecoveryAtomically(input.ports.fs, recovery)
+      if (input.signal?.aborted) throw new AppError(ErrorCode.E_JOB_CANCELLED, {})
+      if (moveMode === 'rename') {
+        await input.ports.fs.rename(remotePath, artifactAt)
+        relocated = true
+      }
+      if (moveMode === 'copy') {
+        try {
+          relocated = true // rmrf can partially delete before failing
+          await input.ports.fs.rmrf(remotePath)
+        } catch (err) {
+          throw new AppError(
+            ErrorCode.E_ARCHIVE_FAILED,
+            {
+              remotePath,
+              storagePath,
+              moveMode,
+              stage: 'clear-target',
+              original: (err as Error).message
+            },
+            {
+              message: '归档副本已完成，但清空目标失败，正在恢复归档前的内容'
+            }
+          )
+        }
+      }
 
-    try {
-      await writeManifestAtomically(input.ports.fs, storagePath, manifestHeader, files)
-    } catch (err) {
-      // 目标此刻是空的 —— 必须把内容搬回去，否则"归档失败"会连带把现网版本弄丢
-      await rollbackMove(input.ports.fs, {
-        artifactAt,
-        remotePath,
-        storagePath,
+      /* ---- 5) 写 manifest（先 .tmp 再 rename，绝不产生半截文件） ----
+       *
+       * 走到这里目标路径已经是空的（内容在 artifactAt）。所以这个 try 里的任何失败
+       * 都必须回滚，否则"归档失败"会连带把现网版本弄没。 */
+      const manifestHeader = buildManifestHeader({
+        targetName: target.name,
+        originalPath: remotePath,
         kind,
-        moveMode,
-        log
+        versionTag,
+        archivedAt: toLocalIso(now()),
+        rootHash,
+        totalBytes,
+        fileCount: files.length,
+        operator: input.operator ?? null,
+        note: input.note ?? null,
+        sourceReleaseId: input.releaseId ?? null
       })
+
+      await writeManifestAtomically(input.ports.fs, storagePath, manifestHeader, files)
+
+      const row = repo.atomic(() => {
+        const created = repo.archives.create({
+          targetId: target.id,
+          versionTag,
+          storagePath,
+          payloadPath,
+          kind,
+          rootHash,
+          totalBytes,
+          fileCount: files.length,
+          releaseId: input.releaseId ?? null,
+          note: input.note ?? null,
+          status: 'valid'
+        })
+        recovery.archiveId = created.id
+        const release = input.releaseId ? repo.releases.get(input.releaseId) : undefined
+        if (release)
+          repo.releases.update(release.id, {
+            recoveryInfo: JSON.stringify(recovery),
+            ...(release.action === 'deploy' ? { archiveId: created.id } : {})
+          })
+        return created
+      })
+
+      try {
+        repo.audit.write({
+          level: 'info',
+          scope: 'archive',
+          refId: row.id,
+          message:
+            `归档版本 ${versionTag}（${files.length} 个文件 / ${totalBytes} 字节）` +
+            `${hashedRemotely ? '；指纹由远端现网内容现场计算' : ''}`,
+          detail: JSON.stringify({ targetId: target.id, storagePath, rootHash })
+        })
+      } catch (err) {
+        log(`归档完成但审计写入失败：${String(err)}`, 'warn')
+      }
+      logger.info(
+        `archived ${remotePath} -> ${storagePath} (${files.length} files, root=${rootHash.slice(0, 12)})`
+      )
+      log(`已归档为 ${versionTag}（${files.length} 个文件 / ${totalBytes} 字节）`)
+
+      if (!input.releaseId) {
+        try {
+          await input.ports.fs.removeFile(joinRemote(storagePath, RECOVERY_FILE))
+        } catch (err) {
+          log(`归档完成但恢复标记清理失败：${String(err)}`, 'warn')
+        }
+      }
+      return { archive: toView(row), recovery, tagConflicts: resolved.attempts - 1, hashedRemotely }
+    } catch (err) {
+      if (relocated) {
+        try {
+          // Only this operation may clear its own partially deleted copy source.
+          if (moveMode === 'copy' && (await input.ports.fs.stat(remotePath)).exists) {
+            await input.ports.fs.rmrf(remotePath)
+          }
+          await restoreRecovery({ recovery, ports: input.ports, log })
+          try {
+            if (input.releaseId && repo.releases.get(input.releaseId))
+              repo.releases.update(input.releaseId, {
+                recoveryRequired: false,
+                recoveryInfo: null,
+                ...(repo.releases.get(input.releaseId)!.action === 'deploy'
+                  ? { archiveId: null }
+                  : {})
+              })
+          } catch (dbError) {
+            log(`内容已复位，恢复台账需对账：${String(dbError)}`, 'warn')
+          }
+        } catch (restoreError) {
+          try {
+            if (input.releaseId && repo.releases.get(input.releaseId))
+              repo.releases.update(input.releaseId, {
+                recoveryRequired: true,
+                recoveryInfo: JSON.stringify(recovery)
+              })
+          } catch {
+            /* remote recovery.json remains authoritative */
+          }
+          throw new ArchiveOperationError(recovery, restoreError)
+        }
+      } else {
+        try {
+          await input.ports.fs.rmrf(storagePath)
+        } catch (cleanupError) {
+          log(`未搬动目标，归档残留需清理：${String(cleanupError)}`, 'warn')
+        }
+      }
       throw err instanceof AppError
         ? err
-        : new AppError(ErrorCode.E_ARCHIVE_FAILED, {
-            storagePath,
-            original: (err as Error).message
-          })
+        : new AppError(ErrorCode.E_ARCHIVE_FAILED, { storagePath, original: String(err) })
     }
-
-    /* ---- 6) 入库 ---- */
-    const row = repo.archives.create({
-      targetId: target.id,
-      versionTag,
-      storagePath,
-      payloadPath,
-      kind,
-      rootHash,
-      totalBytes,
-      fileCount: files.length,
-      releaseId: input.releaseId ?? null,
-      note: input.note ?? null,
-      status: 'valid'
-    })
-
-    repo.audit.write({
-      level: 'info',
-      scope: 'archive',
-      refId: row.id,
-      message:
-        `归档版本 ${versionTag}（${files.length} 个文件 / ${totalBytes} 字节）` +
-        `${hashedRemotely ? '；指纹由远端现网内容现场计算' : ''}`,
-      detail: JSON.stringify({ targetId: target.id, storagePath, rootHash })
-    })
-    logger.info(`archived ${remotePath} -> ${storagePath} (${files.length} files, root=${rootHash.slice(0, 12)})`)
-    log(`已归档为 ${versionTag}（${files.length} 个文件 / ${totalBytes} 字节）`)
-
-    return { archive: toView(row), tagConflicts: resolved.attempts - 1, hashedRemotely }
   }
 
   /**
@@ -852,45 +971,118 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
    * 去程是 `rename` 就用 `rename` 回来；去程是 `copy` 就只能再复制一遍
    * （此时源与目标跨设备，`rename` 一定失败）。
    */
-  async function rollbackMove(
-    fs: ArchiveFsPort,
-    opts: {
-      artifactAt: string
-      remotePath: string
-      storagePath: string
-      kind: 'dir' | 'file'
-      moveMode: 'rename' | 'copy'
-      log: ArchiveLogFn
-    }
-  ): Promise<void> {
-    const { artifactAt, remotePath, storagePath, kind, moveMode, log } = opts
-    log('写 manifest 失败，正在把内容放回目标路径…', 'warn')
-    try {
-      if (moveMode === 'copy') {
-        // 去程把目标清空了，所以先把目标清干净再放回去，避免留下新版本的碎片
-        if ((await fs.stat(remotePath)).exists) await fs.rmrf(remotePath)
-        await copyArtifactInto({ fs, src: artifactAt, dst: remotePath, kind })
-      } else {
-        await fs.rename(artifactAt, remotePath)
-      }
-    } catch (err) {
-      const message =
-        `写 manifest 失败后回滚也失败：目标路径 ${remotePath} 目前为空，` +
-        `内容仍在 ${storagePath}/payload 下。请手工移动回去或使用对账功能恢复。`
-      logger.error(`${message}（原因：${(err as Error).message}）`)
-      log(message, 'error')
+  async function restoreRecovery(input: {
+    recovery: ArchiveRecoveryDescriptor
+    ports: ArchivePorts
+    log?: ArchiveLogFn
+  }): Promise<void> {
+    const d = input.recovery
+    const fs = input.ports.fs
+    if ((await fs.stat(d.originalPath)).exists)
       throw new AppError(
         ErrorCode.E_ARCHIVE_FAILED,
-        { target: remotePath, storagePath, moveMode, original: (err as Error).message },
-        { message, hint: '内容没有丢，但需要人工介入。请把上述路径告知运维。' }
+        { remotePath: d.originalPath },
+        { message: '目标路径已有内容，拒绝覆盖' }
       )
+    if (!(await fs.stat(d.artifactPath)).exists)
+      throw new AppError(ErrorCode.E_ARCHIVE_MISSING, { path: d.artifactPath })
+    if (d.archiveMoveMode === 'copy') {
+      assertCopyVerificationAvailable(input.ports.hash, deps.hashCompat?.() ?? true)
+      if (input.ports.hash.capability.hasSha256sum || input.ports.hash.capability.hasShasum) {
+        await fs.mkdirp(input.ports.hash.tmpDir)
+      }
+      const expected = await hashRemoteArtifact({
+        port: input.ports.hash,
+        remotePath: d.artifactPath,
+        kind: d.kind
+      })
+      const files = expected.items.map((it) => ({
+        ...it,
+        relPath: d.kind === 'dir' ? `${posixBasename(d.originalPath)}/${it.relPath}` : it.relPath
+      }))
+      if (computeRootHash(files) !== d.rootHash)
+        throw new AppError(ErrorCode.E_VERIFY_MISMATCH, { path: d.artifactPath })
+      await copyArtifactInto({ fs, src: d.artifactPath, dst: d.originalPath, kind: d.kind })
+      await verifyCopiedArtifact({
+        port: input.ports.hash,
+        remotePath: d.originalPath,
+        kind: d.kind,
+        expected: expected.items,
+        operationId: d.operationId,
+        allowStreamFallback: deps.hashCompat?.() ?? true
+      })
+    } else {
+      await fs.rename(d.artifactPath, d.originalPath)
+    }
+    // Once content is restored, bookkeeping errors must never report a failed restore.
+    try {
+      await fs.rmrf(d.storagePath)
+    } catch (err) {
+      input.log?.(`归档残留需清理：${String(err)}`, 'warn')
     }
     try {
-      await fs.rmrf(storagePath)
+      const row = d.archiveId
+        ? repo.archives.get(d.archiveId)
+        : repo.archives
+            .listByTarget(d.targetId, RETENTION_SCAN_LIMIT)
+            .find((r) => r.storagePath === d.storagePath)
+      if (row) repo.archives.remove(row.id)
     } catch (err) {
-      logger.warn(`回滚后清理空归档目录失败（不影响正确性）：${(err as Error).message}`)
+      input.log?.(`内容已恢复，归档台账需对账：${String(err)}`, 'warn')
     }
-    log('已回滚到归档前状态', 'warn')
+    input.log?.('旧版本已复位到目标路径', 'warn')
+  }
+
+  async function writeRecoveryAtomically(
+    fs: ArchiveFsPort,
+    recovery: ArchiveRecoveryDescriptor
+  ): Promise<void> {
+    const path = joinRemote(
+      recovery.storagePath,
+      recovery.phase && recovery.phase !== 'pending' ? RECOVERY_CLOSED_FILE : RECOVERY_FILE
+    )
+    if ((await fs.stat(path)).exists) {
+      const existing = JSON.parse(await fs.readTextFile(path)) as ArchiveRecoveryDescriptor
+      if (
+        existing.operationId === recovery.operationId &&
+        existing.rootHash === recovery.rootHash &&
+        existing.storagePath === recovery.storagePath &&
+        existing.phase === recovery.phase
+      )
+        return
+      throw new AppError(ErrorCode.E_ARCHIVE_FAILED, { path, reason: 'receipt-conflict' })
+    }
+    await fs.writeTextChunks(`${path}.tmp`, [JSON.stringify(recovery)])
+    await fs.rename(`${path}.tmp`, path)
+  }
+
+  async function completeRecovery(
+    recovery: ArchiveRecoveryDescriptor,
+    fs: ArchiveFsPort,
+    phase: 'committed' | 'abandoned' = 'committed'
+  ): Promise<void> {
+    // Remote receipt comes first; reconciliation can repair unavailable SQLite later.
+    await writeRecoveryAtomically(fs, { ...recovery, phase })
+    if (repo.releases.get(recovery.operationId)) {
+      repo.atomic(() => {
+        repo.releases.finish(recovery.operationId, phase === 'committed' ? 'SUCCESS' : 'FAILED')
+        repo.releases.update(recovery.operationId, { recoveryRequired: false, recoveryInfo: null })
+      })
+    }
+    for (const name of [RECOVERY_FILE, RECOVERY_CLOSED_FILE]) {
+      const path = joinRemote(recovery.storagePath, name)
+      if ((await fs.stat(path)).exists) await fs.removeFile(path)
+    }
+  }
+
+  async function isRecoveryProtected(storagePath: string, fs: ArchiveFsPort): Promise<boolean> {
+    return (
+      (await fs.stat(joinRemote(storagePath, RECOVERY_FILE))).exists ||
+      (await fs.stat(joinRemote(storagePath, RECOVERY_CLOSED_FILE))).exists ||
+      repo.releases
+        .listUnfinished()
+        .some((r) => r.recoveryInfo?.includes(JSON.stringify(storagePath)))
+    )
   }
 
   /* ------------------------------------------------------------ 校验 */
@@ -935,9 +1127,10 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
     try {
       text = await input.ports.fs.readTextFile(manifestPath)
     } catch (err) {
-      const reason = err instanceof AppError && err.code === ErrorCode.E_ARCHIVE_MISSING
-        ? '归档目录里没有 manifest.json'
-        : `读取 manifest.json 失败：${(err as Error).message}`
+      const reason =
+        err instanceof AppError && err.code === ErrorCode.E_ARCHIVE_MISSING
+          ? '归档目录里没有 manifest.json'
+          : `读取 manifest.json 失败：${(err as Error).message}`
       return fail('missing', reason)
     }
 
@@ -1061,7 +1254,16 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
     for (const victim of plan.remove) {
       const row = byId.get(victim.id)
       if (!row) continue
+      if (input.signal?.aborted) break
       try {
+        if (await isRecoveryProtected(row.storagePath, input.fs)) {
+          base.failed.push({
+            id: row.id,
+            versionTag: row.versionTag,
+            reason: '版本仍用于恢复，已保留'
+          })
+          continue
+        }
         // rmrf 对"已不存在"是幂等的（stat 不存在直接返回），
         // 所以"服务器上已被手工删掉"的版本也能顺利摘掉台账行
         await input.fs.rmrf(row.storagePath)
@@ -1131,6 +1333,12 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
         continue
       }
       try {
+        if (await isRecoveryProtected(row.storagePath, input.fs))
+          throw new AppError(
+            ErrorCode.E_DEPLOY_BLOCKED,
+            { archiveId: row.id },
+            { message: '版本仍用于恢复，禁止删除' }
+          )
         // rmrf 对"已不存在"是幂等的：服务器上被手工删过的版本也能干净地摘掉台账行
         await input.fs.rmrf(row.storagePath)
         repo.archives.remove(row.id)
@@ -1144,7 +1352,11 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
         logger.info(`archive remove: ${row.versionTag} (${row.storagePath})`)
         log(`已删除往期版本 ${row.versionTag}（释放 ${row.totalBytes} 字节）`)
       } catch (err) {
-        result.failed.push({ id: row.id, versionTag: row.versionTag, reason: (err as Error).message })
+        result.failed.push({
+          id: row.id,
+          versionTag: row.versionTag,
+          reason: (err as Error).message
+        })
         logger.warn(`archive remove failed: ${row.versionTag} — ${(err as Error).message}`)
         log(`删除往期版本 ${row.versionTag} 失败：${(err as Error).message}`, 'warn')
       }
@@ -1212,7 +1424,9 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
       offset,
       limit,
       total: m.files.length,
-      unknownKeys: Object.keys(m).filter((k) => !(KNOWN_MANIFEST_KEYS as readonly string[]).includes(k)),
+      unknownKeys: Object.keys(m).filter(
+        (k) => !(KNOWN_MANIFEST_KEYS as readonly string[]).includes(k)
+      ),
       warnings: parsed.warnings,
       durationMs: Date.now() - started
     }
@@ -1233,72 +1447,23 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
     const artifactAt = joinRemote(row.payloadPath, posixBasename(remotePath))
     const moveMode: 'rename' | 'copy' = input.moveMode === 'copy' ? 'copy' : 'rename'
 
-    if (!(await input.ports.fs.stat(artifactAt)).exists) {
-      throw new AppError(
-        ErrorCode.E_ARCHIVE_MISSING,
-        { artifactAt, storagePath: row.storagePath },
-        {
-          message: '归档复位失败：归档目录里找不到内容',
-          hint: `请人工检查 ${row.storagePath}。`
-        }
-      )
-    }
-
-    // 目标路径已被占用就**拒绝**：覆盖它可能把别的东西弄没，
-    // 而"目标为什么有东西"这件事只有人判断得了。
-    if ((await input.ports.fs.stat(remotePath)).exists) {
-      throw new AppError(
-        ErrorCode.E_ARCHIVE_FAILED,
-        { remotePath, storagePath: row.storagePath },
-        {
-          message: `归档复位被拒绝：目标路径 ${remotePath} 已经有内容`,
-          hint: '为避免覆盖，未做任何改动。请人工确认该路径的内容后再处理。'
-        }
-      )
-    }
-
-    log(`正在把归档版本 ${row.versionTag} 复位到 ${remotePath}…`, 'warn')
-    try {
-      if (moveMode === 'copy') {
-        await copyArtifactInto({
-          fs: input.ports.fs,
-          src: artifactAt,
-          dst: remotePath,
-          kind
-        })
-      } else {
-        await input.ports.fs.rename(artifactAt, remotePath)
-      }
-    } catch (err) {
-      const message =
-        `归档复位失败：目标 ${remotePath} 仍为空，内容还在 ${row.storagePath}/payload 下。` +
-        `请手工移动回去。`
-      logger.error(`${message}（原因：${(err as Error).message}）`)
-      log(message, 'error')
-      throw new AppError(
-        ErrorCode.E_ARCHIVE_FAILED,
-        { remotePath, storagePath: row.storagePath, original: (err as Error).message },
-        { message, hint: '内容没有丢，但需要人工介入。请把上述路径告知运维。' }
-      )
-    }
-
-    try {
-      await input.ports.fs.rmrf(row.storagePath)
-    } catch (err) {
-      // 台账行仍要删掉（内容已经回到目标路径，这个版本不再"在版本库里"），
-      // 但目录没删干净要说出来，否则会在归档目录里留下一个对不上账的孤儿目录
-      logger.warn(`归档复位后清理 ${row.storagePath} 失败：${(err as Error).message}`)
-      log(`警告：归档目录 ${row.storagePath} 未能删除，请手工清理`, 'warn')
-    }
-    repo.archives.remove(row.id)
-    repo.audit.write({
-      level: 'warn',
-      scope: 'archive',
-      refId: row.id,
-      message: `撤销归档 ${row.versionTag}：内容已复位到 ${remotePath}`,
-      detail: JSON.stringify({ targetId: row.targetId, storagePath: row.storagePath, moveMode })
+    await restoreRecovery({
+      recovery: {
+        operationId: row.releaseId ?? row.id,
+        targetId: row.targetId,
+        originalPath: remotePath,
+        storagePath: row.storagePath,
+        payloadPath: row.payloadPath,
+        artifactPath: artifactAt,
+        kind,
+        archiveMoveMode: moveMode,
+        versionTag: row.versionTag,
+        rootHash: row.rootHash,
+        archiveId: row.id
+      },
+      ports: input.ports,
+      log
     })
-    log(`已把归档版本 ${row.versionTag} 复位到目标路径`, 'warn')
   }
 
   /* -------------------------------------------- 去重：丢掉与另一份相同的归档 */
@@ -1363,6 +1528,8 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
     }
 
     try {
+      if (await isRecoveryProtected(drop.storagePath, input.fs))
+        throw new AppError(ErrorCode.E_DEPLOY_BLOCKED, { archiveId: drop.id })
       await input.fs.rmrf(drop.storagePath)
     } catch (err) {
       // 目录没删掉就**不摘台账行**：那会让台账指向一个仍然存在的目录，对账反而说不清。
@@ -1387,7 +1554,20 @@ export function createArchiveService(deps: ArchiveServiceDeps) {
     return { discarded: true, keptVersionTag: keep.versionTag }
   }
 
-  return { list, count, summary, archiveVersion, verifyArchive, applyRetention, removeVersions, readDetail, undoArchive, discardDuplicateArchive }
+  return {
+    list,
+    count,
+    summary,
+    archiveVersion,
+    verifyArchive,
+    applyRetention,
+    removeVersions,
+    readDetail,
+    undoArchive,
+    restoreRecovery,
+    completeRecovery,
+    discardDuplicateArchive
+  }
 }
 
 export type ArchiveService = ReturnType<typeof createArchiveService>

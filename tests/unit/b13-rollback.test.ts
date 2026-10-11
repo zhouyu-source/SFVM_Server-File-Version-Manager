@@ -72,7 +72,11 @@ describe('RollbackService（B13 回滚）', () => {
    * 归档那一步走的是**与发布阶段 4 相同的** `archiveVersion`，
    * 因此归档目录里有真的 `manifest.json`，阶段 1 的校验能真的跑起来。
    */
-  async function setupArchived(): Promise<{ archiveId: string; versionTag: string; storagePath: string }> {
+  async function setupArchived(): Promise<{
+    archiveId: string
+    versionTag: string
+    storagePath: string
+  }> {
     fake.putFile(`${REMOTE}/index.html`, 'v1')
     const a = await archive.archiveVersion({
       targetId,
@@ -204,14 +208,15 @@ describe('RollbackService（B13 回滚）', () => {
     expect(t.repo.archives.countByTarget(targetId)).toBe(1)
   })
 
-  it('阶段 1：跳过校验（T13.2）→ 改坏的内容照样换上线，日志里有风险提示', async () => {
+  it('跳过来源校验仍须通过复制校验：损坏副本拒绝提交并恢复当前版本', async () => {
     const a = await setupArchived()
     fake.putFile(`${a.storagePath}/payload/dist/index.html`, 'tampered')
     const { result, text } = run(a.archiveId, { skipVerify: true })
     const out = await result
-    expect(out.ok).toBe(true)
+    expect(out.ok).toBe(false)
     expect(out.verified).toBe(false)
-    expect(fake.text(`${REMOTE}/index.html`)).toBe('tampered')
+    expect(out.failure?.code).toBe(ErrorCode.E_VERIFY_MISMATCH)
+    expect(fake.text(`${REMOTE}/index.html`)).toBe('v2')
     expect(text()).toContain('跳过完整性校验')
   })
 
@@ -518,10 +523,10 @@ describe('RollbackService（B13 回滚）', () => {
 
   /* ------------------------------------------------ L13：失败分支的 moveMode */
 
-  it('L13：失败分支返回的 moveMode 与实际一致（挂载点 + 不保留来源 → copy）', async () => {
+  it('L13：失败分支返回的 moveMode 与实际一致（跨设备 + 不保留来源 → copy）', async () => {
     const a = await setupArchived()
     // 目标本身是挂载点 ⇒ 换版退化成复制（`canRename === false`）
-    fake.dfOverride.set(REMOTE, { filesystem: '/dev/sdb1', mountPoint: REMOTE })
+    fake.dfOverride.set(REMOTE, { filesystem: '/dev/sdb1', mountPoint: '/opt' })
     // 阶段 3 的复制失败
     fake.copyFileFailures.set(`${REMOTE}/index.html`, {
       err: new Error('模拟复制中断'),
@@ -537,9 +542,9 @@ describe('RollbackService（B13 回滚）', () => {
     expect(out.failure).toBeTruthy()
   })
 
-  it('L13：成功分支同样按实际路径返回（挂载点 + 不保留来源 → copy）', async () => {
+  it('L13：成功分支同样按实际路径返回（跨设备 + 不保留来源 → copy）', async () => {
     const a = await setupArchived()
-    fake.dfOverride.set(REMOTE, { filesystem: '/dev/sdb1', mountPoint: REMOTE })
+    fake.dfOverride.set(REMOTE, { filesystem: '/dev/sdb1', mountPoint: '/opt' })
 
     const out = await run(a.archiveId, { keepSource: false }).result
 

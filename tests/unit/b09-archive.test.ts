@@ -178,7 +178,11 @@ class FakeRemote {
         for (const c of chunks) {
           text += c
           n++
-          if (this.failWriteAfterChunks !== null && n >= this.failWriteAfterChunks) {
+          if (
+            p.endsWith(MANIFEST_TMP_NAME) &&
+            this.failWriteAfterChunks !== null &&
+            n >= this.failWriteAfterChunks
+          ) {
             // 半截落盘：正是"不能产生半截 manifest"要防的情形
             this.putFile(p, text)
             throw new Error('模拟写流中断')
@@ -289,7 +293,11 @@ describe('ArchiveService', () => {
 
     // 3) 台账
     expect(archive.count(targetId)).toBe(1)
-    expect(archive.list(targetId)[0]).toMatchObject({ status: 'valid', fileCount: 1, totalBytes: 5 })
+    expect(archive.list(targetId)[0]).toMatchObject({
+      status: 'valid',
+      fileCount: 1,
+      totalBytes: 5
+    })
   })
 
   it('目录型目标：relPath 相对 payload，因此带一层 <basename>/ 前缀', async () => {
@@ -387,7 +395,13 @@ describe('ArchiveService', () => {
 
   it('连续 5 次冲突时明确报错，且目标未被搬动', async () => {
     // 预先把基础版本号与 -2..-5 都占上
-    for (const tag of [BASE_TAG, `${BASE_TAG}-2`, `${BASE_TAG}-3`, `${BASE_TAG}-4`, `${BASE_TAG}-5`]) {
+    for (const tag of [
+      BASE_TAG,
+      `${BASE_TAG}-2`,
+      `${BASE_TAG}-3`,
+      `${BASE_TAG}-4`,
+      `${BASE_TAG}-5`
+    ]) {
       fake.putDir(`/opt/svc/order.jar.versions/${tag}`)
     }
     fake.putFile('/opt/svc/order.jar', 'hello')
@@ -432,9 +446,9 @@ describe('ArchiveService', () => {
     expect((err as { code?: string }).code).toBe('E_ARCHIVE_FAILED')
     expect((err as Error).message).toMatch(/内容仍在/)
     // 回滚失败时绝不能删掉 payload —— 内容确实还在那里
-    expect(
-      fake.read(`/opt/svc/order.jar.versions/${BASE_TAG}/payload/order.jar`).toString()
-    ).toBe('hello')
+    expect(fake.read(`/opt/svc/order.jar.versions/${BASE_TAG}/payload/order.jar`).toString()).toBe(
+      'hello'
+    )
   })
 
   /* ------------------------------------------------------ T09.7 校验 */

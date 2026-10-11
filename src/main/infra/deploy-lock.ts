@@ -25,6 +25,40 @@
 import { AppError, ErrorCode } from './errors'
 import { buildLockPayload, lockPathOf, parseLockPayload } from './deploy-plan'
 import type { RemoteLockInfo } from '../../shared/contracts/deploy'
+import { randomUUID } from 'node:crypto'
+
+export async function withTargetRemoteLock<T>(
+  fs: LockFsPort,
+  remotePath: string,
+  run: (operationId: string) => Promise<T>
+): Promise<T> {
+  const operationId = `maintenance_${randomUUID()}`
+  await acquireRemoteLock({
+    fs,
+    remotePath,
+    releaseId: operationId,
+    hostname: 'sfvm-maintenance',
+    pid: process.pid,
+    now: new Date(),
+    cleanStaleLock: false,
+    log: () => undefined
+  })
+  try {
+    return await run(operationId)
+  } finally {
+    await releaseOwnedRemoteLock(fs, remotePath, operationId)
+  }
+}
+
+export async function releaseOwnedRemoteLock(
+  fs: LockFsPort,
+  remotePath: string,
+  operationId: string
+): Promise<void> {
+  const owner = parseLockPayload(await fs.readTextFile(lockPathOf(remotePath)), new Date())
+  if (owner?.releaseId !== operationId) throw new AppError(ErrorCode.E_TARGET_BUSY, { remotePath })
+  await fs.removeFile(lockPathOf(remotePath))
+}
 
 /** 取锁需要的三个 SFTP 原语（`DeployFsPort` 天然满足）。 */
 export interface LockFsPort {

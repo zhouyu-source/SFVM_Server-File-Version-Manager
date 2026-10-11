@@ -27,6 +27,14 @@
  * 与其它服务一样：不 import electron / ssh2，副作用全经 `ReconcilePorts` 注入，
  * 于是"补录保留 archivedAt""manifest 缺失不补录"这类关键正确性用例能在单测里真跑。
  */
+import { randomUUID } from 'node:crypto'
+import {
+  recoveryDescriptorSchema,
+  RECOVERY_FILE,
+  RECOVERY_CLOSED_FILE,
+  type ArchiveRecoveryDescriptor
+} from '../infra/archive-recovery'
+import { acquireRemoteLock, type LockFsPort } from '../infra/deploy-lock'
 import { AppError, ErrorCode } from '../infra/errors'
 import { logger } from '../infra/logger'
 import { normalizeRemotePath } from '../infra/remote-path'
@@ -39,15 +47,10 @@ import {
   parseManifestText,
   checkManifestConsistency
 } from '../infra/manifest-io'
-import { lockPathOf, parseLockPayload } from '../infra/deploy-plan'
+import { stagingRootOf, lockPathOf, parseLockPayload } from '../infra/deploy-plan'
 import { STAGING_PREFIX } from '../../shared/contracts/deploy'
 import { VERSION_TAG_PATTERN } from '../../shared/contracts/archive'
-import {
-  archiveDirOf,
-  type ArchiveFsPort,
-  type ArchivePorts,
-  type ArchiveService
-} from './archive'
+import { archiveDirOf, type ArchiveFsPort, type ArchivePorts, type ArchiveService } from './archive'
 import type { RemoteHashPort } from './hash'
 import type { Repositories } from '../db/repositories'
 import type {
@@ -73,9 +76,10 @@ const RECONCILE_SCAN_LIMIT = 100000
 
 /** 对账需要的远端能力（比归档多一个 `readdir`：要列归档目录）。 */
 export interface ReconcilePorts {
-  fs: ArchiveFsPort & {
-    readdir(path: string): Promise<Array<{ name: string; isDirectory: boolean; size: number }>>
-  }
+  fs: ArchiveFsPort &
+    LockFsPort & {
+      readdir(path: string): Promise<Array<{ name: string; isDirectory: boolean; size: number }>>
+    }
   hash: RemoteHashPort
 }
 
@@ -114,6 +118,7 @@ export function createReconcileService(deps: {
         environmentName: env?.name ?? '(环境已删除)',
         action: r.action,
         status: r.status,
+        recoveryRequired: r.recoveryRequired,
         versionTag: r.versionTag,
         startedAt: r.startedAt,
         currentStep: r.currentStep ?? null
@@ -124,7 +129,10 @@ export function createReconcileService(deps: {
 
   /* ---------------------------------------------------- 远端锁（T14.6） */
 
-  async function readLock(input: { targetId: string }, ports: ReconcilePorts): Promise<RemoteLockInfoView> {
+  async function readLock(
+    input: { targetId: string },
+    ports: ReconcilePorts
+  ): Promise<RemoteLockInfoView> {
     const target = repo.targets.get(input.targetId)
     if (!target) throw new AppError(ErrorCode.E_NOT_FOUND, { targetId: input.targetId })
     const remotePath = normalizeRemotePath(target.remotePath)
@@ -254,6 +262,59 @@ export function createReconcileService(deps: {
     }
     remoteTags.sort()
 
+    for (const tag of remoteTags) {
+      const intentPath = joinRemote(joinRemote(archiveDir, tag), RECOVERY_FILE)
+      const closedPath = joinRemote(joinRemote(archiveDir, tag), RECOVERY_CLOSED_FILE)
+      const markerPath = (await fs.stat(closedPath)).exists ? closedPath : intentPath
+      if (!(await fs.stat(markerPath)).exists) continue
+      try {
+        const raw = JSON.parse(await fs.readTextFile(markerPath))
+        const descriptor = checkedDescriptor(raw, target, raw.operationId)
+        const existing = repo.releases.get(descriptor.operationId)
+        if (existing && existing.targetId !== target.id) throw new Error('recovery target mismatch')
+        if (descriptor.phase === 'committed' || descriptor.phase === 'abandoned') {
+          if (existing) {
+            repo.atomic(() => {
+              repo.releases.finish(
+                existing.id,
+                descriptor.phase === 'committed' ? 'SUCCESS' : 'FAILED'
+              )
+              repo.releases.update(existing.id, {
+                recoveryRequired: false,
+                recoveryInfo: null,
+                ...(descriptor.phase === 'abandoned' ? { currentStep: 'recovered-abandoned' } : {})
+              })
+            })
+          }
+          if ((await fs.stat(intentPath)).exists) await fs.removeFile(intentPath)
+          if ((await fs.stat(closedPath)).exists) await fs.removeFile(closedPath)
+          continue
+        }
+        if (!existing)
+          repo.releases.create({
+            id: descriptor.operationId,
+            targetId: target.id,
+            action: 'deploy',
+            status: 'FAILED',
+            versionTag: descriptor.versionTag,
+            recoveryRequired: true,
+            recoveryInfo: JSON.stringify(descriptor),
+            currentStep: 'recovery-required'
+          })
+        else if (
+          !['SUCCESS', 'ROLLED_BACK'].includes(existing.status) &&
+          !existing.currentStep?.startsWith('recovered-')
+        ) {
+          repo.releases.update(existing.id, {
+            recoveryRequired: true,
+            recoveryInfo: JSON.stringify(descriptor)
+          })
+        }
+      } catch (err) {
+        log(`恢复信息无法补录：${markerPath}：${String(err)}`, 'warn')
+      }
+    }
+
     /* ---- 2) 台账（全量：对账不能只看前 N 条） ---- */
     const ledger = repo.archives.listByTarget(target.id, RECONCILE_SCAN_LIMIT)
     const ledgerByTag = new Map(ledger.map((r) => [r.versionTag, r]))
@@ -299,7 +360,8 @@ export function createReconcileService(deps: {
         if (issues.length > 0) manifestProblem = `manifest 自相矛盾：${issues.join('；')}`
         manifest = parsed.manifest
       } catch (err) {
-        manifestProblem = err instanceof AppError ? `manifest 不可用（${err.code}）` : 'manifest 读取失败'
+        manifestProblem =
+          err instanceof AppError ? `manifest 不可用（${err.code}）` : 'manifest 读取失败'
       }
 
       /**
@@ -412,7 +474,9 @@ export function createReconcileService(deps: {
           fileCount: manifest.fileCount,
           totalBytes: manifest.totalBytes,
           note:
-            (payloadExists ? '已按 manifest 补录' : '已补录，但归档内容目录不存在（标为 missing）') +
+            (payloadExists
+              ? '已按 manifest 补录'
+              : '已补录，但归档内容目录不存在（标为 missing）') +
             (manifestTimeParsed ? '' : '；manifest 时间无法解析，台账已用重建时刻')
         })
         log(`补录版本 ${tag}（${manifest.fileCount} 个文件，${created.archivedAt}）`)
@@ -606,27 +670,115 @@ export function createReconcileService(deps: {
    *
    * 三个选项的可用性就从这里推出来（界面直接按 `options` 决定按钮能不能点）。
    */
+  function validateRecoveryRelease(targetId: string, releaseId: string, allowCompleted = false) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(releaseId))
+      throw new AppError(ErrorCode.E_DEPLOY_BLOCKED, { releaseId })
+    const release = repo.releases.get(releaseId)
+    if (!release) throw new AppError(ErrorCode.E_NOT_FOUND, { releaseId })
+    if (release.targetId !== targetId)
+      throw new AppError(ErrorCode.E_DEPLOY_BLOCKED, { targetId, releaseId })
+    const completedRecovery =
+      release.status === 'FAILED' && release.currentStep?.startsWith('recovered-')
+    if (
+      ['SUCCESS', 'ROLLED_BACK'].includes(release.status) ||
+      (release.status === 'FAILED' &&
+        !release.recoveryRequired &&
+        !(allowCompleted && completedRecovery))
+    ) {
+      throw new AppError(
+        ErrorCode.E_DEPLOY_BLOCKED,
+        { releaseId },
+        { message: '这条操作已结束，不允许执行崩溃恢复' }
+      )
+    }
+    return release
+  }
+
+  function checkedDescriptor(
+    raw: unknown,
+    target: NonNullable<ReturnType<typeof repo.targets.get>>,
+    releaseId: string
+  ): ArchiveRecoveryDescriptor {
+    const d = recoveryDescriptorSchema.parse(raw)
+    const remotePath = normalizeRemotePath(target.remotePath)
+    const expectedStorage = joinRemote(archiveDirOf(target), d.versionTag)
+    if (
+      d.targetId !== target.id ||
+      d.operationId !== releaseId ||
+      d.originalPath !== remotePath ||
+      !VERSION_TAG_PATTERN.test(d.versionTag) ||
+      d.storagePath !== expectedStorage ||
+      d.payloadPath !== joinRemote(expectedStorage, PAYLOAD_DIR_NAME) ||
+      d.artifactPath !== joinRemote(d.payloadPath, remotePath.split('/').at(-1)!) ||
+      d.kind !== target.kind
+    )
+      throw new AppError(ErrorCode.E_DEPLOY_BLOCKED, {
+        releaseId,
+        reason: 'recovery-path-mismatch'
+      })
+    return d
+  }
+
+  function descriptorFor(
+    target: NonNullable<ReturnType<typeof repo.targets.get>>,
+    release: NonNullable<ReturnType<typeof repo.releases.get>>
+  ) {
+    if (release.recoveryInfo)
+      return checkedDescriptor(JSON.parse(release.recoveryInfo), target, release.id)
+    const row =
+      release.action === 'deploy'
+        ? release.archiveId
+          ? repo.archives.get(release.archiveId)
+          : undefined
+        : repo.archives
+            .listByTarget(target.id, RECONCILE_SCAN_LIMIT)
+            .find((r) => r.releaseId === release.id)
+    if (!row || row.targetId !== target.id) return undefined
+    return checkedDescriptor(
+      {
+        operationId: release.id,
+        targetId: target.id,
+        originalPath: normalizeRemotePath(target.remotePath),
+        storagePath: row.storagePath,
+        payloadPath: row.payloadPath,
+        artifactPath: joinRemote(
+          row.payloadPath,
+          normalizeRemotePath(target.remotePath).split('/').at(-1)!
+        ),
+        kind: row.kind,
+        archiveMoveMode: 'rename',
+        versionTag: row.versionTag,
+        rootHash: row.rootHash,
+        archiveId: row.id
+      },
+      target,
+      release.id
+    )
+  }
+
   async function diagnose(
     input: DiagnoseInput & { ports: ReconcilePorts }
   ): Promise<RecoveryDiagnosis> {
     const target = repo.targets.get(input.targetId)
     if (!target) throw new AppError(ErrorCode.E_NOT_FOUND, { targetId: input.targetId })
-    const release = repo.releases.get(input.releaseId)
-    if (!release) throw new AppError(ErrorCode.E_NOT_FOUND, { releaseId: input.releaseId })
+    const release = validateRecoveryRelease(target.id, input.releaseId)
 
     const remotePath = normalizeRemotePath(target.remotePath)
     const fs = input.ports.fs
 
     const st = await fs.stat(remotePath)
-    const archiveRow = release.archiveId ? repo.archives.get(release.archiveId) : undefined
-    const storageExists = archiveRow ? (await fs.stat(archiveRow.storagePath)).exists : false
+    const descriptor = descriptorFor(target, release)
+    const archiveRow = descriptor
+      ? { ...descriptor, id: descriptor.archiveId ?? descriptor.storagePath }
+      : undefined
+    const storageExists = descriptor ? (await fs.stat(descriptor.artifactPath)).exists : false
 
     const lockView = await readLock({ targetId: target.id }, input.ports).catch(() => null)
     let staging: string[]
     try {
       const parent = parentDirOf(remotePath)
       staging = (await fs.readdir(parent))
-        .filter((e) => e.name.startsWith(STAGING_PREFIX))
+        .filter((e) => joinRemote(parent, e.name) === stagingRootOf(remotePath, release.id))
         .map((e) => joinRemote(parent, e.name))
     } catch {
       staging = []
@@ -642,20 +794,29 @@ export function createReconcileService(deps: {
      * 这种情况只该由人看过之后决定，不该由工具替他决定。
      */
     const targetOccupied = st.exists
-    const restoreReason = !archiveRow
-      ? '这次操作没有归档过旧版本（崩在归档之前），没有东西可以恢复'
-      : !storageExists
-        ? `归档目录 ${archiveRow.storagePath} 已不存在，无法恢复`
-        : targetOccupied
-          ? '目标路径上已有内容：可能是这次操作留下的半成品，也可能是别的程序放进去的。请先人工确认，再决定是恢复还是放弃'
-          : '可以把归档的旧版本搬回目标路径'
+    const lockBlocked = Boolean(lockView?.exists)
+    const lockReason =
+      '远端锁仍存在。确认没有其他操作后，请先到「往期版本 → 对账」显式清理旧锁，再查看现场。'
+    const restoreReason = lockBlocked
+      ? lockReason
+      : !archiveRow
+        ? '这次操作没有归档过旧版本（崩在归档之前），没有东西可以恢复'
+        : !storageExists
+          ? `归档内容 ${archiveRow.storagePath} 已不存在，无法恢复`
+          : targetOccupied
+            ? '目标路径上已有内容：可能是这次操作留下的半成品，也可能是别的程序放进去的。请先人工确认，再决定是恢复还是放弃'
+            : '可以把归档的旧版本搬回目标路径'
 
     const options: RecoveryDiagnosis['options'] = [
-      { mode: 'restore-old', enabled: canRestore && !targetOccupied, reason: restoreReason },
+      {
+        mode: 'restore-old',
+        enabled: canRestore && !targetOccupied && !lockBlocked,
+        reason: restoreReason
+      },
       {
         mode: 'abandon',
-        enabled: true,
-        reason: '把这条记录收尾（标为失败），并清掉能证明是它留下的暂存目录与锁'
+        enabled: !lockBlocked,
+        reason: lockBlocked ? lockReason : '把这条记录收尾（标为失败），仅清理本记录的暂存目录'
       },
       { mode: 'retry', enabled: true, reason: '用当前本地产物重新发起一次发布（新的一次操作）' }
     ]
@@ -696,145 +857,133 @@ export function createReconcileService(deps: {
   /**
    * 按选定的方式收场。
    *
-   * **顺序与发布/回滚的补偿一致（由外到内）**：先清掉本次留下的残片，
-   * 再把旧版本搬回来，最后清暂存与锁、收尾台账。
-   * 反过来 `undoArchive` 会因为"目标已有内容"拒绝搬回。
+   * 校验记录并获取新锁后，只向空目标恢复旧版；已有目标内容必须由人确认。
+   * 仅清理本记录的暂存目录，释放自己持有的锁，最后收尾或保留待恢复状态。
    */
   async function recover(
-    input: RecoverInput & { ports: ReconcilePorts; log?: ReconcileLogFn }
+    input: RecoverInput & { ports: ReconcilePorts; log?: ReconcileLogFn; signal?: AbortSignal }
   ): Promise<RecoverResult> {
-    const log: ReconcileLogFn = input.log ?? ((): void => undefined)
+    const log = input.log ?? ((): void => undefined)
     const target = repo.targets.get(input.targetId)
     if (!target) throw new AppError(ErrorCode.E_NOT_FOUND, { targetId: input.targetId })
-    const release = repo.releases.get(input.releaseId)
-    if (!release) throw new AppError(ErrorCode.E_NOT_FOUND, { releaseId: input.releaseId })
-
+    const release = validateRecoveryRelease(target.id, input.releaseId, true)
+    if (
+      !release.recoveryRequired &&
+      release.currentStep === `recovered-${input.mode === 'restore-old' ? 'restored' : 'abandoned'}`
+    ) {
+      return {
+        releaseId: release.id,
+        mode: input.mode,
+        status: 'success',
+        actions: [],
+        manualCleanup: []
+      }
+    }
     const remotePath = normalizeRemotePath(target.remotePath)
     const fs = input.ports.fs
+    const recovery = descriptorFor(target, release)
+    if (input.signal?.aborted) throw new AppError(ErrorCode.E_JOB_CANCELLED, {})
+    if (input.mode === 'restore-old' && !recovery)
+      throw new AppError(ErrorCode.E_NOT_FOUND, { releaseId: release.id })
+    const lockId = `recovery_${randomUUID()}`
+    // An old lock must be explicitly removed through the existing confirmation UI.
+    await acquireRemoteLock({
+      fs,
+      remotePath,
+      releaseId: lockId,
+      hostname: 'sfvm-recovery',
+      pid: process.pid,
+      now: now(),
+      cleanStaleLock: false,
+      log
+    })
     const actions: RecoverResult['actions'] = []
-    const manualCleanup: string[] = []
-
-    if (input.mode === 'restore-old') {
-      const archiveRow = release.archiveId ? repo.archives.get(release.archiveId) : undefined
-      if (!archiveRow) {
-        throw new AppError(
-          ErrorCode.E_NOT_FOUND,
-          { releaseId: release.id },
-          {
-            message: '这次操作没有归档过旧版本，无法恢复',
-            hint: '请改用「放弃并清理」，然后用当前本地产物重新发布。'
-          }
+    const attempt = async (action: string, fn: () => Promise<void> | void): Promise<void> => {
+      try {
+        await fn()
+        actions.push({ action, ok: true })
+      } catch (err) {
+        actions.push({ action, ok: false, detail: String(err) })
+        log(`${action}失败：${String(err)}`, 'error')
+      }
+    }
+    try {
+      if (input.mode === 'restore-old') {
+        if ((await fs.stat(remotePath)).exists)
+          throw new AppError(
+            ErrorCode.E_DEPLOY_BLOCKED,
+            {},
+            { message: '目标路径已有内容，拒绝覆盖；请先人工确认' }
+          )
+        if (input.signal?.aborted) throw new AppError(ErrorCode.E_JOB_CANCELLED, {})
+        await attempt('恢复旧版本', () =>
+          archive.restoreRecovery({ recovery: recovery!, ports: input.ports, log })
         )
       }
-
-      // ① 先清目标路径上的残片（此刻它是这次操作留下的半成品）
-      if ((await fs.stat(remotePath)).exists) {
-        try {
-          await fs.rmrf(remotePath)
-          actions.push({ action: '清理目标残片', ok: true, detail: '目标路径上的不完整内容已清除' })
-          log('已清除目标路径上的不完整内容', 'warn')
-        } catch (err) {
-          actions.push({ action: '清理目标残片', ok: false, detail: (err as Error).message })
-          manualCleanup.push(`目标路径 ${remotePath} 未能清空`)
-          log(`清除目标残片失败：${(err as Error).message}`, 'error')
-        }
-      }
-
-      // ② 把归档的旧版本搬回目标
-      try {
-        await archive.undoArchive({
-          archiveId: archiveRow.id,
-          ports: { fs, hash: input.ports.hash },
-          // 崩在中间时无从知道去程用的是哪种方式；`rename` 在这里是安全的
-          // （归档里的 payload 就是原内容的本来形态，搬回去即还原）
-          moveMode: 'rename',
-          log: (text, level) => log(text, level)
+      if (input.cleanResidue !== false) {
+        await attempt('清理暂存目录', async () => {
+          const staging = stagingRootOf(remotePath, release.id)
+          if ((await fs.stat(staging)).exists) await fs.rmrf(staging)
         })
-        actions.push({
-          action: '恢复旧版本',
-          ok: true,
-          detail: `已把 ${archiveRow.versionTag} 搬回 ${remotePath}`
-        })
-      } catch (err) {
-        actions.push({ action: '恢复旧版本', ok: false, detail: (err as Error).message })
-        manualCleanup.push(`恢复 ${archiveRow.versionTag} 失败，内容可能仍在版本库里`)
-        log(`恢复旧版本失败：${(err as Error).message}`, 'error')
       }
-    }
-
-    // ③ 清暂存残留与锁（能证明是本目标留下的那部分）
-    if (input.cleanResidue !== false) {
-      try {
-        const parent = parentDirOf(remotePath)
-        const stale = (await fs.readdir(parent)).filter((e) => e.name.startsWith(STAGING_PREFIX))
-        for (const e of stale) {
-          const p = joinRemote(parent, e.name)
-          try {
-            await fs.rmrf(p)
-            actions.push({ action: '清理暂存目录', ok: true, detail: p })
-          } catch (err) {
-            actions.push({ action: '清理暂存目录', ok: false, detail: `${p}：${(err as Error).message}` })
-            manualCleanup.push(`暂存目录 ${p} 未能删除`)
-          }
-        }
-        if (stale.length === 0) {
-          actions.push({ action: '清理暂存目录', ok: true, detail: '没有暂存残留' })
-        }
-      } catch (err) {
-        actions.push({ action: '清理暂存目录', ok: false, detail: (err as Error).message })
-      }
-
-      try {
-        const lockView = await readLock({ targetId: target.id }, input.ports)
-        if (lockView.exists) {
-          // 只删"锁里写的正是这次操作"的那把：别的锁可能是另一台机器的
-          if (lockView.releaseId === release.id || lockView.unreadable) {
-            await fs.removeFile(lockView.path)
-            actions.push({ action: '清理远端锁', ok: true, detail: lockView.path })
-          } else {
-            actions.push({
-              action: '清理远端锁',
-              ok: true,
-              detail: `锁属于另一次操作（releaseId=${lockView.releaseId ?? '无法解析'}），保留未动`
-            })
-          }
-        }
-      } catch (err) {
-        actions.push({ action: '清理远端锁', ok: false, detail: (err as Error).message })
-      }
-    }
-
-    // ④ 台账收尾：把这条记录标成失败（它是一个已结束的事实，不该继续挡着下一次发布）
-    try {
-      repo.releases.finish(
-        release.id,
-        'FAILED',
-        `crashed:${input.mode === 'restore-old' ? 'restored' : 'abandoned'}${input.note ? ` ${input.note}` : ''}`
-      )
-      repo.releases.update(release.id, {
-        currentStep: input.mode === 'restore-old' ? 'recovered-restored' : 'recovered-abandoned'
+    } finally {
+      await attempt('释放恢复锁', async () => {
+        const owner = parseLockPayload(await fs.readTextFile(lockPathOf(remotePath)), now())
+        if (owner?.releaseId !== lockId) throw new AppError(ErrorCode.E_TARGET_BUSY, { lockId })
+        await fs.removeFile(lockPathOf(remotePath))
       })
-      actions.push({ action: '收尾台账', ok: true, detail: '该记录已标记为失败（不再阻止新的发布）' })
-    } catch (err) {
-      actions.push({ action: '收尾台账', ok: false, detail: (err as Error).message })
     }
-
-    repo.audit.write({
-      level: 'warn',
-      scope: 'reconcile',
-      refId: target.id,
-      message: `崩溃恢复（${input.mode}）`,
-      detail: JSON.stringify({ releaseId: release.id, actions })
+    const failed = actions.some((a) => !a.ok)
+    await attempt('收尾台账', () => {
+      repo.atomic(() => {
+        repo.releases.finish(release.id, 'FAILED', `crashed:${input.mode}`)
+        repo.releases.update(release.id, {
+          recoveryRequired: failed,
+          recoveryInfo: failed && recovery ? JSON.stringify(recovery) : null,
+          ...(!failed && input.mode === 'restore-old' && release.action === 'deploy'
+            ? { archiveId: null }
+            : {}),
+          currentStep: failed
+            ? 'recovery-partial'
+            : input.mode === 'restore-old'
+              ? 'recovered-restored'
+              : 'recovered-abandoned'
+        })
+      })
     })
-
-    const status: RecoverResult['status'] = manualCleanup.length > 0 ? 'partial' : 'success'
-    log(
-      status === 'success'
-        ? `恢复完成（${input.mode}）`
-        : `恢复部分完成（${input.mode}）：${manualCleanup.length} 项需要人工处理`,
-      status === 'success' ? 'info' : 'warn'
-    )
-    return { releaseId: release.id, mode: input.mode, status, actions, manualCleanup }
+    if (!actions.some((a) => !a.ok) && recovery && (await fs.stat(recovery.storagePath)).exists) {
+      await attempt('清理恢复标记', () => archive.completeRecovery(recovery, fs, 'abandoned'))
+    }
+    if (actions.some((a) => !a.ok)) {
+      try {
+        repo.releases.update(release.id, {
+          recoveryRequired: true,
+          recoveryInfo: recovery ? JSON.stringify(recovery) : null,
+          currentStep: 'recovery-partial'
+        })
+      } catch (err) {
+        log(`恢复残留标记写入失败：${String(err)}`, 'error')
+      }
+    }
+    try {
+      repo.audit.write({
+        level: 'warn',
+        scope: 'reconcile',
+        refId: target.id,
+        message: `崩溃恢复（${input.mode}）`,
+        detail: JSON.stringify({ releaseId: release.id, actions })
+      })
+    } catch (err) {
+      log(`恢复审计写入失败：${String(err)}`, 'warn')
+    }
+    const manualCleanup = actions.filter((a) => !a.ok).map((a) => a.detail ?? a.action)
+    return {
+      releaseId: release.id,
+      mode: input.mode,
+      status: manualCleanup.length ? 'partial' : 'success',
+      actions,
+      manualCleanup
+    }
   }
 
   return { startupScan, reconcile, diagnose, recover, readLock, removeLock }
